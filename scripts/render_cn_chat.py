@@ -684,6 +684,8 @@ def _export_translation_json(
     cmd = [
         sys.executable,
         str(burn),
+        "--out-dir",
+        str(trans_json.parent),
         str(video),
         str(chat_html),
         "--export-translation",
@@ -909,7 +911,15 @@ def load_yaml_file(yaml_path: Path, label: str):
         raise SystemExit(f"错误: 使用 {label} 需要安装 PyYAML，请运行 pip install PyYAML")
     if not yaml_path.is_file():
         raise SystemExit(f"错误: {label} 文件不存在: {yaml_path}")
-    return yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
+    try:
+        data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as e:
+        raise PipelineError(f"Invalid {label} YAML {yaml_path}: {e}") from e
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise PipelineError(f"Invalid {label} YAML {yaml_path}: root must be a mapping")
+    return data
 
 
 def load_yaml_rules(rules_path: Path):
@@ -921,10 +931,30 @@ def load_yaml_rules(rules_path: Path):
     """
     data = load_yaml_file(rules_path, "规则")
     rules = []
-    for item in data.get("normalizations", []):
+    if "normalizations" not in data:
+        raw_rules = []
+    else:
+        raw_rules = data["normalizations"]
+    if not isinstance(raw_rules, list):
+        raise PipelineError(
+            f"Invalid rules YAML {rules_path}: normalizations must be a list"
+        )
+    for rule_index, item in enumerate(raw_rules):
+        if not isinstance(item, dict):
+            raise PipelineError(
+                f"Invalid rules YAML {rules_path}: normalizations[{rule_index}] must be a mapping"
+            )
         targets = item.get("match", [])
         if isinstance(targets, str):
             targets = [targets]
+        elif not isinstance(targets, list):
+            raise PipelineError(
+                f"Invalid rules YAML {rules_path}: normalizations[{rule_index}].match must be a string or list"
+            )
+        if not all(isinstance(target, (str, int, float)) for target in targets):
+            raise PipelineError(
+                f"Invalid rules YAML {rules_path}: normalizations[{rule_index}].match contains a non-scalar value"
+            )
         translation = item.get("translation")
         if translation is None:
             continue
@@ -934,11 +964,20 @@ def load_yaml_rules(rules_path: Path):
             "translation": str(translation),
         })
     preserve = []
-    for pat in data.get("preserve_patterns") or []:
+    preserve_raw = data.get("preserve_patterns")
+    if preserve_raw is None:
+        preserve_raw = []
+    if not isinstance(preserve_raw, list):
+        raise PipelineError(
+            f"Invalid rules YAML {rules_path}: preserve_patterns must be a list"
+        )
+    for pattern_index, pat in enumerate(preserve_raw):
         try:
             preserve.append(re.compile(str(pat)))
         except re.error as e:
-            print(f"警告: 忽略非法 preserve_patterns {pat!r}: {e}")
+            raise PipelineError(
+                f"Invalid rules YAML {rules_path}: preserve_patterns[{pattern_index}] is not a valid regex: {e}"
+            ) from e
     return {"normalizations": rules, "preserve_patterns": preserve}
 
 
@@ -1032,6 +1071,21 @@ def normalize_translation(json_path: Path, rules_path: Path | None = None):
 
 def load_profile(profile_path: Path):
     data = load_yaml_file(profile_path, "Profile")
+    glossary_value = data.get("glossary")
+    if glossary_value is not None and not isinstance(glossary_value, dict):
+        raise PipelineError(
+            f"Invalid Profile YAML {profile_path}: glossary must be a mapping"
+        )
+    preserve_value = data.get("preserve")
+    if preserve_value is not None and not isinstance(preserve_value, list):
+        raise PipelineError(
+            f"Invalid Profile YAML {profile_path}: preserve must be a list"
+        )
+    style_value = data.get("translation_style")
+    if style_value is not None and not isinstance(style_value, dict):
+        raise PipelineError(
+            f"Invalid Profile YAML {profile_path}: translation_style must be a mapping"
+        )
     context_parts = []
     if data.get("context"):
         context_parts.append(str(data["context"]))
@@ -1500,16 +1554,39 @@ def doctor(args):
         video = Path(args.video).resolve()
         check("输入视频", video.is_file(), str(video), "检查视频路径")
         if video.is_file() and safe_which("ffprobe"):
-            r = subprocess.run(
-                [require_executable("ffprobe"), "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(video)],
-                capture_output=True,
-                text=True,
-            )
-            check("视频可读取", r.returncode == 0, (r.stdout.strip() + r.stderr.strip())[:120], "确认视频文件未损坏")
             try:
-                v_dur = float((r.stdout or "").strip().splitlines()[0]) if r.returncode == 0 else 0.0
-            except (ValueError, IndexError):
-                v_dur = 0.0
+                probe = subprocess.run(
+                    [
+                        require_executable("ffprobe"),
+                        "-v",
+                        "error",
+                        "-show_entries",
+                        "format=duration",
+                        "-of",
+                        "csv=p=0",
+                        str(video),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=45,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                check("视频可读取", False, str(exc)[:120], "确认 ffprobe 可用且视频文件未损坏")
+            else:
+                check(
+                    "视频可读取",
+                    probe.returncode == 0,
+                    ((probe.stdout or "").strip() + (probe.stderr or "").strip())[:120],
+                    "确认视频文件未损坏",
+                )
+                try:
+                    v_dur = (
+                        float((probe.stdout or "").strip().splitlines()[0])
+                        if probe.returncode == 0
+                        else 0.0
+                    )
+                except (ValueError, IndexError):
+                    v_dur = 0.0
     if getattr(args, "chat_html", None):
         html = Path(args.chat_html).resolve()
         check("聊天 HTML", html.is_file(), str(html), "检查 HTML 路径")

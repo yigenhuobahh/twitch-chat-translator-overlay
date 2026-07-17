@@ -18,6 +18,10 @@ import time
 # Tiny 1x1 PNG used only for sniff tests / not required at runtime.
 _EMOTE_PREFIXES = ("first-", "second-", "third-")
 _CSS_LOOKBACK = 8192  # class selector may sit far before content:url
+_MAX_EMOTE_BYTES = 8 * 1024 * 1024
+_MAX_TOTAL_EMOTE_BYTES = 128 * 1024 * 1024
+# A padded base64 payload needs four characters for every three decoded bytes.
+_MAX_EMOTE_BASE64_CHARS = 4 * ((_MAX_EMOTE_BYTES + 2) // 3)
 
 
 def _read_html_text(html_path: str) -> str:
@@ -32,12 +36,12 @@ def _read_html_text(html_path: str) -> str:
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
-        # Residual non-UTF8 bytes (e.g. latin-1 editor exports): prefer latin-1
-        # so accented text survives; never hard-crash.
-        try:
-            return raw.decode("latin-1")
-        except Exception:
-            return raw.decode("utf-8", errors="replace")
+        # A damaged byte must not force valid UTF-8 CJK through latin-1.
+        # Keep latin-1 only for genuinely legacy ASCII-plus-latin-1 exports.
+        repaired = raw.decode("utf-8", errors="replace")
+        if any(ch != "\ufffd" and ord(ch) > 127 for ch in repaired):
+            return repaired
+        return raw.decode("latin-1")
 
 
 def _class_has_token(class_value: str, token: str) -> bool:
@@ -134,6 +138,7 @@ def parse_chat_html(html_path, out_dir):
 
     emote_count = 0
     emote_rules_seen = 0
+    emote_bytes_written = 0
     # Match content:url("data:image/...;base64,...") only — require base64 inside *this* url()
     # so non-base64 data: URLs cannot steal a later rule's payload. Capture the full
     # selector text immediately before the opening "{" of this rule.
@@ -167,6 +172,12 @@ def parse_chat_html(html_path, out_dir):
         b64_data = (m.group(3) or "").replace("\n", "").replace("\r", "").strip()
         if not b64_data:
             continue
+        if len(b64_data) > _MAX_EMOTE_BASE64_CHARS:
+            print(
+                f"  emote base64 过大，解码前已跳过 ({len(b64_data)} chars)",
+                flush=True,
+            )
+            continue
         # Collect every .first- / .second- / .third- class in the selector list.
         class_names: list[str] = []
         for sel in selector_blob.split(","):
@@ -183,7 +194,7 @@ def parse_chat_html(html_path, out_dir):
             print(f"  emote CSS base64 解码失败: {e}", flush=True)
             continue
         # Soft size cap: skip absurd blobs (DoS / disk fill).
-        if len(img_data) > 8 * 1024 * 1024:
+        if len(img_data) > _MAX_EMOTE_BYTES:
             print(f"  emote 图片过大已跳过 ({len(img_data)} bytes)", flush=True)
             continue
         ext = "bin"
@@ -195,7 +206,11 @@ def parse_chat_html(html_path, out_dir):
             ext = "webp"
         elif img_data[:2] == b"\xff\xd8":
             ext = "jpg"
+        budget_exhausted = False
         for class_name in class_names:
+            if emote_bytes_written + len(img_data) > _MAX_TOTAL_EMOTE_BYTES:
+                budget_exhausted = True
+                break
             try:
                 safe_name = re.sub(r"[^\w.-]+", "_", class_name)
                 img_path = os.path.join(emote_dir, f"{safe_name}.{ext}")
@@ -203,9 +218,16 @@ def parse_chat_html(html_path, out_dir):
                     ef.write(img_data)
                 emote_map[class_name] = img_path
                 emote_count += 1
+                emote_bytes_written += len(img_data)
             except Exception as e:
                 print(f"  emote {class_name} 写入失败: {e}", flush=True)
         emote_prog.tick(emote_count, "写入 emote 图片")
+        if budget_exhausted:
+            print(
+                f"  emote 累计写入达到上限 {_MAX_TOTAL_EMOTE_BYTES} bytes，停止继续提取",
+                flush=True,
+            )
+            break
         if emote_count >= 5000:
             print("  emote 数量达到上限 5000，停止继续提取", flush=True)
             break

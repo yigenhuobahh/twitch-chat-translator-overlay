@@ -231,28 +231,15 @@ def test_try_portable_td_cli_extracts_zip(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr(ur, "urlopen", fake_urlopen)
 
-    calls = {"n": 0}
-
-    def find_side(root=None):
-        if calls["n"] == 0:
-            calls["n"] = 1
-            return None
-        base = Path(root or td._REPO_ROOT) / "tools" / "TwitchDownloaderCLI"
-        if not base.is_dir():
-            return None
-        for name in td.td_exe_names():
-            for hit in base.rglob(name):
-                if hit.is_file():
-                    return hit.resolve()
-        return None
-
-    monkeypatch.setattr(td, "find_twitchdownloader_cli", find_side)
-    monkeypatch.setattr(td, "prepend_tools_td_to_path", lambda root=None: None)
+    monkeypatch.delenv("TWITCHDOWNLOADER_CLI", raising=False)
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setattr(td, "safe_which", lambda _name: None)
 
     ok = td.try_portable_td_cli(assume_yes=True, root=root, timeout=10.0)
     assert ok is True
-    found_any = list((root / "tools" / "TwitchDownloaderCLI").rglob("TwitchDownloaderCLI.exe"))
-    assert found_any, "exe should exist under tools/TwitchDownloaderCLI"
+    installed = root / "tools" / "TwitchDownloaderCLI" / "TwitchDownloaderCLI.exe"
+    assert installed.is_file()
+    assert td.find_twitchdownloader_cli(root) == installed.resolve()
 
 def test_installed_defaults_ignore_untrusted_cwd_tools(tmp_path: Path, monkeypatch):
     import twitch_download as td

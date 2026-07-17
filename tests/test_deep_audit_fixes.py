@@ -7,6 +7,8 @@ from __future__ import annotations
 import inspect
 from types import SimpleNamespace
 
+import pytest
+
 from helpers import load_module
 
 
@@ -30,11 +32,11 @@ def test_confirm_preview_operator_precedence():
     assert 'and offset_info["mode"] == "auto"' in src
 
 
-def test_negative_offset_allowed_in_validation_snippet():
+def test_negative_offset_allowed_by_runtime_validation():
     burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
-    src = inspect.getsource(burn.main)
-    assert "absolute value must be <= 7 days" in src
-    assert 'validate_non_negative_float("--offset"' not in src
+    assert burn._validate_offset(-1.5) == -1.5
+    with pytest.raises(ValueError, match="absolute value must be <= 7 days"):
+        burn._validate_offset(-(7 * 24 * 3600 + 1))
 
 
 def test_clean_translation_strips_username_prefix():

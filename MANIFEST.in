@@ -6,7 +6,20 @@ include CONTRIBUTING.md
 include requirements.txt
 include requirements-dev.txt
 include .env.example
+include .gitattributes
+include .gitignore
+include .github/workflows/ci.yml
 include pyproject.toml
+include pytest.ini
+include run.bat
+include run.sh
+include install.bat
+include install.sh
+include update.bat
+include update.sh
+include doctor.bat
+include doctor.sh
+include jobs/example_job.yaml
 
 # Public YAML assets (whitelist; private channel profiles stay local via .gitignore).
 include profiles/default.yaml
@@ -18,7 +31,7 @@ include profiles/render_fast.yaml
 include profiles/render_hq.yaml
 include configs/rules.example.yaml
 
-# Test source for sdist (CI installs from sdist and runs pytest).
+# Test source for sdist (CI unpacks the sdist and runs pytest).
 recursive-include tests *.py
 recursive-include tests/fixtures *
 

@@ -328,6 +328,7 @@ def test_pipeline_export_forwards_offset(tmp_path: Path, monkeypatch):
     assert "--offset" in seen["cmd"]
     assert seen["cmd"][seen["cmd"].index("--offset") + 1] == "42.0"
     assert "--export-translation" in seen["cmd"]
+    assert seen["cmd"][seen["cmd"].index("--out-dir") + 1] == str(tj.parent)
 
 
 def test_publish_output_respects_backup_prev(tmp_path: Path):

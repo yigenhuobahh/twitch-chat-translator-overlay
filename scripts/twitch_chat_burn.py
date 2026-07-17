@@ -34,6 +34,49 @@ import sys
 import time
 import unicodedata
 
+_PROBE_TIMEOUT_SECONDS = 15.0
+_PREVIEW_FRAME_TIMEOUT_SECONDS = 120.0
+_MAX_EMOTE_ANIMATION_FRAMES = 300
+_MAX_EMOTE_SOURCE_PIXELS = 4_000_000
+_MAX_EMOTE_DECODED_BYTES_PER_ASSET = 32 * 1024 * 1024
+_MAX_EMOTE_DECODED_BYTES_TOTAL = 256 * 1024 * 1024
+
+
+def emote_decode_plan(
+    width,
+    height,
+    frame_count,
+    target_height,
+    remaining_bytes,
+):
+    """Validate one emote before Pillow materializes every animation frame."""
+    width = int(width)
+    height = int(height)
+    frame_count = int(frame_count)
+    target_height = int(target_height)
+    remaining_bytes = max(0, int(remaining_bytes))
+    if width <= 0 or height <= 0 or frame_count <= 0 or target_height <= 0:
+        raise ValueError("emote dimensions, frame count, and target height must be positive")
+    if width * height > _MAX_EMOTE_SOURCE_PIXELS:
+        raise ValueError(f"emote source has too many pixels ({width}x{height})")
+    if frame_count > _MAX_EMOTE_ANIMATION_FRAMES:
+        raise ValueError(
+            f"emote animation has too many frames "
+            f"({frame_count} > {_MAX_EMOTE_ANIMATION_FRAMES})"
+        )
+    target_width = max(1, int(width * target_height / height))
+    decoded_bytes = target_width * target_height * 4 * frame_count
+    if decoded_bytes > _MAX_EMOTE_DECODED_BYTES_PER_ASSET:
+        raise ValueError(
+            f"emote decoded size exceeds per-asset budget ({decoded_bytes} bytes)"
+        )
+    if decoded_bytes > remaining_bytes:
+        raise ValueError(
+            f"emote decoded size exceeds remaining global budget ({decoded_bytes} bytes)"
+        )
+    return target_width, decoded_bytes
+
+
 # Allow sibling imports when loaded as a script or via importlib from tests.
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
@@ -85,6 +128,7 @@ from process_util import (
 from render_perf import (
     assert_contiguous_frame_sequence,
     blank_gap_frame_indexes,
+    ensure_render_disk_headroom,
     expand_frame_sequence_for_ffmpeg,
     missing_frame_indexes,
     write_or_reuse_frame,
@@ -246,30 +290,10 @@ def wrap_fragments(frag_list, header_w, max_w, padding, indent, gap, text_width_
 # ============================================================
 
 def normalize_text(t):
-    """将不支持的 Unicode 字符（如数学字母符号）转为 ASCII。"""
-    result = []
-    for ch in t:
-        cp = ord(ch)
-        if 0x1D400 <= cp <= 0x1D7FF:  # Mathematical Alphanumeric Symbols
-            try:
-                name = unicodedata.name(ch, "")
-                parts = name.split()
-                if parts and parts[-1] in ("SMALL", "CAPITAL") and len(parts) >= 3:
-                    letter = parts[-2].lower() if parts[-1] == "SMALL" else parts[-2].upper()
-                    result.append(letter)
-                else:
-                    result.append(ch)
-            except Exception:
-                result.append(ch)
-        elif cp >= 0x10000:
-            decomp = unicodedata.normalize("NFKD", ch)
-            if all(ord(c) < 0x10000 for c in decomp):
-                result.append(decomp)
-            else:
-                result.append("?")
-        else:
-            result.append(ch)
-    return "".join(result)
+    """Normalize compatibility glyphs without destroying supplementary Unicode."""
+    # Keep emoji, ZWJ sequences and supplementary CJK whenever the font supports
+    # them; NFKC still simplifies mathematical compatibility letters.
+    return unicodedata.normalize("NFKC", str(t or ""))
 
 
 def hex_to_rgb(hex_color):
@@ -446,11 +470,15 @@ def frame_index_range(start_t, end_t, fps, total_frames):
 
 def probe_video_duration(video_path):
     """Read media duration via ffprobe. Returns float seconds or raises RuntimeError."""
-    probe = subprocess.run(
-        [require_executable("ffprobe"), "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", video_path],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        probe = subprocess.run(
+            [require_executable("ffprobe"), "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", video_path],
+            capture_output=True,
+            text=True,
+            timeout=_PROBE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"读取视频时长超时 ({_PROBE_TIMEOUT_SECONDS:g}s): {video_path}") from e
     raw = (probe.stdout or "").strip().splitlines()
     if probe.returncode != 0 or not raw:
         err = (probe.stderr or probe.stdout or "ffprobe failed").strip()[:400]
@@ -459,7 +487,7 @@ def probe_video_duration(video_path):
         duration = float(raw[0].strip() or 0.0)
     except ValueError as e:
         raise RuntimeError(f"无法解析视频时长 {raw[0]!r}: {e}") from e
-    if duration <= 0:
+    if not math.isfinite(duration) or duration <= 0:
         raise RuntimeError(f"视频时长无效 ({duration}): {video_path}")
     return duration
 
@@ -467,13 +495,18 @@ def probe_video_duration(video_path):
 
 def probe_video_dimensions(video_path):
     """Read the first video stream dimensions via ffprobe, or return None."""
-    probe = subprocess.run(
-        [
-            require_executable("ffprobe"), "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=width,height", "-of", "json", video_path,
-        ],
-        capture_output=True, text=True,
-    )
+    try:
+        probe = subprocess.run(
+            [
+                require_executable("ffprobe"), "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height", "-of", "json", video_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_PROBE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return None
     if probe.returncode != 0:
         return None
     try:
@@ -606,15 +639,19 @@ def adapt_absolute_layout_to_source(config, video_path) -> str | None:
 
 def probe_video_fps(video_path):
     """Best-effort source video FPS via ffprobe. Returns float or None."""
-    probe = subprocess.run(
-        [
-            require_executable("ffprobe"), "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=r_frame_rate,avg_frame_rate",
-            "-of", "json", video_path,
-        ],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        probe = subprocess.run(
+            [
+                require_executable("ffprobe"), "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=r_frame_rate,avg_frame_rate",
+                "-of", "json", video_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_PROBE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return None
     if probe.returncode != 0:
         return None
     try:
@@ -834,6 +871,7 @@ def schedule_messages(
     """
     msg_schedule = []
     lane_ends = {}
+    lane_owners = {}
     life = float(msg_lifetime or 0.0)
     if life <= 0:
         # Avoid zero/negative lifetimes that make every message permanently occupy
@@ -848,37 +886,29 @@ def schedule_messages(
     last_admitted_at = None
 
     def _evict_overlapping(base_lane: int, need_nl: int, t: float) -> bool:
-        """Truncate schedule rows overlapping [base_lane, base_lane+need_nl) at t.
-
-        Multi-line parents are one schedule row but occupy nl consecutive lanes;
-        free *all* of those sublanes when any overlap is seized.
-
-        Two-pass: check min_visible protection for every overlapping row first.
-        Mutating mid-scan then returning False left earlier rows truncated while
-        the new message was dropped (silent schedule corruption).
-        """
-        seize_lo = base_lane
-        seize_hi = base_lane + need_nl
-        victims: list[int] = []
-        for si, s in enumerate(msg_schedule):
-            s_start, s_end, s_lane, s_idx, s_nl = s
-            # Active at or through t (include same-timestamp occupants).
+        """Evict current lane owners without scanning all historical rows."""
+        victims = {
+            lane_owners[lane]
+            for lane in range(base_lane, base_lane + need_nl)
+            if lane_ends.get(lane, 0) > t and lane in lane_owners
+        }
+        # Check every victim first so min_visible rejection is atomic.
+        for si in sorted(victims):
+            s_start, s_end, s_lane, s_idx, s_nl = msg_schedule[si]
             if not (s_start <= t < s_end):
                 continue
-            row_lo = s_lane
-            row_hi = s_lane + max(1, int(s_nl))
-            if row_hi <= seize_lo or row_lo >= seize_hi:
-                continue
-            # A protected message wins over a newly arriving one. The caller
-            # drops the new message instead of cutting an on-screen message short.
             if t - s_start < min_visible:
                 return False
-            victims.append(si)
-        for si in victims:
+        for si in sorted(victims):
             s_start, s_end, s_lane, s_idx, s_nl = msg_schedule[si]
+            if not (s_start <= t < s_end):
+                continue
             msg_schedule[si] = (s_start, t, s_lane, s_idx, s_nl)
             for sub in range(max(1, int(s_nl))):
-                lane_ends[s_lane + sub] = t
+                lane = s_lane + sub
+                if lane_owners.get(lane) == si:
+                    lane_ends[lane] = t
+                    lane_owners.pop(lane, None)
         return True
 
     dropped_past_duration = 0
@@ -923,9 +953,12 @@ def schedule_messages(
                     all_free = False
                     break
             if all_free:
-                for sub in range(nl):
-                    lane_ends[lane + sub] = end
+                schedule_idx = len(msg_schedule)
                 msg_schedule.append((t, end, lane, i, nl))
+                for sub in range(nl):
+                    occupied_lane = lane + sub
+                    lane_ends[occupied_lane] = end
+                    lane_owners[occupied_lane] = schedule_idx
                 assigned = True
                 last_admitted_at = t
                 break
@@ -941,9 +974,12 @@ def schedule_messages(
                     best_lane = lane
             if not _evict_overlapping(best_lane, nl, t):
                 continue
-            for sub in range(nl):
-                lane_ends[best_lane + sub] = end
+            schedule_idx = len(msg_schedule)
             msg_schedule.append((t, end, best_lane, i, nl))
+            for sub in range(nl):
+                occupied_lane = best_lane + sub
+                lane_ends[occupied_lane] = end
+                lane_owners[occupied_lane] = schedule_idx
             last_admitted_at = t
 
     if dropped_past_duration:
@@ -1018,6 +1054,7 @@ def schedule_messages_float(
     # List subclass carries precomputed starts for O(1) bisect keys across CPs.
     out = _FloatEventList(events)
     out.starts = [e[0] for e in out]
+    out.sorted_by_start = True
     return out
 
 
@@ -1025,6 +1062,7 @@ class _FloatEventList(list):
     """Schedule list with optional .starts cache for active_float_stack."""
 
     starts: list[float]
+    sorted_by_start: bool = False
 
 
 def active_float_stack(events, current_t, capacity_lines):
@@ -1042,22 +1080,26 @@ def active_float_stack(events, current_t, capacity_lines):
     if not events:
         return []
 
-    # Prefer chronological order; schedule_messages_float returns sorted events.
-    # Only re-sort when a caller hands unsorted history.
-    needs_sort = False
-    for i in range(1, len(events)):
-        if (events[i][0], events[i][3]) < (events[i - 1][0], events[i - 1][3]):
-            needs_sort = True
-            break
-    ordered = (
-        sorted(events, key=lambda e: (e[0], e[3]))
-        if needs_sort
-        else events
+    # Product schedules carry a validated starts cache. Trust that marker instead
+    # of re-scanning all VOD history at every change point.
+    cached_starts = getattr(events, "starts", None)
+    known_sorted = (
+        isinstance(events, _FloatEventList)
+        and bool(getattr(events, "sorted_by_start", False))
+        and cached_starts is not None
+        and len(cached_starts) == len(events)
     )
+    needs_sort = False
+    if not known_sorted:
+        for i in range(1, len(events)):
+            if (events[i][0], events[i][3]) < (events[i - 1][0], events[i - 1][3]):
+                needs_sort = True
+                break
+    ordered = sorted(events, key=lambda e: (e[0], e[3])) if needs_sort else events
 
     # Candidates with start <= current_t (float ends are far future / open).
     # Prefer precomputed starts from schedule_messages_float (full-render hot path).
-    starts = getattr(events, "starts", None)
+    starts = cached_starts if known_sorted else None
     if starts is None or len(starts) != len(ordered) or needs_sort:
         starts = [e[0] for e in ordered]
     hi = bisect.bisect_right(starts, current_t)
@@ -1080,6 +1122,46 @@ def active_float_stack(events, current_t, capacity_lines):
         out.append((lane, idx, start, end, nl))
         lane += nl
     return out
+
+class _LaneVisibilityCursor:
+    """Incrementally resolve visible lane rows for monotonically increasing times."""
+
+    def __init__(self, schedule):
+        self._events = sorted(
+            enumerate(schedule),
+            key=lambda item: (item[1][0], item[0]),
+        )
+        self._cursor = 0
+        self._active = {}
+        self._last_t = float("-inf")
+
+    def _reset(self):
+        self._cursor = 0
+        self._active.clear()
+        self._last_t = float("-inf")
+
+    def at(self, current_t):
+        t = float(current_t)
+        if t < self._last_t:
+            self._reset()
+        while (
+            self._cursor < len(self._events)
+            and self._events[self._cursor][1][0] <= t
+        ):
+            schedule_i, row = self._events[self._cursor]
+            self._cursor += 1
+            if row[1] > t:
+                self._active[schedule_i] = row
+        expired = [i for i, row in self._active.items() if row[1] <= t]
+        for schedule_i in expired:
+            self._active.pop(schedule_i, None)
+        self._last_t = t
+        visible = [
+            (row[2], row[3], row[0], row[1], row[4])
+            for row in self._active.values()
+        ]
+        visible.sort(key=lambda row: row[0])
+        return visible
 
 
 def _normalize_import_identity_text(text):
@@ -1353,6 +1435,30 @@ def apply_imported_translations(chat_data, trans_data, strict=False):
 
     return replaced, stripped_placeholders, warnings
 
+AUTO_LAZY_MESSAGE_THRESHOLD = 1000
+
+
+def resolve_message_image_cache_policy(
+    message_count: int,
+    requested_lazy: bool,
+    cache_size: int,
+):
+    count = max(0, int(message_count or 0))
+    cap = max(8, int(cache_size or 256))
+    auto_enabled = count >= AUTO_LAZY_MESSAGE_THRESHOLD
+    return bool(requested_lazy or auto_enabled), cap, auto_enabled
+
+
+def _store_message_image(msg_images, msg_lines, idx, image, nl, *, lazy, cache_cap):
+    msg_lines[idx] = nl
+    msg_images[idx] = image
+    msg_images.move_to_end(idx)
+    if lazy:
+        while len(msg_images) > cache_cap:
+            evicted_idx, _image = msg_images.popitem(last=False)
+            msg_lines.pop(evicted_idx, None)
+    return len(msg_images)
+
 
 def render_overlay(chat_data, out_dir, video_path, config):
     """渲染聊天覆盖层为 PNG 帧序列。"""
@@ -1366,25 +1472,52 @@ def render_overlay(chat_data, out_dir, video_path, config):
     # GIF / animated WebP 不能直接 convert，否则只会取第一帧。
     # 预解码后按消息显示时间选择动画帧。
     emote_imgs = {}
+    decoded_emote_bytes = 0
     for cls, path in emote_map.items():
         try:
-            source = Image.open(path)
-            frames = []
-            durations = []
-            for frame_index in range(getattr(source, "n_frames", 1)):
-                source.seek(frame_index)
-                img = source.convert("RGBA")
-                if img.height != config.emote_h:
-                    scale = config.emote_h / img.height
-                    img = img.resize((max(1, int(img.width * scale)), config.emote_h), Image.LANCZOS)
-                frames.append(img)
-                durations.append(max(10, int(source.info.get("duration", 100))))
-            emote_imgs[cls] = {"frames": frames, "durations": durations, "cycle_ms": sum(durations), "width": frames[0].width}
+            with Image.open(path) as source:
+                frame_count = int(getattr(source, "n_frames", 1) or 1)
+                target_width, decoded_bytes = emote_decode_plan(
+                    source.width,
+                    source.height,
+                    frame_count,
+                    config.emote_h,
+                    _MAX_EMOTE_DECODED_BYTES_TOTAL - decoded_emote_bytes,
+                )
+                frames = []
+                durations = []
+                for frame_index in range(frame_count):
+                    source.seek(frame_index)
+                    image = source.convert("RGBA")
+                    if (
+                        image.width != target_width
+                        or image.height != config.emote_h
+                    ):
+                        image = image.resize(
+                            (target_width, config.emote_h),
+                            Image.LANCZOS,
+                        )
+                    frames.append(image)
+                    durations.append(
+                        max(10, int(source.info.get("duration", 100)))
+                    )
+            if not frames:
+                raise ValueError("emote has no decodable frames")
+            decoded_emote_bytes += decoded_bytes
+            emote_imgs[cls] = {
+                "frames": frames,
+                "durations": durations,
+                "cycle_ms": sum(durations),
+                "width": frames[0].width,
+            }
             state = f"动画 {len(frames)} 帧" if len(frames) > 1 else "静态"
-            print(f"  emote: {cls} ({frames[0].width}x{frames[0].height}, {state})", flush=True)
-        except Exception as e:
-            print(f"  emote 加载失败 {cls}: {e}", flush=True)
-
+            print(
+                f"  emote: {cls} "
+                f"({frames[0].width}x{frames[0].height}, {state})",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"  emote 加载失败 {cls}: {exc}", flush=True)
     def emote_image(cls, message_age=0.0):
         emote = emote_imgs.get(cls)
         if not emote:
@@ -1636,13 +1769,19 @@ def render_overlay(chat_data, out_dir, video_path, config):
     # - --lazy-message-images: only render when a message becomes visible; LRU cap for long VODs
     from collections import OrderedDict
 
-    lazy_images = bool(getattr(config, "lazy_message_images", False))
-    cache_cap = max(8, int(getattr(config, "message_image_cache_size", 256) or 256))
+    lazy_images, cache_cap, auto_lazy = resolve_message_image_cache_policy(
+        len(messages),
+        bool(getattr(config, "lazy_message_images", False)),
+        int(getattr(config, "message_image_cache_size", 256) or 256),
+    )
+    config.lazy_message_images = lazy_images
+    cache_peak = 0
     msg_images = OrderedDict()  # idx -> Image
     msg_lines = {}  # msg_index -> num_lines
 
     def message_image(idx, message_age=0.0, force_dynamic=False):
         """Return (img, nl) for message idx; animated/dynamic always re-renders."""
+        nonlocal cache_peak
         if force_dynamic or idx in animated_message_ids:
             img, nl = render_message(messages[idx], message_age)
             msg_lines[idx] = nl
@@ -1651,11 +1790,12 @@ def render_overlay(chat_data, out_dir, video_path, config):
             msg_images.move_to_end(idx)
             return msg_images[idx], msg_lines.get(idx, 1)
         img, nl = render_message(messages[idx], 0.0)
-        msg_lines[idx] = nl
-        msg_images[idx] = img
-        if lazy_images:
-            while len(msg_images) > cache_cap:
-                msg_images.popitem(last=False)
+        cache_size = _store_message_image(
+            msg_images, msg_lines, idx, img, nl,
+            lazy=lazy_images,
+            cache_cap=cache_cap,
+        )
+        cache_peak = max(cache_peak, cache_size)
         return img, nl
 
     if lazy_images:
@@ -1663,6 +1803,11 @@ def render_overlay(chat_data, out_dir, video_path, config):
             f"  消息图: lazy 模式 (cache_size={cache_cap}, messages={len(messages)})",
             flush=True,
         )
+        if auto_lazy:
+            print(
+                f"  消息数达到 {AUTO_LAZY_MESSAGE_THRESHOLD}，已自动启用 lazy 缓存",
+                flush=True,
+            )
     else:
         for i in range(len(messages)):
             img, nl = message_image(i)
@@ -1674,6 +1819,7 @@ def render_overlay(chat_data, out_dir, video_path, config):
     for old in os.listdir(frames_dir):
         if old.endswith(".png"):
             os.remove(os.path.join(frames_dir, old))
+    ensure_render_disk_headroom(frames_dir)
 
     FPS = config.fps
     W, H = config.width, config.height
@@ -1707,7 +1853,7 @@ def render_overlay(chat_data, out_dir, video_path, config):
     blank_hold_seconds = float(getattr(config, "blank_hold_seconds", 0.5) or 0.5)
     blank_stride = max(1, int(round(blank_hold_seconds * FPS)))
     stats = {
-        "written": 0,
+        "write": 0,
         "hardlink": 0,
         "copy": 0,
         "reused_static": 0,
@@ -1718,6 +1864,7 @@ def render_overlay(chat_data, out_dir, video_path, config):
     written_indexes: list[int] = []
     last_static_key = None
     last_static_frame_idx = None
+    lane_visibility = None if stack_mode == "float" else _LaneVisibilityCursor(msg_schedule)
 
     for cp_idx in range(len(change_points)):
         cp = change_points[cp_idx]
@@ -1727,11 +1874,7 @@ def render_overlay(chat_data, out_dir, video_path, config):
             # Bottom-up Twitch stack: recompute lanes from currently active messages.
             visible = active_float_stack(msg_schedule, cp, MAX_VISIBLE)
         else:
-            visible = []
-            for start, end, lane, idx, nl_sch in msg_schedule:
-                if start <= cp < end:
-                    visible.append((lane, idx, start, end, nl_sch))
-            visible.sort(key=lambda v: v[0])
+            visible = lane_visibility.at(cp)
 
         if preview_frame_time is not None:
             frame_indexes = [0]
@@ -1780,6 +1923,8 @@ def render_overlay(chat_data, out_dir, video_path, config):
                 break
 
             out_frame_num = 0 if preview_frame_time is not None else frame_i
+            if frame_num % 256 == 0:
+                ensure_render_disk_headroom(frames_dir)
 
             # Reuse previous identical static frame without re-compositing.
             if (
@@ -1894,7 +2039,7 @@ def render_overlay(chat_data, out_dir, video_path, config):
                 eta_str = ""
             print(
                 f"  [{cp_idx+1}/{len(change_points)}] t={cp:.1f}s {len(visible)}msgs "
-                f"{pct:.0f}% write={stats['written']} reuse={stats['reused_static']}{eta_str}",
+                f"{pct:.0f}% write={stats['write']} reuse={stats['reused_static']}{eta_str}",
                 flush=True,
             )
             last_progress_time = now
@@ -1925,12 +2070,15 @@ def render_overlay(chat_data, out_dir, video_path, config):
         frame_num = final_count
 
     elapsed_total = time.time() - render_start_time
+    stats["message_cache_peak"] = cache_peak
+    stats["lazy_message_images"] = int(lazy_images)
+    stats["auto_lazy_message_images"] = int(auto_lazy)
     config.frame_stats = stats
     config.stage_timings = dict(getattr(config, "stage_timings", {}) or {})
     config.stage_timings["render_frames"] = elapsed_total
     print(
         f"  完成: {frame_num} 帧, 用时 {int(elapsed_total//60)}m{int(elapsed_total%60)}s "
-        f"(write={stats['written']}, hardlink={stats['hardlink']}, copy={stats['copy']}, "
+        f"(write={stats['write']}, hardlink={stats['hardlink']}, copy={stats['copy']}, "
         f"static_reuse={stats['reused_static']}, blank_sparse={stats['blank_sparse']}, filled={stats['filled']})",
         flush=True,
     )
@@ -1945,11 +2093,23 @@ def render_overlay(chat_data, out_dir, video_path, config):
         preview_path = os.path.join(out_dir, safe_name)
         bg_path = os.path.join(out_dir, "preview_video_frame.png")
         # Accurate single-frame extract (decode then seek) for preview alignment.
-        r = subprocess.run([
-            require_executable("ffmpeg"), "-y", "-i", video_path, "-ss", str(preview_t),
-            "-frames:v", "1", bg_path,
-        ], capture_output=True, text=True)
-        if r.returncode == 0 and os.path.isfile(bg_path):
+        try:
+            r = subprocess.run(
+                [
+                    require_executable("ffmpeg"), "-y", "-i", video_path,
+                    "-ss", str(preview_t), "-frames:v", "1", bg_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_PREVIEW_FRAME_TIMEOUT_SECONDS,
+            )
+            preview_error = (r.stderr or "ffmpeg failed")[-300:]
+        except subprocess.TimeoutExpired:
+            r = None
+            preview_error = (
+                f"单帧抽取超过 {_PREVIEW_FRAME_TIMEOUT_SECONDS:g}s，已终止"
+            )
+        if r is not None and r.returncode == 0 and os.path.isfile(bg_path):
             bg = Image.open(bg_path).convert("RGBA")
             overlay = Image.open(os.path.join(frames_dir, "frame_00000.png")).convert("RGBA")
             bg.paste(overlay, (config.x, config.y), overlay)
@@ -1959,7 +2119,7 @@ def render_overlay(chat_data, out_dir, video_path, config):
             except OSError:
                 pass
         else:
-            print(f"  警告: 无法抽取视频帧，改为输出 overlay 透明图: {r.stderr[-300:]}", flush=True)
+            print(f"  警告: 无法抽取视频帧，改为输出 overlay 透明图: {preview_error}", flush=True)
             Image.open(os.path.join(frames_dir, "frame_00000.png")).save(preview_path)
         # If user requested a path outside out_dir, also publish a copy there after
         # the safe write (explicit user intent; still keep the in-job copy).
@@ -2001,18 +2161,24 @@ def detect_frame_start_number(frames_dir):
 
 def get_stream_start_time(video_path, stream_selector):
     """读取流起始时间；缺失/异常时回退 0。"""
-    probe = subprocess.run(
-        [
-            require_executable("ffprobe"), "-v", "error", "-select_streams", stream_selector,
-            "-show_entries", "stream=start_time", "-of", "csv=p=0", video_path,
-        ],
-        capture_output=True, text=True,
-    )
+    try:
+        probe = subprocess.run(
+            [
+                require_executable("ffprobe"), "-v", "error", "-select_streams", stream_selector,
+                "-show_entries", "stream=start_time", "-of", "csv=p=0", video_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_PROBE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return 0.0
     try:
         raw = (probe.stdout or "").strip().splitlines()
         if not raw:
             return 0.0
-        return float(raw[0] or 0)
+        value = float(raw[0] or 0)
+        return value if math.isfinite(value) else 0.0
     except ValueError:
         return 0.0
 
@@ -2028,14 +2194,20 @@ def probe_media_summary(path):
         "height": 0,
         "error": "",
     }
-    probe = subprocess.run(
-        [
-            require_executable("ffprobe"), "-v", "error",
-            "-show_entries", "format=duration:stream=index,codec_type,width,height",
-            "-of", "json", path,
-        ],
-        capture_output=True, text=True,
-    )
+    try:
+        probe = subprocess.run(
+            [
+                require_executable("ffprobe"), "-v", "error",
+                "-show_entries", "format=duration:stream=index,codec_type,width,height",
+                "-of", "json", path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_PROBE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        summary["error"] = f"ffprobe timed out after {_PROBE_TIMEOUT_SECONDS:g}s"
+        return summary
     if probe.returncode != 0:
         summary["error"] = (probe.stderr or probe.stdout or "ffprobe failed").strip()[:400]
         return summary
@@ -2498,6 +2670,57 @@ def _format_import_translation_command(
     )
 
 
+def _validate_offset(value) -> float:
+    offset = float(value)
+    if not math.isfinite(offset):
+        raise ValueError("--offset must be finite")
+    if abs(offset) > 7 * 24 * 3600.0:
+        raise ValueError("--offset absolute value must be <= 7 days")
+    return offset
+
+
+def _validate_runtime_args(args) -> None:
+    validate_positive_int("--fps", args.fps, minimum=1, maximum=240)
+    if args.output_fps is not None:
+        validate_positive_float("--output-fps", args.output_fps, minimum=1.0, maximum=240.0)
+    validate_positive_int("--w/--width", args.width, minimum=16, maximum=7680)
+    validate_positive_int("--h/--height", args.height, minimum=16, maximum=4320)
+    validate_positive_int("--font-size", args.font_size, minimum=8, maximum=128)
+    validate_positive_int("--emote-height", args.emote_height, minimum=8, maximum=256)
+    validate_positive_int("--max-visible", args.max_visible, minimum=0, maximum=100)
+    validate_positive_int(
+        "--message-image-cache-size",
+        args.message_image_cache_size,
+        minimum=8,
+        maximum=100000,
+    )
+    stack_mode = str(getattr(args, "stack_mode", "lanes") or "lanes").strip().lower()
+    if stack_mode not in ("float", "lanes"):
+        raise ValueError(f"--stack-mode must be float or lanes, got {args.stack_mode!r}")
+    args.stack_mode = stack_mode
+    if stack_mode == "lanes":
+        validate_positive_float("--msg-lifetime", args.msg_lifetime, minimum=0.1, maximum=600.0)
+    validate_positive_int("--max-message-lines", args.max_message_lines, minimum=0, maximum=100)
+    validate_non_negative_float("--min-visible-seconds", args.min_visible_seconds, maximum=600.0)
+    validate_non_negative_float("--arrival-interval", args.arrival_interval, maximum=600.0)
+    for ratio_arg in ("x_ratio", "y_ratio", "width_ratio", "height_ratio", "font_size_ratio"):
+        validate_non_negative_float(f"--{ratio_arg.replace('_', '-')}", getattr(args, ratio_arg), maximum=1.0)
+    if stack_mode == "lanes" and args.msg_lifetime > 0 and args.min_visible_seconds > args.msg_lifetime:
+        raise ValueError("--min-visible-seconds must be <= --msg-lifetime")
+    if args.preview_frame is not None:
+        validate_non_negative_float("--preview-frame", args.preview_frame, maximum=24 * 3600.0)
+    if args.preview_clip is not None:
+        validate_non_negative_float("--preview-clip", args.preview_clip, maximum=24 * 3600.0)
+        if float(args.preview_clip) <= 0:
+            raise ValueError("--preview-clip must be > 0")
+    if args.offset is not None:
+        _validate_offset(args.offset)
+    validate_non_negative_float("--blank-hold-seconds", args.blank_hold_seconds, maximum=30.0)
+    if args.blank_hold_seconds <= 0:
+        raise ValueError("--blank-hold-seconds must be > 0")
+    if not 0 <= args.bg_alpha <= 255:
+        raise ValueError("--bg-alpha must be between 0 and 255")
+
 def main():
     from env_bootstrap import prepend_tools_ffmpeg_to_path
 
@@ -2573,6 +2796,11 @@ def main():
     parser.add_argument("--bg-alpha", type=int, default=255, help="背景透明度 0-255 (默认 255，不透明黑底)")
     parser.add_argument("--emote-height", type=int, default=22, help="emote 图片高度像素 (默认 22)")
     parser.add_argument("--offset", type=float, default=None, help="时间偏移修正秒数")
+    parser.add_argument(
+        "--allow-empty-chat",
+        action="store_true",
+        help="允许解析结果为 0 条消息并继续（默认失败，避免静默生成无弹幕成片）",
+    )
     parser.add_argument("--keep-temp", action="store_true", help="保留中间文件")
     parser.add_argument(
         "--job-dir",
@@ -2780,9 +3008,7 @@ def main():
                 raise ValueError("--preview-clip must be > 0")
         if args.offset is not None:
             # Offset may be negative (chat behind video) or large positive (VOD clip start).
-            off = float(args.offset)
-            if abs(off) > 7 * 24 * 3600.0:
-                raise ValueError("--offset absolute value must be <= 7 days")
+            _validate_offset(args.offset)
         validate_non_negative_float("--blank-hold-seconds", args.blank_hold_seconds, maximum=30.0)
         if args.blank_hold_seconds <= 0:
             raise ValueError("--blank-hold-seconds must be > 0")
@@ -2821,6 +3047,11 @@ def main():
             print(f"[render-preset] 加载失败: {e}", flush=True)
             return 2
 
+    # Validate the final namespace after both layout and render presets apply.
+    try:
+        _validate_runtime_args(args)
+    except ValueError as e:
+        parser.error(str(e))
     try:
         encode_opts = resolve_encode_options(
             encoder=args.encoder,
@@ -2856,9 +3087,14 @@ def main():
     # 检查 ffmpeg（导出翻译模式不需要）
     if not args.export_translation:
         try:
-            subprocess.run([require_executable("ffmpeg"), "-version"], capture_output=True, check=True)
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            print("错误: 未找到 ffmpeg，请确保已安装并在 PATH 中")
+            subprocess.run(
+                [require_executable("ffmpeg"), "-version"],
+                capture_output=True,
+                check=True,
+                timeout=_PROBE_TIMEOUT_SECONDS,
+            )
+        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            print("错误: ffmpeg 不可用或版本探测超时，请检查安装与 PATH")
             sys.exit(1)
 
     # Working directories:
@@ -2979,6 +3215,12 @@ def main():
 
     # Step 1: 解析 HTML
     chat_data = parse_chat_html(html_path, out_dir)
+    if not (chat_data.get("messages") or []):
+        if not bool(getattr(args, "allow_empty_chat", False)):
+            print("错误: 聊天 HTML 未解析出任何有效消息，已停止以避免生成无弹幕成片")
+            print("  如确认该 VOD 聊天本来为空，可显式添加 --allow-empty-chat")
+            return 1
+        print("  [WARN] --allow-empty-chat: 将继续生成无消息 overlay", flush=True)
 
     # Structured offset diagnosis (manual / auto / warnings).
     video_dur = None
@@ -3233,7 +3475,7 @@ def main():
     if args.preview_clip is not None:
         duration = min(duration, max(0.1, float(args.preview_clip)))
 
-    def promote_to_out_base(src_path: str) -> str:
+    def promote_to_out_base(src_path: str) -> str | None:
         """Copy a job-dir artifact to out_base with temp+replace and .bak restore.
 
         Concurrent runs sharing the same out_base each have a unique job_ dir.
@@ -3241,7 +3483,7 @@ def main():
         job-unique name so the last writer does not silently overwrite the other.
         """
         if not src_path or not os.path.isfile(src_path):
-            return src_path
+            return None
         if os.path.abspath(out_dir) == os.path.abspath(out_base):
             return src_path
         base_name = os.path.basename(src_path)
@@ -3300,7 +3542,7 @@ def main():
                     print(f"  已从备份恢复: {promoted}", flush=True)
                 except OSError as restore_err:
                     print(f"  警告: 无法从备份恢复 {backup}: {restore_err}", flush=True)
-            return src_path
+            return None
 
     if args.preview_frame is not None:
         # render_overlay already wrote the preview image and set config.preview_image
@@ -3316,15 +3558,30 @@ def main():
                 candidates.append(os.path.abspath(str(args.preview_image)))
             candidates.append(os.path.join(out_dir, default_name))
             preview_path = next((p for p in candidates if p and os.path.isfile(p)), candidates[0])
-        # If still inside job dir, promote basename to out_base; if already outside, keep.
-        if path_is_under(preview_path, out_dir) and os.path.abspath(out_dir) != os.path.abspath(out_base):
+        needs_promote = (
+            path_is_under(preview_path, out_dir)
+            and os.path.abspath(out_dir) != os.path.abspath(out_base)
+        )
+        if needs_promote:
             final_preview = promote_to_out_base(preview_path)
         else:
-            final_preview = preview_path
+            final_preview = preview_path if os.path.isfile(preview_path) else None
+        if not final_preview:
+            mark_run_status(
+                out_dir,
+                "failed",
+                stage="publish_preview",
+                job_output=preview_path,
+                out_base=out_base,
+            )
+            print("\n[FAIL] 预览图发布失败，job 内文件已保留")
+            print(f"   预览文件: {preview_path}")
+            print(f"   排查目录: {out_dir}")
+            return 1
         print(f"\n[OK] 预览图已生成，跳过视频合成: {final_preview}")
         if not args.keep_temp and os.path.abspath(out_dir) != os.path.abspath(out_base):
             shutil.rmtree(out_dir, ignore_errors=True)
-        return
+        return 0
 
     # Step 3: 合成视频
     result = compose_video(video_path, frames_dir, out_dir, config, duration)
@@ -3364,11 +3621,12 @@ def main():
             except OSError as e:
                 print(f"  警告: 无法保存 run_meta 到输出目录: {e}", flush=True)
     else:
+        failure_stage = "publish" if result else "compose_or_render"
         mark_run_status(
             out_dir,
             "failed",
-            stage="compose_or_render",
-            note="partial.mp4 / ffmpeg logs may remain in job dir",
+            stage=failure_stage,
+            note="job output and diagnostics retained for recovery",
         )
         # Always leave a durable breadcrumb next to out_base so a failed full
         # render does not leave only a stale success meta from a prior preview.
@@ -3383,7 +3641,9 @@ def main():
                 print(f"  警告: 无法保存失败 run_meta 到输出目录: {e}", flush=True)
 
     if not args.keep_temp:
-        if used_isolated_job and final_result and os.path.isfile(final_result):
+        if not final_result:
+            print(f"   失败现场已保留在 {out_dir}", flush=True)
+        elif used_isolated_job and os.path.isfile(final_result):
             # Whole job directory is disposable after successful publish + meta copy.
             shutil.rmtree(out_dir, ignore_errors=True)
             cleaned = 1
@@ -3421,7 +3681,7 @@ def main():
             f"   FFmpeg 日志: {os.path.join(out_dir, 'ffmpeg-overlay.log')} / "
             f"{os.path.join(out_dir, 'ffmpeg-webm.log')}"
         )
-        sys.exit(1)
+        return 1
 
 
 if __name__ == "__main__":

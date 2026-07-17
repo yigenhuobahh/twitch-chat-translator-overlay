@@ -11,11 +11,13 @@ from pathlib import Path
 import re
 import threading
 import time
+import uuid
 
 
 class TranslationErrorKind:
     RATE_LIMIT = "rate_limit"
     AUTH = "auth"
+    CLIENT = "client"
     TIMEOUT = "timeout"
     BAD_JSON = "bad_json"
     SERVER = "server"
@@ -29,16 +31,28 @@ def classify_api_error(exc: BaseException) -> str:
     if status is None:
         resp = getattr(exc, "response", None)
         status = getattr(resp, "status_code", None) if resp is not None else None
+    try:
+        status_code = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status_code = None
 
-    if status == 429 or "rate limit" in text or "too many requests" in text or "1302" in text:
+    if status_code == 429:
         return TranslationErrorKind.RATE_LIMIT
-    if status in (401, 403) or "unauthorized" in text or "forbidden" in text or "invalid api key" in text:
+    if status_code in (401, 403):
+        return TranslationErrorKind.AUTH
+    if status_code == 408:
+        return TranslationErrorKind.TIMEOUT
+    if status_code is not None and 400 <= status_code < 500:
+        return TranslationErrorKind.CLIENT
+    if "rate limit" in text or "too many requests" in text or "1302" in text:
+        return TranslationErrorKind.RATE_LIMIT
+    if "unauthorized" in text or "forbidden" in text or "invalid api key" in text:
         return TranslationErrorKind.AUTH
     if "timeout" in text or "timed out" in text:
         return TranslationErrorKind.TIMEOUT
     if "json" in text and ("decode" in text or "parse" in text or "expecting" in text):
         return TranslationErrorKind.BAD_JSON
-    if status is not None and int(status) >= 500:
+    if status_code is not None and status_code >= 500:
         return TranslationErrorKind.SERVER
     if "connection" in text or "network" in text or "temporarily unavailable" in text:
         return TranslationErrorKind.NETWORK
@@ -75,6 +89,7 @@ def backoff_seconds(kind: str, attempt: int, exc: BaseException | None = None) -
         TranslationErrorKind.NETWORK: 8.0,
         TranslationErrorKind.BAD_JSON: 3.0,
         TranslationErrorKind.AUTH: 0.0,
+        TranslationErrorKind.CLIENT: 0.0,
         TranslationErrorKind.UNKNOWN: 12.0,
     }.get(kind, 12.0)
     if base <= 0:
@@ -82,12 +97,24 @@ def backoff_seconds(kind: str, attempt: int, exc: BaseException | None = None) -
     return min(120.0, base * (2 ** attempt))
 
 
-def cache_key(original: str, target_language: str, model: str, context: str) -> str:
+def cache_key(
+    original: str,
+    target_language: str,
+    model: str,
+    context: str,
+    *,
+    provider: str = "",
+    base_url: str = "",
+    prompt_version: str = "",
+) -> str:
     raw = "\0".join([
         original or "",
         target_language or "",
         model or "",
         context or "",
+        (provider or "").strip().lower(),
+        (base_url or "").strip().rstrip("/"),
+        str(prompt_version or ""),
     ])
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
@@ -100,10 +127,29 @@ class TranslationCache:
         if self.enabled:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def get(self, original: str, target_language: str, model: str, context: str) -> str | None:
+    def get(
+        self,
+        original: str,
+        target_language: str,
+        model: str,
+        context: str,
+        *,
+        provider: str = "",
+        base_url: str = "",
+        prompt_version: str = "",
+    ) -> str | None:
         if not self.enabled:
             return None
-        path = self.cache_dir / f"{cache_key(original, target_language, model, context)}.json"
+        key = cache_key(
+            original,
+            target_language,
+            model,
+            context,
+            provider=provider,
+            base_url=base_url,
+            prompt_version=prompt_version,
+        )
+        path = self.cache_dir / f"{key}.json"
         with self._lock:
             if not path.is_file():
                 return None
@@ -114,22 +160,57 @@ class TranslationCache:
             except Exception:
                 return None
 
-    def put(self, original: str, target_language: str, model: str, context: str, translation: str) -> None:
+    def put(
+        self,
+        original: str,
+        target_language: str,
+        model: str,
+        context: str,
+        translation: str,
+        *,
+        provider: str = "",
+        base_url: str = "",
+        prompt_version: str = "",
+    ) -> bool:
         if not self.enabled:
-            return
-        path = self.cache_dir / f"{cache_key(original, target_language, model, context)}.json"
+            return False
+        key = cache_key(
+            original,
+            target_language,
+            model,
+            context,
+            provider=provider,
+            base_url=base_url,
+            prompt_version=prompt_version,
+        )
+        path = self.cache_dir / f"{key}.json"
         payload = {
             "original": original,
             "target_language": target_language,
             "model": model,
             "context": context,
+            "provider": provider,
+            "prompt_version": prompt_version,
             "translation": translation,
             "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
-        tmp = path.with_suffix(".tmp")
-        with self._lock:
-            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            os.replace(tmp, path)
+        tmp = path.with_name(
+            f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            with self._lock:
+                tmp.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                os.replace(tmp, path)
+        except OSError:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
+        return True
 
 
 def summarize_errors(error_counts: dict[str, int]) -> str:

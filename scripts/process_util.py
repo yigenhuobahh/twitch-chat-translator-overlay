@@ -202,6 +202,18 @@ def run_tracked(
 
 
 JOB_DIR_MARKER = ".twitch_overlay_job"
+_WINDOWS_REPARSE_POINT = 0x400
+
+
+def _is_link_or_reparse_point(path: str | Path) -> bool:
+    """Refuse filesystem indirections before scanning or deleting entries."""
+    try:
+        if os.path.islink(path) or Path(path).is_symlink():
+            return True
+        attrs = int(getattr(os.lstat(path), "st_file_attributes", 0) or 0)
+        return bool(attrs & _WINDOWS_REPARSE_POINT)
+    except OSError:
+        return True
 
 
 def make_job_dir(parent: str | Path, prefix: str = "job_") -> Path:
@@ -228,15 +240,11 @@ def is_tool_job_dir(path: str | Path, prefix: str = "job_") -> bool:
     Loose names like job_backup_final are *not* treated as tool jobs.
     """
     p = Path(path)
+    if _is_link_or_reparse_point(p):
+        return False
     if not p.is_dir():
         return False
     if not p.name.startswith(prefix):
-        return False
-    # Never follow/delete through symlinks or junctions as tool jobs.
-    try:
-        if p.is_symlink():
-            return False
-    except OSError:
         return False
     marker = p / JOB_DIR_MARKER
     if marker.is_file():
@@ -433,10 +441,7 @@ def clean_temp_artifacts(
         if only_abs is None and not (name.startswith("job_") or name.startswith("batch_")):
             return False
         # Refuse to rmtree symlinks/junctions (target may be outside out_base).
-        try:
-            if Path(path).is_symlink() or os.path.islink(path):
-                return False
-        except OSError:
+        if _is_link_or_reparse_point(path):
             return False
         path_abs = os.path.abspath(path)
         if only_abs is not None:
@@ -473,6 +478,8 @@ def clean_temp_artifacts(
         nonlocal freed, count, skipped_jobs
         name = os.path.basename(entry_path)
         try:
+            if _is_link_or_reparse_point(entry_path):
+                return
             if os.path.isdir(entry_path):
                 # Default clean keeps jobs: count by name prefix only (no marker I/O).
                 if not remove_job_dirs and (name.startswith("job_") or name.startswith("batch_")):
@@ -516,7 +523,7 @@ def clean_temp_artifacts(
     if scan_one_level and only_abs is None:
         for subdir in list(os.listdir(out_base)):
             subdir_path = os.path.join(out_base, subdir)
-            if not os.path.isdir(subdir_path):
+            if _is_link_or_reparse_point(subdir_path) or not os.path.isdir(subdir_path):
                 continue
             # Do not recurse into leftover job/batch dirs already removed above.
             if subdir.startswith("job_") or subdir.startswith("batch_"):

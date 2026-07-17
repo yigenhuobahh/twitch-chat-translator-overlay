@@ -13,11 +13,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import platform
+import shutil
+import stat
 import subprocess
 import sys
-from urllib.request import urlretrieve
+import tempfile
+from urllib.request import Request, urlopen
+import uuid
 import zipfile
 
 from common_utils import (
@@ -41,6 +45,155 @@ class CheckItem:
     fix_cmds: list[str] = field(default_factory=list)
     fix_urls: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+
+
+MAX_PORTABLE_DOWNLOAD_BYTES = 512 * 1024 * 1024
+MAX_PORTABLE_EXTRACTED_BYTES = 2 * 1024 * 1024 * 1024
+MAX_PORTABLE_ARCHIVE_FILES = 20_000
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def _archive_member_target(root: Path, info: zipfile.ZipInfo) -> Path:
+    raw_name = info.filename
+    normalized = raw_name.replace("\\", "/")
+    member = PurePosixPath(normalized)
+    if (
+        not raw_name
+        or "\x00" in raw_name
+        or normalized.startswith("/")
+        or member.is_absolute()
+        or not member.parts
+        or any(part in ("", ".", "..") for part in member.parts)
+        or ":" in member.parts[0]
+    ):
+        raise ValueError(f"unsafe archive member path: {raw_name!r}")
+    target = root.joinpath(*member.parts)
+    try:
+        target.resolve(strict=False).relative_to(root.resolve())
+    except ValueError as exc:
+        raise ValueError(f"archive member escapes destination: {raw_name!r}") from exc
+    return target
+
+
+def safe_extract_zip(
+    archive: zipfile.ZipFile,
+    destination: Path,
+    *,
+    max_files: int = MAX_PORTABLE_ARCHIVE_FILES,
+    max_uncompressed_bytes: int = MAX_PORTABLE_EXTRACTED_BYTES,
+) -> None:
+    """Extract a trusted-tool archive with traversal and resource limits."""
+    infos = archive.infolist()
+    if len(infos) > max_files:
+        raise ValueError(f"archive contains too many entries ({len(infos)} > {max_files})")
+    declared_size = sum(max(0, int(info.file_size)) for info in infos)
+    if declared_size > max_uncompressed_bytes:
+        raise ValueError(
+            "archive expands beyond the allowed size "
+            f"({declared_size} > {max_uncompressed_bytes} bytes)"
+        )
+
+    destination.mkdir(parents=True, exist_ok=True)
+    seen: set[str] = set()
+    targets: list[tuple[zipfile.ZipInfo, Path, int]] = []
+    for info in infos:
+        if info.flag_bits & 0x1:
+            raise ValueError(f"encrypted archive member is not supported: {info.filename!r}")
+        unix_mode = (info.external_attr >> 16) & 0xFFFF
+        file_type = stat.S_IFMT(unix_mode)
+        if file_type == stat.S_IFLNK:
+            raise ValueError(f"archive symlink is not allowed: {info.filename!r}")
+        if file_type not in (0, stat.S_IFREG, stat.S_IFDIR):
+            raise ValueError(f"special archive member is not allowed: {info.filename!r}")
+        target = _archive_member_target(destination, info)
+        identity = os.path.normcase(str(target.resolve(strict=False)))
+        if identity in seen:
+            raise ValueError(f"duplicate archive member path: {info.filename!r}")
+        seen.add(identity)
+        targets.append((info, target, unix_mode))
+
+    extracted_size = 0
+    for info, target, unix_mode in targets:
+        if info.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        written = 0
+        with archive.open(info, "r") as source, target.open("xb") as output:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                extracted_size += len(chunk)
+                if written > int(info.file_size) or extracted_size > max_uncompressed_bytes:
+                    raise ValueError(f"archive member exceeded its size budget: {info.filename!r}")
+                output.write(chunk)
+        if written != int(info.file_size):
+            raise ValueError(f"archive member size mismatch: {info.filename!r}")
+        if os.name != "nt" and unix_mode:
+            target.chmod(unix_mode & 0o777)
+
+
+def stream_response_to_path(response, path: Path, *, max_bytes: int) -> int:
+    """Stream an HTTP response to a new file while enforcing a byte ceiling."""
+    headers = getattr(response, "headers", None)
+    length_value = headers.get("Content-Length") if headers is not None else None
+    if length_value is None and hasattr(response, "getheader"):
+        length_value = response.getheader("Content-Length")
+    if length_value:
+        try:
+            content_length = int(length_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid Content-Length in download response") from exc
+        if content_length < 0 or content_length > max_bytes:
+            raise ValueError(
+                f"download exceeds the allowed size ({content_length} > {max_bytes} bytes)"
+            )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    total = 0
+    with path.open("xb") as output:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"download exceeded the allowed size ({total} > {max_bytes} bytes)")
+            output.write(chunk)
+    return total
+
+
+def atomic_replace_directory(staged: Path, destination: Path) -> None:
+    """Replace a tool directory only after a complete staged install validates."""
+    if not staged.is_dir():
+        raise ValueError(f"staged install is not a directory: {staged}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if staged.parent.resolve() != destination.parent.resolve():
+        raise ValueError("staged install must be a sibling of its destination")
+
+    backup: Path | None = None
+    if destination.exists() or destination.is_symlink():
+        backup = destination.with_name(f".{destination.name}.backup-{uuid.uuid4().hex}")
+        os.replace(destination, backup)
+    try:
+        os.replace(staged, destination)
+    except Exception:
+        if backup is not None and not destination.exists():
+            os.replace(backup, destination)
+        raise
+    if backup is not None:
+        try:
+            _remove_path(backup)
+        except OSError:
+            pass
 
 
 def _repo_root() -> Path:
@@ -509,6 +662,21 @@ _GYAN_ESSENTIALS_URL = (
 )
 
 
+def _find_ffmpeg_bin(root: Path) -> Path | None:
+    candidates = [root, root / "bin"]
+    try:
+        candidates.extend(child / "bin" for child in root.iterdir() if child.is_dir())
+    except OSError:
+        return None
+    for candidate in candidates:
+        if (
+            (candidate / "ffmpeg.exe").is_file()
+            and (candidate / "ffprobe.exe").is_file()
+        ):
+            return candidate
+    return None
+
+
 def try_portable_ffmpeg(*, assume_yes: bool = False, root: Path | None = None) -> bool:
     """P4: download portable FFmpeg into tools/ffmpeg (Windows primarily)."""
     if safe_which("ffmpeg") and safe_which("ffprobe"):
@@ -528,23 +696,48 @@ def try_portable_ffmpeg(*, assume_yes: bool = False, root: Path | None = None) -
         return False
 
     dest_root = root / "tools" / "ffmpeg"
-    dest_root.mkdir(parents=True, exist_ok=True)
-    zip_path = dest_root / "ffmpeg-release-essentials.zip"
+    dest_root.parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(
+        tempfile.mkdtemp(prefix=f".{dest_root.name}.install-", dir=dest_root.parent)
+    )
+    payload = staging_root / "payload"
+    zip_path = staging_root / "ffmpeg-release-essentials.zip"
+    ready: Path | None = None
     try:
         print(f"  下载: {_GYAN_ESSENTIALS_URL}")
         print(f"  → {zip_path}")
-        urlretrieve(_GYAN_ESSENTIALS_URL, zip_path)  # noqa: S310 — fixed vendor URL, user consent
+        request = Request(
+            _GYAN_ESSENTIALS_URL,
+            headers={"User-Agent": "twitch-chat-cn-overlay"},
+        )
+        with urlopen(request, timeout=120.0) as response:  # noqa: S310 - fixed vendor URL
+            stream_response_to_path(
+                response,
+                zip_path,
+                max_bytes=MAX_PORTABLE_DOWNLOAD_BYTES,
+            )
         print("  解压中…")
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(dest_root)
-        try:
-            zip_path.unlink()
-        except OSError:
-            pass
-    except Exception as e:
-        print(f"  [FAIL] 便携 FFmpeg 下载/解压失败: {e}")
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            safe_extract_zip(archive, payload)
+        if _find_ffmpeg_bin(payload) is None:
+            raise ValueError("archive does not contain sibling ffmpeg.exe and ffprobe.exe")
+        zip_path.unlink(missing_ok=True)
+        ready = dest_root.parent / f".{dest_root.name}.ready-{uuid.uuid4().hex}"
+        payload.rename(ready)
+        atomic_replace_directory(ready, dest_root)
+        ready = None
+    except Exception as exc:
+        print(f"  [FAIL] 便携 FFmpeg 下载/解压失败: {exc}")
         print(f"  请手动从 https://www.gyan.dev/ffmpeg/builds/ 下载 essentials 并解压到 {dest_root}")
         return False
+    finally:
+        for leftover in (ready, staging_root):
+            if leftover is None:
+                continue
+            try:
+                _remove_path(leftover)
+            except OSError:
+                pass
 
     found = prepend_tools_ffmpeg_to_path(root)
     if found:
@@ -552,7 +745,6 @@ def try_portable_ffmpeg(*, assume_yes: bool = False, root: Path | None = None) -
         return True
     print(f"  [FAIL] 解压后未找到 bin/ffmpeg.exe，请检查 {dest_root} 目录结构")
     return False
-
 
 def can_prompt_interactive() -> bool:
     """True when we can ask the user (real TTY, not CI/pipe)."""

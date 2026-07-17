@@ -15,6 +15,7 @@ from common_utils import (
     is_console_entry_script,
     quote_cli_arg,
     safe_which,
+    source_checkout_root,
     trusted_tools_root,
 )
 
@@ -42,10 +43,24 @@ preview_clip: 10
 """
 
 
+def find_example_job() -> Path | None:
+    """Locate the full example job in a checkout or installed wheel share."""
+    source_root = source_checkout_root(__file__)
+    if source_root is not None:
+        source_example = source_root / "jobs" / "example_job.yaml"
+        if source_example.is_file():
+            return source_example
+    for share_root in distribution_share_dirs():
+        installed_example = share_root / "jobs" / "example_job.yaml"
+        if installed_example.is_file():
+            return installed_example
+    return None
+
+
 def example_job_yaml_text() -> str:
-    """Load jobs/example_job.yaml only when scaffolding (not at import time)."""
-    bundled = Path(__file__).resolve().parent.parent / "jobs" / "example_job.yaml"
-    if bundled.is_file():
+    """Load the complete example job only when scaffolding (not at import time)."""
+    bundled = find_example_job()
+    if bundled is not None:
         try:
             return bundled.read_text(encoding="utf-8")
         except OSError:

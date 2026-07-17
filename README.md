@@ -182,9 +182,23 @@ console scripts 定义在 `pyproject.toml`：`twitch-chat-overlay` / `twitch-cha
 打包说明：
 
 - 代码以 `scripts/` 下的 flat `py-modules` 形式安装（不改成 package）。
-- 公开 `profiles/*.yaml`、`configs/rules.example.yaml` 与 `.env.example` 会通过 setuptools `data-files` 打进 wheel/sdist（安装后通常在 `share/twitch-chat-translator-overlay/`）。
+- 公开 `profiles/*.yaml`、`configs/rules.example.yaml`、完整 `jobs/example_job.yaml` 与 `.env.example` 会通过 setuptools `data-files` 打进 wheel/sdist（安装后通常在 `share/twitch-chat-translator-overlay/`）。
 - 资源解析优先使用显式路径、当前目录和源码仓库；wheel 安装后会自动搜索解释器、用户安装目录及控制台入口前缀下的 `share/`。布局/编码短名、`--profile` 和 `--rules` 都支持该搜索顺序。
 - `.env` 会按「当前工作目录 → 仓库根 → 模块旁」顺序加载（不覆盖已有环境变量）。
+
+## 更新与历史迁移
+
+- Git 检出请使用 `update.bat`（Windows）或 `bash update.sh`（Linux/macOS）。更新器只接受 fast-forward；任何拉取失败都会停在依赖安装之前。
+- GitHub ZIP / sdist 没有可拉取的 Git 历史，不能原地更新。请下载新的归档到新目录。
+- 仓库在 **2026-07** 做过一次历史重写。此前创建的旧 clone 无法 fast-forward，必须迁移到 fresh clone。
+
+旧 clone 迁移：
+
+1. 只备份本机配置：`.env`、`jobs/*.yaml`、自定义 `profiles/*.yaml` 与 `configs/launcher.local.yaml`。
+2. 在新目录重新 clone 当前仓库。
+3. 将上述本机配置恢复到新 clone，再运行安装和 doctor。
+
+不要把旧仓库历史与新 clone 合并。更新脚本不会自动执行破坏性的历史修复。
 
 ## 渲染编码预设
 
@@ -642,7 +656,7 @@ outputs/                       # 生成视频（.gitignore）
 tests/                         # 测试（含 smoke / max / concurrent / UX）
   fixtures/                    # HTML 变体、翻译 JSON 等测试夹具
   test_max_*.py                # 全面套件（run_tests.py --max）
-  test_*.py                    # 测试模块（当前约 28 个文件 / 270+ 用例）
+  test_*.py                    # 测试模块（400+ 用例；以当前 CI / pytest 输出为准）
 requirements.txt               # 运行依赖
 requirements-dev.txt           # 开发/测试依赖
 .env.example                   # 翻译 API 配置模板

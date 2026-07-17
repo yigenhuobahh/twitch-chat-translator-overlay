@@ -105,6 +105,14 @@ python scripts/render_cn_chat.py video.mp4 chat.html --reuse-translation --revie
 
 `python scripts/render_cn_chat.py --doctor` checks tools/fonts/API. Missing FFmpeg may prompt to install on TTY; `--offer-fix` / `--fix-yes` for automation. Optional TD CLI: `--offer-td-cli`.
 
+## Updating and history migration
+
+- Git checkouts can use `update.bat` on Windows or `bash update.sh` on Linux/macOS. Updates are fast-forward only and stop before dependency installation if the pull fails.
+- GitHub ZIP and sdist copies have no Git history to pull. Download a fresh archive into a new directory instead.
+- Repository history was rewritten in **2026-07**. Clones created before that rewrite cannot fast-forward and require a fresh clone.
+
+For an old clone, back up only `.env`, `jobs/*.yaml`, custom `profiles/*.yaml`, and `configs/launcher.local.yaml`; create a fresh clone in a new directory; then restore those local files. Do not combine the old repository history with the fresh clone. The updater deliberately performs no destructive history repair.
+
 ## Key Concepts
 
 ### Chat FPS vs Output FPS

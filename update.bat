@@ -15,15 +15,20 @@ if exist ".git" (
   git pull --ff-only
   if errorlevel 1 (
     echo [FAIL] git pull failed. Update stopped.
-    echo        Possible causes:
-    echo        - Local changes conflict. Try: git stash ^&^& git pull ^&^& git stash pop
-    echo        - No upstream. Try: git fetch origin ^&^& git merge origin/main
-    echo        - Network issue. Try again later.
+    echo        The remote history may have been rewritten.
+    echo        1. Back up only your local .env, jobs, custom profiles,
+    echo           and configs\launcher.local.yaml.
+    echo        2. Create a fresh clone in a new directory.
+    echo        3. Restore those local files into the fresh clone.
     if not defined CI pause
     exit /b 1
   )
 ) else (
-  echo [1/3] Not a git checkout; skip pull
+  echo [FAIL] This directory is not a git checkout; source update is unavailable.
+  echo        ZIP/source-archive copies cannot update themselves.
+  echo        Download a fresh release or create a fresh clone instead.
+  if not defined CI pause
+  exit /b 1
 )
 
 set "PY=python"

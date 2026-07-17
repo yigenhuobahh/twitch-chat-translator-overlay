@@ -5,9 +5,13 @@ on:
     branches: [master, main]
   pull_request:
     branches: [master, main]
+  schedule:
+    - cron: "17 18 * * *"
+  workflow_dispatch:
 
 jobs:
   test:
+    if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
       matrix:
@@ -82,6 +86,7 @@ jobs:
           python scripts/run_tests.py --smoke --no-lint
 
   wheel-smoke:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
 
     steps:
@@ -179,3 +184,58 @@ jobs:
           ! grep -q 'scripts/render_cn_chat.py' init.log
           ! grep -q 'run.bat' init.log
           ! grep -Eq 'python .*twitch-chat-overlay' init.log
+
+  sdist-smoke:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build source distribution
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+          python -m build --sdist --outdir "$RUNNER_TEMP/dist"
+
+      - name: Unpack, rebuild, and test source distribution
+        run: |
+          mkdir -p "$RUNNER_TEMP/sdist"
+          tar -xzf "$RUNNER_TEMP"/dist/*.tar.gz -C "$RUNNER_TEMP/sdist"
+          SDIST_ROOT="$(find "$RUNNER_TEMP/sdist" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+          cd "$SDIST_ROOT"
+          python -m pip install -r requirements-dev.txt
+          python -m pip wheel --no-deps --wheel-dir "$RUNNER_TEMP/sdist-wheel" .
+          python -m pytest -q -m "not smoke and not slow" --basetemp "$RUNNER_TEMP/sdist-pytest"
+
+  scheduled-max:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install FFmpeg, fonts, and project
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-noto-cjk fonts-wqy-zenhei
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+          python -m pip install -e .
+
+      - name: Run scheduled max suite
+        env:
+          PYTHONPATH: scripts
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: python scripts/run_tests.py --max

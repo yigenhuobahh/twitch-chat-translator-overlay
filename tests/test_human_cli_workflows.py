@@ -494,7 +494,7 @@ class TestHumanCliWorkflows:
         _assert_mp4(final, min_duration=1.5)
 
     def test_translate_resume_skips_when_all_done(self, tmp_path: Path):
-        """With all translations already present, resume should do zero model work."""
+        """Compatible progress plus reviewed JSON should do zero model work."""
         data = {
             "messages": [
                 {
@@ -521,6 +521,29 @@ class TestHumanCliWorkflows:
             ]
         }
         path = write_json(tmp_path / "done.json", data)
+        translator = load_module(
+            "translate_chat_openai",
+            "translate_chat_openai.py",
+        )
+        base_url = "http://127.0.0.1:9/v1"
+        progress = {
+            "schema_version": translator.PROGRESS_SCHEMA_VERSION,
+            "provider": translator.TRANSLATION_PROVIDER,
+            "base_url_fingerprint": translator.base_url_fingerprint(base_url),
+            "model": "dummy-model",
+            "prompt_version": translator.PROMPT_VERSION,
+            "target_language": "zh",
+            "context": "livestream chat",
+            "translations": {"0": "你好", "2": "世界"},
+            "fingerprints": {
+                str(message["index"]): translator.fingerprint_message(message)
+                for message in data["messages"]
+                if not translator.should_preserve_original(message["original"])
+            },
+            "failed": [],
+        }
+        translator.save_progress(translator.progress_path_for(path), progress)
+
         # CLI still validates env even when todo is empty; use dummy values (no network).
         r = _run(
             [
@@ -534,7 +557,7 @@ class TestHumanCliWorkflows:
                 "5",
             ],
             env={
-                "OPENAI_COMPAT_BASE_URL": "http://127.0.0.1:9/v1",
+                "OPENAI_COMPAT_BASE_URL": base_url,
                 "OPENAI_COMPAT_API_KEY": "dummy-key",
                 "OPENAI_COMPAT_MODEL": "dummy-model",
             },

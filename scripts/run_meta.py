@@ -85,7 +85,8 @@ def is_live_run_meta(
       - missing/empty status → not live
       - status not in running/in_progress/started → not live
       - pid present and dead → not live (crashed / killed)
-      - updated_at/started_at older than stale_after_sec → not live
+      - pid present and alive → live, regardless of metadata age
+      - without a known-live pid, stale metadata → not live
       - otherwise live (fail closed when meta is ambiguous)
     """
     if not isinstance(data, dict):
@@ -97,6 +98,8 @@ def is_live_run_meta(
     alive = pid_is_alive(data.get("pid"))
     if alive is False:
         return False
+    if alive is True:
+        return True
 
     now_ts = time.time() if now is None else float(now)
     stamp = _parse_meta_time(data.get("updated_at")) or _parse_meta_time(data.get("started_at"))

@@ -11,6 +11,28 @@ from pathlib import Path
 import shutil
 import time
 
+MIN_RENDER_DISK_RESERVE_BYTES = 512 * 1024 * 1024
+
+
+def ensure_render_disk_headroom(
+    path: str | Path,
+    *,
+    reserve_bytes: int = MIN_RENDER_DISK_RESERVE_BYTES,
+) -> int | None:
+    """Refuse further frame materialization before the filesystem is exhausted."""
+    try:
+        free_bytes = int(shutil.disk_usage(Path(path)).free)
+    except OSError:
+        return None
+    reserve = max(0, int(reserve_bytes))
+    if free_bytes < reserve:
+        raise RuntimeError(
+            "overlay frame filesystem is low on free space "
+            f"({free_bytes / (1024 * 1024):.1f} MiB free; "
+            f"{reserve / (1024 * 1024):.0f} MiB reserve required)"
+        )
+    return free_bytes
+
 
 @dataclass
 class StageTimer:
@@ -222,6 +244,7 @@ def expand_frame_sequence_for_ffmpeg(
             os.link(src, path)
             stats["hardlink"] += 1
         except OSError:
+            ensure_render_disk_headroom(frames_dir)
             shutil.copy2(src, path)
             stats["copy"] += 1
         stats["filled"] += 1

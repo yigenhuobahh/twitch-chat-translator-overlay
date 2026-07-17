@@ -106,6 +106,8 @@ def test_lazy_message_image_cache_evicts(tmp_path: Path, make_test_video):
     # frames were produced
     pngs = list(Path(frames_dir).glob("frame_*.png"))
     assert pngs
+    assert cfg.frame_stats["write"] >= 1
+    assert "written" not in cfg.frame_stats
 
 
 def test_render_cn_chat_accepts_layout_preset_flag():

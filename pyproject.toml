@@ -98,6 +98,9 @@ py-modules = [
 "share/twitch-chat-translator-overlay/configs" = [
   "configs/rules.example.yaml",
 ]
+"share/twitch-chat-translator-overlay/jobs" = [
+  "jobs/example_job.yaml",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

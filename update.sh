@@ -7,10 +7,18 @@ if [[ -e .git ]]; then
   echo "[1/3] git pull --ff-only"
   if ! git pull --ff-only; then
     echo "[FAIL] git pull failed. Update stopped."
+    echo "       The remote history may have been rewritten."
+    echo "       1. Back up only local .env, jobs, custom profiles,"
+    echo "          and configs/launcher.local.yaml."
+    echo "       2. Create a fresh clone in a new directory."
+    echo "       3. Restore those local files into the fresh clone."
     exit 1
   fi
 else
-  echo "[1/3] 非 git 目录，跳过 pull"
+  echo "[FAIL] This directory is not a git checkout; source update is unavailable."
+  echo "       ZIP/source-archive copies cannot update themselves."
+  echo "       Download a fresh release or create a fresh clone instead."
+  exit 1
 fi
 
 if [[ -x .venv/bin/python ]]; then

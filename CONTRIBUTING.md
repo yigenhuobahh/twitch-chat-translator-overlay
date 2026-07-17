@@ -44,7 +44,7 @@ python scripts\run_tests.py --install-dev
 python scripts\run_tests.py --unit-only
 python scripts\run_tests.py --smoke
 python scripts\run_tests.py --lint         # ruff 门禁（规则在 pyproject.toml）
-python scripts\run_tests.py --max          # 长期开发：compile + lint + 全量 + packaging smoke
+python scripts\run_tests.py --max          # 长期开发：compile + lint + 全量 + 源码入口 smoke
 ```
 
 | 命令 | 包含 | 用途 |
@@ -53,7 +53,9 @@ python scripts\run_tests.py --max          # 长期开发：compile + lint + 全
 | `--unit-only` | 无 FFmpeg 依赖 | CI 无编码器或极速 |
 | `--smoke` | 强调短片 e2e | 改渲染时 |
 | `--lint` | `ruff check scripts tests` | 提交前 / CI lint job |
-| `--max` | lint + 全部用例 + packaging/import/doctor 冒烟 | 发版前 / 大改后 / 长期回归 |
+| `--max` | lint + 全部用例 + 源码入口/import/doctor 冒烟 | 发版前 / 大改后 / 长期回归 |
+
+真实制品门禁在 CI 的 `sdist-smoke` job：构建 sdist、解包、从解包目录重建 wheel，并运行非媒体长测。修改 `MANIFEST.in`、`pyproject.toml`、资源定位或 launcher 时，必须同时保证该 job 通过；`run_tests.py --max` 本身不等同于隔离安装测试。
 
 也可用 pytest：
 

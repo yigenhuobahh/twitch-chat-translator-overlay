@@ -58,10 +58,14 @@ def _coerce(key: str, value: Any) -> Any:
         if s in ("0", "false", "no", "off"):
             return False
         raise ValueError(f"render preset 字段 {key} 需要布尔值，收到 {value!r}")
-    if nk in ("crf", "webm_crf", "webm_cpu_used", "fps", "output_fps", "message_image_cache_size"):
+    if nk in ("crf", "webm_crf", "webm_cpu_used", "fps", "message_image_cache_size"):
         if value is None or str(value).strip() == "":
             return None
         return int(value)
+    if nk == "output_fps":
+        if value is None or str(value).strip() == "":
+            return None
+        return float(value)
     if nk == "blank_hold_seconds":
         return float(value)
     if value is None:

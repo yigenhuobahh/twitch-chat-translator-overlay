@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import math
 from pathlib import Path
 import subprocess
 
@@ -36,9 +37,10 @@ class MediaHealth:
 
 def _number(value, default: float = 0.0) -> float:
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return default
+    return number if math.isfinite(number) else default
 
 
 def _rate(value) -> str:
@@ -201,6 +203,7 @@ def validate_media_health(path: Path, *, mode: str = "fast", require_audio: bool
 def repair_media(source: Path, *, encoder: str = "auto", output: Path | None = None) -> Path:
     """Non-destructive A/V normalization; returns a sibling repaired MP4."""
     from encode_options import build_video_encode_args, resolve_encode_options
+    from process_util import run_tracked
     source = Path(source)
     final = output or source.with_name(source.stem + ".repaired.mp4")
     partial = final.with_name(final.stem + ".partial.mp4")
@@ -209,7 +212,7 @@ def repair_media(source: Path, *, encoder: str = "auto", output: Path | None = N
            "-vf", "setpts=PTS-STARTPTS", *build_video_encode_args(opts),
            "-af", "aresample=async=1:first_pts=0", "-c:a", "aac", "-b:a", "160k",
            "-map_metadata", "-1", "-map_chapters", "-1", "-movflags", "+faststart", str(partial)]
-    proc = subprocess.run(cmd, text=True, encoding="utf-8", errors="replace")
+    proc = run_tracked(cmd, stdout=None, stderr=None, text=False)
     if proc.returncode != 0 or not partial.is_file():
         raise RuntimeError("媒体修复 FFmpeg 失败；原文件未改动")
     health = validate_media_health(partial, mode="fast", require_audio=True)

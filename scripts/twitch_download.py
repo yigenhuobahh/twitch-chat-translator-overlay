@@ -9,11 +9,15 @@ This project only consumes TwitchDownloader HTML with CSS-embedded emotes
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
+import tempfile
 import time
+import uuid
 import zipfile
 
 # Sibling imports when loaded as script or via importlib.
@@ -180,6 +184,73 @@ def slug_for_source(kind: str, source_id: str) -> str:
 
 def default_download_dir(root: Path | None = None) -> Path:
     return (root or _REPO_ROOT) / "downloads"
+
+
+def new_download_session_dir(root: Path, slug: str) -> Path:
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    nonce = uuid.uuid4().hex[:8]
+    return default_download_dir(root) / f"{slug}_{timestamp}_{nonce}"
+
+
+def _new_download_staging_path(destination: Path) -> Path:
+    """Return a unique sibling path that preserves the requested file suffix."""
+    return destination.with_name(
+        f".{destination.name}.download-{uuid.uuid4().hex}{destination.suffix}"
+    )
+
+
+def _publish_download_pair(
+    staged_video: Path,
+    video_path: Path,
+    staged_chat: Path,
+    chat_path: Path,
+) -> None:
+    """Publish a validated video/chat pair, restoring existing files on failure."""
+    pairs = ((staged_video, video_path), (staged_chat, chat_path))
+    backups: dict[Path, Path] = {}
+    published: list[Path] = []
+    try:
+        for _staged, destination in pairs:
+            if destination.exists() or destination.is_symlink():
+                if not destination.is_file() and not destination.is_symlink():
+                    raise TwitchDownloadError(
+                        f"下载目标已存在且不是文件: {destination}"
+                    )
+                backup = destination.with_name(
+                    f".{destination.name}.backup-{uuid.uuid4().hex}"
+                )
+                os.replace(destination, backup)
+                backups[destination] = backup
+        for staged, destination in pairs:
+            os.replace(staged, destination)
+            published.append(destination)
+    except Exception as exc:
+        rollback_errors: list[str] = []
+        for destination in reversed(published):
+            if destination in backups:
+                continue
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError as rollback_exc:
+                rollback_errors.append(f"{destination}: {rollback_exc}")
+        for destination, backup in reversed(list(backups.items())):
+            try:
+                os.replace(backup, destination)
+            except OSError as rollback_exc:
+                rollback_errors.append(f"{backup} -> {destination}: {rollback_exc}")
+        if rollback_errors:
+            raise TwitchDownloadError(
+                "发布下载结果失败，且旧文件回滚不完整: " + "; ".join(rollback_errors)
+            ) from exc
+        raise TwitchDownloadError(
+            f"发布下载结果失败，旧文件已恢复: {exc}"
+        ) from exc
+    else:
+        for backup in backups.values():
+            try:
+                backup.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def build_video_cmd(
@@ -358,8 +429,7 @@ def download_assets(
         begin, end = None, None
 
     slug = slug_for_source(kind_r, source_id)
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    base = Path(out_dir) if out_dir else default_download_dir(app_root) / f"{slug}_{ts}"
+    base = Path(out_dir) if out_dir else new_download_session_dir(app_root, slug)
     try:
         from process_util import is_dangerous_publish_path
 
@@ -370,60 +440,75 @@ def download_assets(
     base.mkdir(parents=True, exist_ok=True)
     video_path = base / video_name
     chat_path = base / chat_name
+    if video_path == chat_path:
+        raise TwitchDownloadError("视频和聊天下载目标不能是同一个文件")
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    chat_path.parent.mkdir(parents=True, exist_ok=True)
+    staged_video = _new_download_staging_path(video_path)
+    staged_chat = _new_download_staging_path(chat_path)
+    repaired_video: Path | None = None
 
-    # Prefer system/tools ffmpeg for TD video mux when available
-    ffmpeg_path = safe_which("ffmpeg")
+    try:
+        # Prefer system/tools ffmpeg for TD video mux when available
+        ffmpeg_path = safe_which("ffmpeg")
 
-    vcmd = build_video_cmd(
-        cli,
-        kind=kind_r,
-        source_id=source_id,
-        output=video_path,
-        quality=quality,
-        begin=begin if kind_r == "vod" else None,
-        end=end if kind_r == "vod" else None,
-        oauth=oauth,
-        ffmpeg_path=ffmpeg_path,
-        trim_mode=trim_mode,
-    )
-    _run_cli(vcmd, label="视频下载")
-    if not video_path.is_file():
-        # Some CLI versions may write alternate names; search dir
-        mp4s = list(base.glob("*.mp4"))
-        if mp4s:
-            video_path = mp4s[0]
-        else:
-            raise TwitchDownloadError(f"视频下载后未找到 mp4: {base}")
-    from media_health import repair_media, validate_media_health
-    health = validate_media_health(video_path, mode=media_check, require_audio=True)
-    _print_media_health_warnings(health)
-    if not health.ok and str(media_repair or "off").lower() == "audio":
-        try:
-            video_path = repair_media(video_path)
-            health = validate_media_health(video_path, mode=media_check, require_audio=True)
-            _print_media_health_warnings(health)
-        except (OSError, RuntimeError) as e:
-            raise TwitchDownloadError(f"下载视频修复失败，原文件未覆盖: {e}") from e
-    if not health.ok:
-        raise TwitchDownloadError("下载视频健康检查失败，已阻止继续下载聊天/翻译/渲染: " + health.reason())
+        vcmd = build_video_cmd(
+            cli,
+            kind=kind_r,
+            source_id=source_id,
+            output=staged_video,
+            quality=quality,
+            begin=begin if kind_r == "vod" else None,
+            end=end if kind_r == "vod" else None,
+            oauth=oauth,
+            ffmpeg_path=ffmpeg_path,
+            trim_mode=trim_mode,
+        )
+        _run_cli(vcmd, label="视频下载")
+        if not staged_video.is_file():
+            raise TwitchDownloadError(f"视频下载未生成新的指定文件: {video_path}")
+        from media_health import repair_media, validate_media_health
+        health = validate_media_health(staged_video, mode=media_check, require_audio=True)
+        _print_media_health_warnings(health)
+        video_to_publish = staged_video
+        if not health.ok and str(media_repair or "off").lower() == "audio":
+            try:
+                repaired_video = repair_media(staged_video)
+                health = validate_media_health(
+                    repaired_video,
+                    mode=media_check,
+                    require_audio=True,
+                )
+                _print_media_health_warnings(health)
+                if health.ok:
+                    video_to_publish = repaired_video
+            except (OSError, RuntimeError) as e:
+                raise TwitchDownloadError(f"下载视频修复失败，原文件未覆盖: {e}") from e
+        if not health.ok:
+            raise TwitchDownloadError("下载视频健康检查失败，已阻止继续下载聊天/翻译/渲染: " + health.reason())
 
-    ccmd = build_chat_cmd(
-        cli,
-        source_id=source_id,
-        output=chat_path,
-        begin=begin if kind_r == "vod" else None,
-        end=end if kind_r == "vod" else None,
-        embed=True,
-    )
-    _run_cli(ccmd, label="聊天 HTML 下载")
-    if not chat_path.is_file():
-        htmls = list(base.glob("*.html"))
-        if htmls:
-            chat_path = htmls[0]
-        else:
-            raise TwitchDownloadError(f"聊天下载后未找到 html: {base}")
+        ccmd = build_chat_cmd(
+            cli,
+            source_id=source_id,
+            output=staged_chat,
+            begin=begin if kind_r == "vod" else None,
+            end=end if kind_r == "vod" else None,
+            embed=True,
+        )
+        _run_cli(ccmd, label="聊天 HTML 下载")
+        if not staged_chat.is_file():
+            raise TwitchDownloadError(f"聊天下载未生成新的指定文件: {chat_path}")
 
-    validate_chat_html(chat_path)
+        validate_chat_html(staged_chat)
+        _publish_download_pair(video_to_publish, video_path, staged_chat, chat_path)
+    finally:
+        for temporary in (staged_video, staged_chat, repaired_video):
+            if temporary is None:
+                continue
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
     print(f"\n[OK] 视频: {video_path}", flush=True)
     print(f"[OK] 聊天: {chat_path}", flush=True)
     return DownloadResult(
@@ -500,6 +585,8 @@ def parse_td_time(value: str) -> float:
                 raise ValueError("bad colon time")
         except ValueError as e:
             raise TwitchDownloadError(f"无法解析时间: {value!r}") from e
+        if not all(math.isfinite(part) for part in (h, m, s)):
+            raise TwitchDownloadError(f"时间必须是有限数值: {value!r}")
         if m < 0 or s < 0 or h < 0:
             raise TwitchDownloadError(f"时间不能为负: {value!r}")
         return h * 3600.0 + m * 60.0 + s
@@ -526,6 +613,8 @@ def parse_td_time(value: str) -> float:
         s = float(m.group(3) or 0)
     except ValueError as e:
         raise TwitchDownloadError(f"无法解析时间: {value!r}") from e
+    if not all(math.isfinite(part) for part in (h, mi, s)):
+        raise TwitchDownloadError(f"时间必须是有限数值: {value!r}")
     # Disallow pure junk like "h" — already needs digits.
     if h == 0 and mi == 0 and s == 0 and not re.search(r"\d", text):
         raise TwitchDownloadError(f"无法解析时间: {value!r}")
@@ -534,7 +623,10 @@ def parse_td_time(value: str) -> float:
 
 def format_td_t_seconds(seconds: float) -> tuple[str, str]:
     """Return (query_t, display) for integer seconds: ('0h12m26s', '0:12:26')."""
-    total = int(max(0, round(float(seconds))))
+    value = float(seconds)
+    if not math.isfinite(value):
+        raise TwitchDownloadError(f"时间必须是有限数值: {seconds!r}")
+    total = int(max(0, round(value)))
     h = total // 3600
     m = (total % 3600) // 60
     s = total % 60
@@ -613,11 +705,18 @@ def normalize_cut_ranges(
     total_duration: float,
 ) -> list[tuple[float, float]]:
     """Clamp, sort, and merge cuts on one original merged-video timeline."""
-    total = max(0.0, float(total_duration))
+    total = float(total_duration)
+    if not math.isfinite(total):
+        raise TwitchDownloadError(f"总时长必须是有限数值: {total_duration!r}")
+    total = max(0.0, total)
     clipped: list[tuple[float, float]] = []
     for raw_start, raw_end in ranges or []:
         start = float(raw_start)
         end = float(raw_end)
+        if not math.isfinite(start) or not math.isfinite(end):
+            raise TwitchDownloadError(
+                f"裁切范围必须是有限数值: {(raw_start, raw_end)!r}"
+            )
         if end <= start:
             raise TwitchDownloadError(f"无效切除范围: {start:g}-{end:g}")
         start = min(total, max(0.0, start))
@@ -635,15 +734,31 @@ def normalize_cut_ranges(
     return merged
 
 
-def probe_media_duration(path: Path) -> float:
-    """ffprobe format duration (seconds). Local helper — avoids importing burn."""
+_FFPROBE_TIMEOUT_SECONDS = 45.0
+
+
+def _run_ffprobe(arguments: list[str]):
     import subprocess as _sp
 
+    try:
+        return _sp.run(
+            [require_executable("ffprobe"), *arguments],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_FFPROBE_TIMEOUT_SECONDS,
+        )
+    except (OSError, _sp.TimeoutExpired):
+        return None
+
+
+def probe_media_duration(path: Path) -> float:
+    """ffprobe format duration (seconds). Local helper — avoids importing burn."""
     if not path.is_file():
         raise TwitchDownloadError(f"无法探测时长，文件不存在: {path}")
-    probe = _sp.run(
+    probe = _run_ffprobe(
         [
-            require_executable("ffprobe"),
             "-v",
             "error",
             "-show_entries",
@@ -651,53 +766,57 @@ def probe_media_duration(path: Path) -> float:
             "-of",
             "csv=p=0",
             str(path),
-        ],
-        capture_output=True,
-        text=True,
+        ]
     )
+    if probe is None:
+        raise TwitchDownloadError(f"ffprobe 启动失败或超时: {path}")
     raw = (probe.stdout or "").strip().splitlines()
     if probe.returncode != 0 or not raw:
         err = (probe.stderr or probe.stdout or "ffprobe failed").strip()[:400]
         raise TwitchDownloadError(f"无法读取视频时长: {path}: {err}")
     try:
         duration = float(raw[0].strip() or 0.0)
-    except ValueError as e:
-        raise TwitchDownloadError(f"无法解析视频时长 {raw[0]!r}: {e}") from e
-    if duration <= 0:
+    except ValueError as exc:
+        raise TwitchDownloadError(f"无法解析视频时长 {raw[0]!r}: {exc}") from exc
+    if not math.isfinite(duration) or duration <= 0:
         raise TwitchDownloadError(f"视频时长无效 ({duration}): {path}")
     return duration
 
 
 def get_stream_start_time(path: Path, stream_selector: str) -> float:
     """Return a stream start_time in seconds, defaulting to 0 when absent."""
-    import subprocess as _sp
-
-    probe = _sp.run(
+    probe = _run_ffprobe(
         [
-            require_executable("ffprobe"), "-v", "error", "-select_streams", stream_selector,
-            "-show_entries", "stream=start_time", "-of", "csv=p=0", str(path),
-        ],
-        capture_output=True,
-        text=True,
+            "-v",
+            "error",
+            "-select_streams",
+            stream_selector,
+            "-show_entries",
+            "stream=start_time",
+            "-of",
+            "csv=p=0",
+            str(path),
+        ]
     )
+    if probe is None:
+        return 0.0
     raw = (probe.stdout or "").strip().splitlines()
     if probe.returncode != 0 or not raw:
         return 0.0
     try:
-        return float(raw[0].strip() or 0.0)
+        value = float(raw[0].strip() or 0.0)
     except ValueError:
         return 0.0
+    return value if math.isfinite(value) else 0.0
 
 
 def probe_av_fingerprint(path: Path) -> tuple[str, str, str, str, str, str]:
     """Best-effort (vcodec, width, height, pix_fmt, acodec, sample_rate)."""
     import json as _json
-    import subprocess as _sp
 
     empty = ("", "", "", "", "", "")
-    probe = _sp.run(
+    probe = _run_ffprobe(
         [
-            require_executable("ffprobe"),
             "-v",
             "error",
             "-show_entries",
@@ -705,30 +824,27 @@ def probe_av_fingerprint(path: Path) -> tuple[str, str, str, str, str, str]:
             "-of",
             "json",
             str(path),
-        ],
-        capture_output=True,
-        text=True,
+        ]
     )
-    if probe.returncode != 0:
+    if probe is None or probe.returncode != 0:
         return empty
     try:
         data = _json.loads(probe.stdout or "{}")
-    except Exception:
+    except (TypeError, ValueError):
         return empty
     vcodec = width = height = pix = acodec = rate = ""
-    for st in data.get("streams") or []:
-        if not isinstance(st, dict):
+    for stream in data.get("streams") or []:
+        if not isinstance(stream, dict):
             continue
-        if st.get("codec_type") == "video" and not vcodec:
-            vcodec = str(st.get("codec_name") or "")
-            width = str(st.get("width") or "")
-            height = str(st.get("height") or "")
-            pix = str(st.get("pix_fmt") or "")
-        elif st.get("codec_type") == "audio" and not acodec:
-            acodec = str(st.get("codec_name") or "")
-            rate = str(st.get("sample_rate") or "")
+        if stream.get("codec_type") == "video" and not vcodec:
+            vcodec = str(stream.get("codec_name") or "")
+            width = str(stream.get("width") or "")
+            height = str(stream.get("height") or "")
+            pix = str(stream.get("pix_fmt") or "")
+        elif stream.get("codec_type") == "audio" and not acodec:
+            acodec = str(stream.get("codec_name") or "")
+            rate = str(stream.get("sample_rate") or "")
     return (vcodec, width, height, pix, acodec, rate)
-
 
 def _ffmpeg_concat_list_line(path: Path) -> str:
     """Escape path for ffmpeg concat demuxer file directive."""
@@ -1201,8 +1317,7 @@ def download_assets_multi(
         )
 
     slug = slug_for_source(kind_r, source_id)
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    base = Path(out_dir) if out_dir else default_download_dir(app_root) / f"{slug}_{ts}"
+    base = Path(out_dir) if out_dir else new_download_session_dir(app_root, slug)
     try:
         from process_util import is_dangerous_publish_path
 
@@ -1333,13 +1448,15 @@ def platform_td_asset_token() -> str | None:
     return None
 
 
-def pick_td_cli_asset(assets: list[dict]) -> dict | None:
+def pick_td_cli_asset(assets: list[object]) -> dict | None:
     """Pick best TwitchDownloaderCLI zip asset from GitHub release asset list."""
     token = platform_td_asset_token()
     if not token:
         return None
     cli_assets = []
     for a in assets or []:
+        if not isinstance(a, dict):
+            continue
         name = str(a.get("name") or "")
         if "TwitchDownloaderCLI" not in name:
             continue
@@ -1371,6 +1488,7 @@ def fetch_latest_td_cli_release_asset(
     """
     import json as _json
     from urllib.error import HTTPError, URLError
+    from urllib.parse import urlparse
     from urllib.request import Request, urlopen
 
     api = "https://api.github.com/repos/lay295/TwitchDownloader/releases/latest"
@@ -1383,7 +1501,10 @@ def fetch_latest_td_cli_release_asset(
     )
     try:
         with urlopen(req, timeout=timeout) as resp:  # noqa: S310 — fixed GitHub API
-            data = _json.loads(resp.read().decode("utf-8", errors="replace"))
+            raw = resp.read(2 * 1024 * 1024 + 1)
+            if len(raw) > 2 * 1024 * 1024:
+                raise TwitchDownloadError("GitHub releases 响应超过 2 MiB 上限")
+            data = _json.loads(raw.decode("utf-8", errors="replace"))
     except HTTPError as e:
         raise TwitchDownloadError(f"GitHub releases API 失败 HTTP {e.code}: {e.reason}") from e
     except URLError as e:
@@ -1391,10 +1512,14 @@ def fetch_latest_td_cli_release_asset(
     except Exception as e:
         raise TwitchDownloadError(f"读取 releases 失败: {e}") from e
 
+    if not isinstance(data, dict):
+        raise TwitchDownloadError("GitHub releases 响应根节点必须是对象")
     tag = str(data.get("tag_name") or "unknown")
-    assets = data.get("assets") or []
+    assets = data.get("assets")
     if not isinstance(assets, list):
         raise TwitchDownloadError("releases 响应缺少 assets 列表")
+    if not all(isinstance(asset, dict) for asset in assets):
+        raise TwitchDownloadError("releases 响应中的 asset 项必须是对象")
     picked = pick_td_cli_asset(assets)
     if not picked:
         token = platform_td_asset_token() or "unknown-platform"
@@ -1408,6 +1533,13 @@ def fetch_latest_td_cli_release_asset(
     name = str(picked.get("name") or "").strip()
     if not url or not name:
         raise TwitchDownloadError("选中的 asset 缺少 name 或 browser_download_url")
+    parsed = urlparse(url)
+    if (
+        parsed.scheme.lower() != "https"
+        or (parsed.hostname or "").lower() != "github.com"
+        or not parsed.path.startswith("/lay295/TwitchDownloader/releases/download/")
+    ):
+        raise TwitchDownloadError("release asset URL 不属于预期的 GitHub 下载路径")
     return tag, name, url
 
 
@@ -1438,13 +1570,9 @@ def _flatten_td_cli_into(dest: Path) -> Path | None:
                     except OSError:
                         pass
                 except OSError:
-                    return cand
+                    return None
                 flat = dest / name
-                return flat if flat.is_file() else cand
-    # Deep search (one extra level)
-    for path in dest.rglob("*"):
-        if path.is_file() and path.name in td_exe_names():
-            return path
+                return flat if flat.is_file() else None
     return None
 
 
@@ -1454,11 +1582,15 @@ def try_portable_td_cli(
     root: Path | None = None,
     timeout: float = 120.0,
 ) -> bool:
-    """Download latest TwitchDownloaderCLI zip into tools/TwitchDownloaderCLI/.
-
-    Requires network + user consent (unless assume_yes). Returns True if CLI is usable after.
-    """
+    """Download latest TwitchDownloaderCLI through a validated staged install."""
     from urllib.request import Request, urlopen
+
+    from env_bootstrap import (
+        MAX_PORTABLE_DOWNLOAD_BYTES,
+        atomic_replace_directory,
+        safe_extract_zip,
+        stream_response_to_path,
+    )
 
     root = root or _TOOLS_ROOT
     if find_twitchdownloader_cli(root):
@@ -1470,54 +1602,68 @@ def try_portable_td_cli(
     print("  来源: GitHub lay295/TwitchDownloader releases/latest")
     print("  体积约数十 MB，需网络。")
 
-    # Consent is usually already obtained by caller; still gate if not assume_yes
-    # and we want a last confirmation — caller handles prompt; assume_yes means go.
-
     try:
         tag, asset_name, url = fetch_latest_td_cli_release_asset(timeout=min(30.0, timeout))
-    except TwitchDownloadError as e:
-        print(f"  [FAIL] {e}")
+    except TwitchDownloadError as exc:
+        print(f"  [FAIL] {exc}")
         return False
 
     print(f"  版本: {tag}")
     print(f"  资源: {asset_name}")
     print(f"  URL: {url}")
 
-    dest.mkdir(parents=True, exist_ok=True)
-    zip_path = dest / asset_name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(
+        tempfile.mkdtemp(prefix=f".{dest.name}.install-", dir=dest.parent)
+    )
+    payload = staging_root / "payload"
+    zip_path = staging_root / "download.zip"
+    ready: Path | None = None
     try:
         print("  下载中…")
-        req = Request(url, headers={"User-Agent": "twitch-chat-cn-overlay"})
-        with urlopen(req, timeout=timeout) as resp, open(zip_path, "wb") as out:  # noqa: S310
-            while True:
-                chunk = resp.read(1024 * 256)
-                if not chunk:
-                    break
-                out.write(chunk)
+        request = Request(url, headers={"User-Agent": "twitch-chat-cn-overlay"})
+        with urlopen(request, timeout=timeout) as response:  # noqa: S310 - release asset URL
+            stream_response_to_path(
+                response,
+                zip_path,
+                max_bytes=MAX_PORTABLE_DOWNLOAD_BYTES,
+            )
         print("  解压中…")
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(dest)
-        try:
-            zip_path.unlink()
-        except OSError:
-            pass
-    except Exception as e:
-        print(f"  [FAIL] 下载/解压失败: {e}")
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            safe_extract_zip(archive, payload)
+        exe = _flatten_td_cli_into(payload)
+        if exe is None or exe.parent != payload:
+            raise ValueError(
+                "archive does not contain TwitchDownloaderCLI in a supported layout"
+            )
+        if os.name != "nt":
+            exe.chmod(exe.stat().st_mode | 0o111)
+
+        zip_path.unlink(missing_ok=True)
+        ready = dest.parent / f".{dest.name}.ready-{uuid.uuid4().hex}"
+        payload.rename(ready)
+        atomic_replace_directory(ready, dest)
+        ready = None
+    except Exception as exc:
+        print(f"  [FAIL] 下载/解压失败: {exc}")
         print("  请手动从 https://github.com/lay295/TwitchDownloader/releases 下载")
         return False
+    finally:
+        for leftover in (ready, staging_root):
+            if leftover is None:
+                continue
+            try:
+                if leftover.is_symlink() or leftover.is_file():
+                    leftover.unlink(missing_ok=True)
+                elif leftover.exists():
+                    shutil.rmtree(leftover)
+            except OSError:
+                pass
 
-    # Unix: ensure executable bit
-    exe = _flatten_td_cli_into(dest)
-    if exe and os.name != "nt":
-        try:
-            mode = exe.stat().st_mode
-            exe.chmod(mode | 0o111)
-        except OSError:
-            pass
-
+    prepend_tools_td_to_path(root)
     found = find_twitchdownloader_cli(root)
     if found:
         print(f"  [OK] TwitchDownloaderCLI: {found}")
         return True
-    print("  [FAIL] 解压后未找到 TwitchDownloaderCLI 可执行文件，请检查目录结构")
+    print("  [FAIL] 安装后未找到 TwitchDownloaderCLI 可执行文件，请检查目录结构")
     return False

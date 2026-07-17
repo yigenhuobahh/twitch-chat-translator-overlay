@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from pathlib import Path
 import platform
@@ -205,16 +206,31 @@ def trusted_tools_root(module_file: str | Path) -> Path:
     if source_root is not None:
         return source_root
 
+    def absolute_env_path(*keys: str) -> Path | None:
+        for key in keys:
+            if key in _DOTENV_LOADED_KEYS:
+                continue
+            value = str(os.environ.get(key) or "").strip()
+            if not value:
+                continue
+            try:
+                candidate = Path(value).expanduser()
+            except (TypeError, ValueError):
+                continue
+            if candidate.is_absolute():
+                return candidate
+        return None
+
     if os.name == "nt":
-        base = None if "LOCALAPPDATA" in _DOTENV_LOADED_KEYS else os.environ.get("LOCALAPPDATA")
-        if not base and "APPDATA" not in _DOTENV_LOADED_KEYS:
-            base = os.environ.get("APPDATA")
-        root = Path(base).expanduser() if base else Path.home() / "AppData" / "Local"
+        root = absolute_env_path("LOCALAPPDATA", "APPDATA")
+        if root is None:
+            root = Path.home() / "AppData" / "Local"
     elif sys.platform == "darwin":
         root = Path.home() / "Library" / "Application Support"
     else:
-        base = None if "XDG_DATA_HOME" in _DOTENV_LOADED_KEYS else os.environ.get("XDG_DATA_HOME")
-        root = Path(base).expanduser() if base else Path.home() / ".local" / "share"
+        root = absolute_env_path("XDG_DATA_HOME")
+        if root is None:
+            root = Path.home() / ".local" / "share"
     return (root / "twitch-chat-translator-overlay").resolve()
 
 
@@ -706,6 +722,8 @@ def validate_positive_int(name: str, value: int, minimum: int = 1, maximum: int 
 
 def validate_non_negative_float(name: str, value: float, maximum: float | None = None) -> float:
     value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
     if value < 0:
         raise ValueError(f"{name} must be >= 0")
     if maximum is not None and value > maximum:
@@ -721,6 +739,8 @@ def validate_positive_float(
 ) -> float:
     """Require a strictly positive float (rejects 0 and negatives)."""
     value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
     if value < minimum or value <= 0:
         raise ValueError(f"{name} must be > 0")
     if maximum is not None and value > maximum:
@@ -734,6 +754,8 @@ def positive_float_arg(value: str) -> float:
         parsed = float(value)
     except (TypeError, ValueError) as exc:
         raise argparse.ArgumentTypeError(f"invalid float value: {value!r}") from exc
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("must be finite")
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be > 0 (0 is not allowed)")
     return parsed
@@ -770,6 +792,13 @@ def load_dotenv_if_present() -> None:
     if os.environ.get("_TWITCH_TRANSPARENT_TEST_MODE") == "1":
         return
 
+    # Never combine a process-provided credential with endpoint/model values
+    # from a less-trusted cwd .env. Configuration is sourced atomically: when
+    # any supported key is already present, the process environment owns all
+    # translation settings for this run.
+    if any(str(os.environ.get(key) or "").strip() for key in _DOTENV_ALLOWED_KEYS):
+        return
+
     candidates: list[Path] = []
     try:
         candidates.append(Path.cwd() / ".env")
@@ -796,6 +825,7 @@ def load_dotenv_if_present() -> None:
         if not env_path.is_file():
             continue
         try:
+            parsed: dict[str, str] = {}
             for raw in env_path.read_text(encoding="utf-8").splitlines():
                 line = raw.strip()
                 if not line or line.startswith("#") or "=" not in line:
@@ -803,10 +833,12 @@ def load_dotenv_if_present() -> None:
                 key, val = line.split("=", 1)
                 key = key.strip()
                 val = val.strip().strip('"').strip("'")
-                if key in _DOTENV_ALLOWED_KEYS and key not in os.environ:
-                    os.environ[key] = val
-                    _DOTENV_LOADED_KEYS.add(key)
+                if key in _DOTENV_ALLOWED_KEYS:
+                    parsed[key] = val
         except OSError:
             return
+        for key, val in parsed.items():
+            os.environ[key] = val
+            _DOTENV_LOADED_KEYS.add(key)
         # Only load the first existing .env.
         return

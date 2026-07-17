@@ -61,7 +61,7 @@ python scripts\run_tests.py --max          # long; needs FFmpeg for smoke/max
 python scripts\twitch_chat_burn.py video.mp4 chat.html --preview-clip 3 --overlay-codec png --offset 0 --out-dir out --no-job-dir
 ```
 
-Last full `--max` in this handoff window: **323 passed**, 1 skipped (optional local sample), packaging smoke OK.
+Current baseline is **400+ tests**. Treat the latest CI / `pytest` output as release evidence rather than maintaining an exact count here. The `sdist-smoke` CI job must build, unpack, rebuild a wheel, and test the source distribution; scheduled CI runs `--max`.
 
 ## Do not commit
 
