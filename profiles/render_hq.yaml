@@ -1,0 +1,19 @@
+# 高画质编码预设 — 更低 CRF、更慢编码、更高音频码率
+# 用法: --render-preset profiles/render_hq.yaml
+# 适合：最终成品输出，需要最高画质时。
+name: render_hq
+label: "High quality"
+description: "Slower x264, lower CRF, higher AAC bitrate."
+
+render:
+  encoder: x264
+  video_preset: slow     # 比 fast 更慢，压缩效率更高
+  crf: 16                # 比 default 低 2，质量更高
+  audio_codec: aac
+  audio_bitrate: 256k    # 比 default 高 64k
+  overlay_codec: vp9
+  webm_crf: 24           # 比 default 低 6，overlay 质量更高
+  webm_cpu_used: 2       # 比 default 慢，质量更好
+  reuse_static_frames: true
+  skip_blank_frames: true
+  blank_hold_seconds: 0.5

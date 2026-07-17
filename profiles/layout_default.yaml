@@ -1,0 +1,22 @@
+# 默认布局预设 — 按约 1080p 设计的左下角弹幕框
+# 用法: --layout-preset profiles/layout_default.yaml  （run.bat 默认也会落到这套像素）
+# 复制后修改 x/y/w/h/font_size 即可适配你的画面裁切。
+# 非 1080p 源：若未设 *-ratio 且绝对框大部分在画面外，引擎会按源分辨率自动缩放。
+# 默认使用 lanes 堆叠模式（消息按 msg_lifetime 秒过期沉积）。
+name: layout_default
+label: "Default overlay box"
+description: "Matches CLI defaults (~1080p pixels); auto-scales when box would leave non-1080p frames."
+
+layout:
+  x: 15              # 弹幕框左上角 X 坐标（像素）
+  y: 327             # 弹幕框左上角 Y 坐标（像素）
+  width: 497         # 弹幕框宽度（像素）
+  height: 363        # 弹幕框高度（像素）
+  font_size: 15      # 字体大小（像素）
+  font_path: auto    # 字体文件路径；auto = 自动检测系统 CJK 字体
+  font_bold_path: auto
+  fps: 15            # 弹幕层采样帧率（不影响成片帧率；15 足够流畅）
+  max_visible: 0     # 0=按框高/字号自动填满；也可写固定条数
+  msg_lifetime: 14.0 # 消息停留秒数（仅 lanes 模式；float 模式忽略）
+  bg_alpha: 255      # 背景透明度 0-255；255=不透明，170=半透明
+  emote_height: 22   # 表情图片高度（像素）

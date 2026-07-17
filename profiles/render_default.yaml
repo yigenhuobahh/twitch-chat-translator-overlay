@@ -1,0 +1,19 @@
+# 默认编码预设 — 均衡质量，适合一般 VOD overlay
+# 用法: --render-preset profiles/render_default.yaml
+# 命令行参数（如 --crf 16）会覆盖这里的值。
+name: render_default
+label: "Default encode"
+description: "x264 CRF18 + VP9 overlay; static/blank reuse on."
+
+render:
+  encoder: x264          # 编码器：x264 / nvenc / qsv / amf / auto
+  video_preset: fast     # x264 预设：ultrafast(最快) ~ veryslow(最慢最好)
+  crf: 18                # 质量：越小越好，18 是甜点，16 更高质量
+  audio_codec: aac       # 音频编码：aac（重编码）或 copy（直接拷贝）
+  audio_bitrate: 192k    # AAC 码率
+  overlay_codec: vp9     # 弹幕层中间格式：vp9（默认）或 png（更精确）
+  webm_crf: 30           # VP9 质量 CRF：0-63，越小越好，30 是均衡值
+  webm_cpu_used: 4       # VP9 速度：0(最慢最好) ~ 8(最快)，默认 4
+  reuse_static_frames: true  # 静态帧 hardlink/copy 复用
+  skip_blank_frames: true    # 空白时段稀疏写帧
+  blank_hold_seconds: 0.5    # 空白关键帧间隔（秒）

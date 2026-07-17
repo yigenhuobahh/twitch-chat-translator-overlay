@@ -1,0 +1,34 @@
+# Source distribution extras (wheel data files come from pyproject.toml).
+include README.md
+include README.en.md
+include LICENSE
+include CONTRIBUTING.md
+include requirements.txt
+include requirements-dev.txt
+include .env.example
+include pyproject.toml
+
+# Public YAML assets (whitelist; private channel profiles stay local via .gitignore).
+include profiles/default.yaml
+include profiles/layout_default.yaml
+include profiles/layout_compact.yaml
+include profiles/layout_mobile.yaml
+include profiles/render_default.yaml
+include profiles/render_fast.yaml
+include profiles/render_hq.yaml
+include configs/rules.example.yaml
+
+# Test source for sdist (CI installs from sdist and runs pytest).
+recursive-include tests *.py
+recursive-include tests/fixtures *
+
+# Exclude generated caches from distribution.
+global-exclude __pycache__ *.py[cod] .pytest_cache
+
+# Exclude runtime output directories (not part of source distribution).
+# outputs/: generated videos and job files (large, user-specific)
+# emotes/: extracted emote images (regenerated at runtime)
+# _local_archive/: private samples and media (must not be distributed)
+prune outputs
+prune emotes
+prune _local_archive

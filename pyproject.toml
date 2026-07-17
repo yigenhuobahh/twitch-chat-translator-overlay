@@ -1,0 +1,196 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "twitch-chat-translator-overlay"
+version = "0.1.0"
+description = "Translate TwitchDownloader chat HTML and burn Chinese (or other language) overlays onto VOD videos."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "twitch-chat-translator-overlay contributors" }]
+keywords = ["twitch", "chat", "overlay", "translation", "ffmpeg", "pillow"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Multimedia :: Video",
+]
+dependencies = [
+  "beautifulsoup4>=4.12",
+  "openai>=1.0",
+  "openpyxl>=3.1",
+  "pillow>=10.0",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "pytest-cov>=4.0",
+  "ruff>=0.8",
+]
+
+# Console scripts — three entry points for different use cases:
+#   twitch-chat-overlay : full pipeline (parse → translate → render → compose), 日常用这个
+#   twitch-chat-burn    : low-level engine (parse + render + compose, no translation)
+#   twitch-chat-translate: standalone translator (export → API → import JSON)
+[project.scripts]
+twitch-chat-overlay = "render_cn_chat:main"
+twitch-chat-burn = "twitch_chat_burn:main"
+twitch-chat-translate = "translate_chat_openai:main"
+
+[project.urls]
+Homepage = "https://github.com/yigenhuobahh/twitch-chat-translator-overlay"
+Repository = "https://github.com/yigenhuobahh/twitch-chat-translator-overlay"
+Issues = "https://github.com/yigenhuobahh/twitch-chat-translator-overlay/issues"
+
+[tool.setuptools]
+package-dir = {"" = "scripts"}
+py-modules = [
+  "chat_parser",
+  "chat_window",
+  "common_utils",
+  "encode_options",
+  "env_bootstrap",
+  "job_config",
+  "job_wizard",
+  "layout_preset",
+  "media_health",
+  "overlay_config",
+  "process_util",
+  "render_cn_chat",
+  "render_perf",
+  "render_preset",
+  "run_meta",
+  "run_tests",
+  "translate_chat_openai",
+  "translation_support",
+  "twitch_chat_burn",
+  "twitch_download",
+  "ux_setup",
+]
+# Ship public YAML assets with the wheel without converting scripts/ into a package.
+# Wheel data-files install under the interpreter's sysconfig data prefix, usually:
+#   <sys.prefix>/share/twitch-chat-translator-overlay/
+# The CLI checks repo/cwd resources first, then auto-discovers this installed share.
+
+[tool.setuptools.data-files]
+"share/twitch-chat-translator-overlay" = [
+  ".env.example",
+]
+"share/twitch-chat-translator-overlay/profiles" = [
+  "profiles/default.yaml",
+  "profiles/layout_default.yaml",
+  "profiles/layout_compact.yaml",
+  "profiles/layout_mobile.yaml",
+  "profiles/render_default.yaml",
+  "profiles/render_fast.yaml",
+  "profiles/render_hq.yaml",
+]
+"share/twitch-chat-translator-overlay/configs" = [
+  "configs/rules.example.yaml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-ra"
+markers = [
+  "smoke: short end-to-end render checks that need FFmpeg",
+  "max: comprehensive / long-term suite extras (run via scripts/run_tests.py --max)",
+  "slow: longer than usual; included in --max, excluded from default PR loop",
+]
+filterwarnings = [
+  "ignore::DeprecationWarning",
+]
+
+# ---------------------------------------------------------------------------
+# Ruff: lint + import sort + naming (see CONTRIBUTING.md)
+# Gate: python scripts/run_tests.py --lint   |   ruff check scripts tests
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+src = ["scripts", "tests"]
+extend-exclude = [
+  ".venv",
+  "outputs",
+  "_local_archive",
+]
+
+[tool.ruff.lint]
+# E/F: pycodestyle + pyflakes (correctness)
+# I: isort
+# UP: pyupgrade (modernize)
+# B: bugbear (likely bugs)
+# N: pep8-naming
+# SIM: simplify (light)
+select = ["E", "F", "I", "UP", "B", "N", "SIM"]
+ignore = [
+  "E501",   # line length — many Chinese CLI strings; keep readable logs over wrap
+  "E402",   # module import not at top — scripts insert sys.path before local imports
+  "UP009",  # utf-8 coding cookie still useful on Windows tooling
+  "SIM102", # collapsible-if — often less clear for CLI branches
+  "SIM103", # return condition directly — prefer explicit True/False in places
+  "SIM105", # contextlib.suppress — try/except pass is fine for best-effort cleanup
+  "SIM108", # ternary vs if/else — readability preference
+  "SIM110", # any()/all() rewrite — fine either way
+  "SIM117", # nested with — test mocks often nest patches
+  "B008",   # function calls in defaults — argparse patterns
+  "B904", # raise-from — gradual; many intentional re-raises
+  "B905", # zip strict= — py310+ optional, low risk here
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Flat modules under scripts/ intentionally mutate sys.path before local imports.
+"scripts/*.py" = ["E402"]
+# Render hot path uses ALL_CAPS locals (LINE_H, MAX_W) as domain constants.
+"scripts/twitch_chat_burn.py" = ["E402", "N806"]
+# Tests: pytest naming + short fixtures.
+"tests/**/*.py" = ["N802", "N803", "N806"]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+  "chat_parser",
+  "chat_window",
+  "common_utils",
+  "encode_options",
+  "env_bootstrap",
+  "job_config",
+  "job_wizard",
+  "layout_preset",
+  "media_health",
+  "overlay_config",
+  "process_util",
+  "render_cn_chat",
+  "render_perf",
+  "render_preset",
+  "run_meta",
+  "run_tests",
+  "translate_chat_openai",
+  "translation_support",
+  "twitch_chat_burn",
+  "twitch_download",
+  "ux_setup",
+]
+force-sort-within-sections = true
+
+[tool.ruff.lint.pep8-naming]
+classmethod-decorators = ["classmethod"]
+# Domain constants and env-style names used as locals or imports.
+ignore-names = [
+  "X", "Y", "W", "H", "FPS", "CRF", "API_KEY", "BASE_URL", "MODEL",
+  "BATCH_SIZE", "MAX_WORKERS", "DRY_RUN", "QUIET", "VERBOSE",
+  "LINE_H", "MAX_W", "MAX_VISIBLE", "MSG_LIFETIME", "BG_ALPHA",
+  "FADE_IN", "FADE_OUT", "BADGE_COLORS", "Path",
+]

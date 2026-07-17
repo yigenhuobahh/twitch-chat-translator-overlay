@@ -1,0 +1,102 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.json
+htmlcov/
+.venv/
+venv/
+build/
+
+# Secrets / local environment
+.env
+.env.*
+!.env.example
+
+# Local editor / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Generated media and review artifacts
+outputs/*
+!outputs/.gitkeep
+*.tmp.mp4
+*.frames/
+
+# Private local archive of personal samples/reviews/outputs (never publish)
+_local_archive/
+
+# Local profiles may contain channel/game-specific terminology.
+profiles/*.yaml
+!profiles/default.yaml
+# Public render layout presets (geometry only, no channel glossary).
+!profiles/layout_default.yaml
+!profiles/layout_compact.yaml
+!profiles/layout_mobile.yaml
+# Public encode/perf presets (no channel glossary).
+!profiles/render_default.yaml
+!profiles/render_fast.yaml
+!profiles/render_hq.yaml
+
+# Local sample/review data may contain usernames, chat logs, or copyrighted media.
+samples/*.mp4
+samples/*.mkv
+samples/*.mov
+samples/*.webm
+samples/*.avi
+samples/*.html
+samples/*.json
+samples/*.png
+samples/emotes/
+
+# Internal docs, not for public repo
+ROADMAP.md
+HANDOVER.md
+CLAUDE.md
+.claude/
+scripts/twitch_chat_translator_overlay.egg-info/
+samples/overlay_frames/
+!samples/example.*
+translations/*.json
+!translations/example_translation.json
+reviews/*.tsv
+reviews/*.xlsx
+reviews/~$*.xlsx
+reviews/*_lint.tsv
+reviews/*_quality.json
+!reviews/example_translation_review.tsv
+!reviews/example_translation_review.xlsx
+
+chat_data.json
+
+emotes/
+
+# Optional portable FFmpeg (doctor --offer-fix / manual extract)
+tools/ffmpeg/
+# Optional TwitchDownloaderCLI binary tree (install prompt / manual extract)
+tools/TwitchDownloaderCLI/
+# Downloaded VODs/chats from --download
+downloads/
+
+# User job configs (keep public example only)
+jobs/*
+!jobs/.gitkeep
+!jobs/example_job.yaml
+jobs/.last_job
+
+# Optional local launcher overrides
+configs/launcher.local.yaml
+
+# Deprecated/invalid local scripts
+*.bat.invalid
+*.invalid
+
+# Stray local artifacts
+repo

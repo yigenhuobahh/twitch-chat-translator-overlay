@@ -1,0 +1,20 @@
+# 翻译规则示例 — 频道梗、专名、数字梗的归一化
+# 用法: --rules configs/rules.example.yaml
+# 复制后修改 match/translation 即可适配你的频道。
+# 这些规则在 API 翻译后按 original 精确匹配并覆写 translation。
+# preserve_patterns 只跳过这一步规则清洗，不控制是否调用翻译 API。
+
+normalizations:
+  - name: "example acronym"
+    description: "Normalize a channel-specific acronym to a readable translation."
+    match:
+      - "gg"
+      - "GG"
+      - "good game"
+    translation: "打得好"
+
+preserve_patterns:
+  # Skip rule overrides for pure emote messages such as [Pog] or [Kappa].
+  - "^\\[[^\\]]+\\]$"
+  # Skip rule overrides for messages beginning with a user mention.
+  - "^@[A-Za-z0-9_]+"

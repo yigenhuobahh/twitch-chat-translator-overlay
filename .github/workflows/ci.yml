@@ -1,0 +1,181 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.10"
+          - os: ubuntu-latest
+            python-version: "3.11"
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: macos-latest
+            python-version: "3.12"
+          - os: windows-latest
+            python-version: "3.12"
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install FFmpeg and CJK fonts (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-noto-cjk fonts-wqy-zenhei
+
+      - name: Install FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ffmpeg
+          # Noto CJK may already be present on runners; best-effort install
+          brew install --cask font-noto-sans-cjk || true
+
+      - name: Install FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install ffmpeg -y
+          # Windows images usually ship with YaHei / fallback fonts for CJK
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -e .
+
+      - name: Smoke test entry points
+        run: |
+          twitch-chat-overlay --doctor
+          twitch-chat-burn --help
+          twitch-chat-translate --help
+
+      - name: Lint (ruff)
+        env:
+          PYTHONPATH: scripts
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: |
+          python scripts/run_tests.py --lint --no-compile
+
+      - name: Run tests (unit + smoke)
+        env:
+          PYTHONPATH: scripts
+          # Windows runners default to cp1252; force UTF-8 for Chinese CLI logs.
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: |
+          python scripts/run_tests.py --smoke --no-lint
+
+  wheel-smoke:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build project and dependency wheelhouse
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip wheel --wheel-dir "$RUNNER_TEMP/wheelhouse" .
+
+      - name: Verify wheel module manifest
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import tomllib
+          import zipfile
+
+          config = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+          expected = {f"{name}.py" for name in config["tool"]["setuptools"]["py-modules"]}
+          wheel = next((Path(os.environ["RUNNER_TEMP"]) / "wheelhouse").glob("twitch_chat_translator_overlay-*.whl"))
+          with zipfile.ZipFile(wheel) as archive:
+              actual = {name for name in archive.namelist() if "/" not in name and name.endswith(".py")}
+          assert actual == expected, "wheel top-level module manifest differs from pyproject.toml"
+          PY
+
+      - name: Install and exercise wheel outside checkout
+        run: |
+          VENV="$RUNNER_TEMP/wheel-venv"
+          SMOKE="$RUNNER_TEMP/wheel-smoke"
+          python -m venv "$VENV"
+          "$VENV/bin/python" -m pip install --no-index \
+            --find-links "$RUNNER_TEMP/wheelhouse" twitch-chat-translator-overlay
+          mkdir -p "$SMOKE"
+          cd "$SMOKE"
+          "$VENV/bin/python" - <<'PY'
+          import os
+          from pathlib import Path
+
+          import twitch_download
+          from common_utils import (
+              load_dotenv_if_present,
+              resolve_profiles_preset,
+              resolve_public_resource,
+              safe_which,
+          )
+
+          cwd = Path.cwd().resolve()
+          tool_sentinel = cwd / "tools" / "TwitchDownloaderCLI" / twitch_download.td_exe_names()[0]
+          root_sentinel = cwd / twitch_download.td_exe_names()[0]
+          tool_sentinel.parent.mkdir(parents=True)
+          tool_sentinel.write_text("untrusted cwd tools sentinel", encoding="utf-8")
+          root_sentinel.write_text("untrusted cwd root sentinel", encoding="utf-8")
+          root_sentinel.chmod(0o755)
+          ffmpeg_sentinel = cwd / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+          ffprobe_sentinel = cwd / ("ffprobe.exe" if os.name == "nt" else "ffprobe")
+          ffmpeg_sentinel.write_text("untrusted cwd ffmpeg", encoding="utf-8")
+          ffprobe_sentinel.write_text("untrusted cwd ffprobe", encoding="utf-8")
+          ffmpeg_sentinel.chmod(0o755)
+          ffprobe_sentinel.chmod(0o755)
+          (cwd / ".env").write_text(
+              "OPENAI_COMPAT_BASE_URL=\nOPENAI_COMPAT_MODEL=\nOPENAI_COMPAT_API_KEY=\n"
+              f"TWITCHDOWNLOADER_CLI={root_sentinel}\nEDITOR={root_sentinel}\n",
+              encoding="utf-8",
+          )
+          os.environ.pop("TWITCHDOWNLOADER_CLI", None)
+          os.environ.pop("EDITOR", None)
+          load_dotenv_if_present()
+
+          assert twitch_download.default_download_dir() == cwd / "downloads"
+          assert twitch_download._TOOLS_ROOT != cwd
+          assert all(cwd not in candidate.parents for candidate in twitch_download.tools_td_bin_dirs())
+          assert twitch_download.find_twitchdownloader_cli() not in {
+              tool_sentinel.resolve(),
+              root_sentinel.resolve(),
+          }
+          assert safe_which("ffmpeg") != str(ffmpeg_sentinel.resolve())
+          assert safe_which("ffprobe") != str(ffprobe_sentinel.resolve())
+          assert "TWITCHDOWNLOADER_CLI" not in os.environ
+          assert "EDITOR" not in os.environ
+          assert resolve_profiles_preset("compact", prefix="layout").is_file()
+          assert resolve_profiles_preset("fast", prefix="render").is_file()
+          assert resolve_public_resource("profiles/default.yaml", subdir="profiles").is_file()
+          assert resolve_public_resource("configs/rules.example.yaml", subdir="configs").is_file()
+          PY
+          "$VENV/bin/twitch-chat-overlay" --init | tee init.log
+          test -s .env
+          grep -q '^OPENAI_COMPAT_BASE_URL=' .env
+          grep -Eq 'twitch-chat-overlay(\.exe)? --init' init.log
+          ! grep -q 'scripts/render_cn_chat.py' init.log
+          ! grep -q 'run.bat' init.log
+          ! grep -Eq 'python .*twitch-chat-overlay' init.log

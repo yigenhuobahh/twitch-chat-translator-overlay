@@ -1,0 +1,5 @@
+beautifulsoup4>=4.12
+openai>=1.0
+openpyxl>=3.1
+pillow>=10.0
+PyYAML>=6.0

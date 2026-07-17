@@ -1,0 +1,25 @@
+{
+  "messages": [
+    {
+      "index": 0,
+      "timestamp": 0.0,
+      "author": "viewer_one",
+      "original": "GG everyone",
+      "translation": "大家打得好"
+    },
+    {
+      "index": 1,
+      "timestamp": 2.5,
+      "author": "chat_friend",
+      "original": "[Pog]",
+      "translation": "[Pog]"
+    },
+    {
+      "index": 2,
+      "timestamp": 4.0,
+      "author": "mod_user",
+      "original": "@viewer_one thanks for the tip",
+      "translation": "@viewer_one 谢谢提醒"
+    }
+  ]
+}

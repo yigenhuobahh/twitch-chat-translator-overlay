@@ -1,0 +1,29 @@
+# 手机阅读模式 — 同一块电脑弹幕区域，浮动堆叠 + 限流，适合手机观看
+# 用法: --layout-preset profiles/layout_mobile.yaml
+#
+# 与 layout_default 的区别：
+#   - stack_mode: float（Twitch 上浮，无时间过期，仅容量顶出）
+#   - max_visible: 0（按框高/字号自动填满，约 12 行单行消息）
+#   - max_message_lines: 2（超出显示 ...）
+#   - arrival_interval: 0.35（高频聊天时延后新消息）
+#   - fps: 15（降低弹幕层帧率省渲染时间，成片帧率不受影响）
+#
+# 注意：x/y/w/h 与 layout_default 保持一致（约 1080p 像素）。
+#       非 1080p 且框会越界时引擎自动缩放；精确构图请改像素或 *-ratio。
+# Keep x/y/w/h in sync with layout_default.yaml unless you intentionally re-crop.
+name: layout_mobile
+label: "Mobile-readable lower-left chat"
+description: "Desktop geometry, float stack, auto-filled height for phone viewing."
+
+layout:
+  x: 15
+  y: 327
+  width: 497
+  height: 363
+  font_size: 15
+  fps: 15              # 弹幕层帧率（成片帧率跟随源视频）
+  max_visible: 0       # 0 = 按框高/字号自动填满
+  stack_mode: float    # 上浮堆叠（无时间过期，仅容量顶出）
+  max_message_lines: 2 # 单条最多 2 行，超出显示 ...
+  arrival_interval: 0.35 # 新消息最小入场间隔（秒）
+  bg_alpha: 255        # 不透明黑底

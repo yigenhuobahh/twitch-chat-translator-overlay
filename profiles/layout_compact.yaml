@@ -1,0 +1,17 @@
+# 紧凑布局预设 — 更小的弹幕框，适合密集聊天预览
+# 用法: --layout-preset profiles/layout_compact.yaml
+name: layout_compact
+label: "Compact lower-left chat"
+description: "Smaller box, shorter lifetime — good for dense chat previews."
+
+layout:
+  x: 12              # 弹幕框左上角 X 坐标
+  y: 420             # 弹幕框左上角 Y 坐标
+  width: 420         # 弹幕框宽度
+  height: 260        # 弹幕框高度
+  font_size: 14      # 字体大小
+  fps: 24            # 弹幕层采样帧率
+  max_visible: 8     # 最多同时显示消息条数
+  msg_lifetime: 10.0 # 消息停留秒数（仅 lanes 模式）
+  bg_alpha: 200      # 背景透明度（半透明）
+  emote_height: 20   # 表情图片高度

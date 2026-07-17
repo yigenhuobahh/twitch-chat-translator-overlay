@@ -1,0 +1,20 @@
+# 默认翻译 profile — 控制翻译风格、术语表、保留项
+# 用法: --profile profiles/default.yaml
+# 复制后修改 glossary / context / translation_style 即可适配你的频道。
+name: default
+label: "Generic Twitch chat"
+context: "Twitch livestream chat. Keep emote names, @usernames, URLs, and short memes concise."
+
+glossary:
+  GG: "打得好"
+  AFK: "暂离"
+
+preserve:
+  - emotes
+  - usernames
+  - urls
+  - numbers
+
+translation_style:
+  tone: "口语化、简洁，适合弹幕显示"
+  max_length_hint: "尽量短句，不要解释性扩写"

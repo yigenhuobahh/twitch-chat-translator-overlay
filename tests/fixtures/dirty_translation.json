@@ -1,0 +1,39 @@
+{
+  "messages": [
+    {
+      "index": 0,
+      "timestamp": 1.0,
+      "author": "example_user",
+      "original": "hello [LUL] world",
+      "translation": "<example_user> 你好 [LUL] 世界"
+    },
+    {
+      "index": 1,
+      "timestamp": 2.0,
+      "author": "bot_user",
+      "original": "[Hey]",
+      "translation": "[Hey]"
+    },
+    {
+      "index": 2,
+      "timestamp": 3.0,
+      "author": "clip_fan",
+      "original": "nice [xdx] clip",
+      "translation": "clip_fan: 不错的 [xdx] 片段"
+    },
+    {
+      "index": 3,
+      "timestamp": 4.0,
+      "author": "url_user",
+      "original": "see https://example.com/a/b",
+      "translation": "看这里 https://example.com/a/b"
+    },
+    {
+      "index": 4,
+      "timestamp": 5.0,
+      "author": "alt_user",
+      "original": "so strong",
+      "translation": "太强了/真厉害"
+    }
+  ]
+}

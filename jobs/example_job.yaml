@@ -1,0 +1,80 @@
+# =============================================================================
+# Twitch Chat Translator Overlay — 可复用任务样式 (job.yaml)
+# =============================================================================
+# 设计：布局 / 编码 / 用途写进文件；视频与 HTML 默认不写死。
+# 每次运行会询问本次文件位置，或在命令行传入：
+#   python scripts/render_cn_chat.py --job jobs/example_job.yaml video.mp4 chat.html
+#   run.bat example_job
+#     → 菜单里选此配置后，会问本次 video / HTML（不写回本文件）
+#
+# 若要固定某部片子的路径：取消下面 video / chat_html 的注释并改成真实路径。
+#
+# 规则:
+#   - 显式命令行参数优先于本文件（CLI wins）
+#   - 一般相对路径相对「本 YAML 文件所在目录」解析
+#   - profile/rules 若不在 YAML 旁，则继续从项目或安装资源目录查找
+#   - 布局/编码可用短名: compact / mobile / fast / hq / default
+# =============================================================================
+
+# --- 输入 / 输出（默认注释 = 每次运行询问，不写死）---------------------------
+
+# 源视频路径。取消注释后才固定跟配置走。
+# video: path/to/video.mp4
+
+# TwitchDownloader 聊天 HTML。取消注释后才固定。
+# chat_html: path/to/chat.html
+
+# 最终成片；注释掉则默认 <视频名>_chat.mp4
+# output: path/to/out_chat.mp4
+
+# 工作目录（可选，可写死以便复用）
+# workdir: work/my_style
+
+# 翻译 JSON；注释掉则默认 <视频名>_translation.json
+# translation_json: path/to/translations.json
+
+
+# --- 场景模式 mode -----------------------------------------------------------
+# auto / full : 完整流程（导出→翻译→渲染；有 reuse_translation 则跳过翻译）
+# preview     : 预览优先；未指定 preview_clip/frame 时默认 10 秒，overlay 倾向 png
+# translate   : 只做导出+翻译，不渲染
+# render      : 只渲染；必须 reuse_translation 或 render_original，避免误调 API
+mode: preview
+
+
+# --- 翻译相关 ----------------------------------------------------------------
+
+# true = 不调用翻译 API，直接烧录 HTML 里的原始聊天（含已嵌入 emote）
+# 首次确认时间轴/布局时强烈建议 true
+render_original: true
+
+# true = 复用已有 translation_json，跳过导出和 API
+# reuse_translation: false
+
+# 翻译目标语言（调 API 时有效）: zh / ja / ko / en ...
+# target_language: zh
+
+
+# --- 预览 / 时间轴 -----------------------------------------------------------
+
+# 只渲染开头 N 秒短片（秒）。mode=preview 且未写时，CLI 会默认 10。
+preview_clip: 10
+
+# 聊天时间戳相对视频的偏移（秒）。不填则引擎自动启发式检测。
+# offset: 7264
+
+
+# --- 布局 / 编码（可复用核心）-------------------------------------------------
+
+# 布局 YAML 或短名: default | compact | mobile
+# layout_preset: compact
+
+# 编码/性能 YAML 或短名: default | fast | hq
+# render_preset: fast
+
+
+# --- 其它可选 ----------------------------------------------------------------
+# profile: profiles/default.yaml
+# rules: configs/rules.example.yaml
+# encoder: x264
+# overlay_codec: png

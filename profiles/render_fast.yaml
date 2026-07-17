@@ -1,0 +1,19 @@
+# 快速预览/草稿编码预设 — 低质量、快速出片
+# 用法: --render-preset profiles/render_fast.yaml
+# 适合：快速检查弹幕位置/翻译效果，不需要最终画质时。
+name: render_fast
+label: "Fast draft"
+description: "Lower quality, faster x264 + PNG overlay path for quick checks."
+
+render:
+  encoder: x264
+  video_preset: veryfast  # 比 fast 更快，质量略低
+  crf: 23                 # 比 default 高 5，文件更小但质量略低
+  audio_codec: aac
+  audio_bitrate: 128k
+  overlay_codec: png      # PNG 直接叠加，跳过 VP9 编码步骤
+  reuse_static_frames: true
+  skip_blank_frames: true
+  blank_hold_seconds: 1.0
+  lazy_message_images: true        # 长片省内存：消息图按需渲染
+  message_image_cache_size: 128    # LRU 缓存上限
