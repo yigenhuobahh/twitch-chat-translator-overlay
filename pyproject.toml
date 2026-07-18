@@ -39,6 +39,7 @@ dev = [
   "ruff>=0.8",
   "tomli>=2.0; python_version < '3.11'",
 ]
+tui = ["textual>=0.80"]
 
 # Console scripts — three entry points for different use cases:
 #   twitch-chat-overlay : full pipeline (parse → translate → render → compose), 日常用这个
@@ -76,6 +77,7 @@ py-modules = [
   "quick_demo",
   "run_tests",
   "task_events",
+  "tui_run",
   "translate_chat_openai",
   "translation_support",
   "twitch_chat_burn",

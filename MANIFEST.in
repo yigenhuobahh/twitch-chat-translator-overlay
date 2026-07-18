@@ -14,6 +14,7 @@ include .github/workflows/release.yml
 include pyproject.toml
 include pytest.ini
 include run.bat
+include run_tui.bat
 include run.sh
 include install.bat
 include install.sh

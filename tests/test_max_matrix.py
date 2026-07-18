@@ -110,7 +110,7 @@ def test_public_console_scripts_declared():
 
 
 def test_run_bat_is_ascii_crlf():
-    for name in ("run.bat", "install.bat", "update.bat", "doctor.bat"):
+    for name in ("run.bat", "run_tui.bat", "install.bat", "update.bat", "doctor.bat"):
         p = ROOT / name
         if not p.is_file():
             continue

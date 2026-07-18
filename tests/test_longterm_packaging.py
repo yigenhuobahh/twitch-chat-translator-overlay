@@ -28,6 +28,7 @@ SDIST_CONTRACT_FILES = {
     "CHANGELOG.md",
     "pytest.ini",
     "run.bat",
+    "run_tui.bat",
     "run.sh",
     "install.bat",
     "install.sh",
