@@ -63,17 +63,20 @@ class OverlayTui(App[None]):
         self.event_offset = 0
         env = os.environ.copy()
         env["TWITCH_OVERLAY_EVENT_FILE"] = str(self.event_path.resolve())
-        self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        self.process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=env,
+        )
         self.query_one("#status", Static).update(f"Running: {label}")
         self.query_one("#log", RichLog).write("$ " + " ".join(command))
 
     def _poll_process(self) -> None:
         log = self.query_one("#log", RichLog)
-        if self.process and self.process.stdout:
+        if self.process:
             if self.process.poll() is not None:
-                output = self.process.stdout.read()
-                for line in output.splitlines():
-                    log.write(line)
                 self.query_one("#status", Static).update(f"Finished with exit code {self.process.returncode}")
                 self.process = None
         if self.event_path and self.event_path.is_file():
