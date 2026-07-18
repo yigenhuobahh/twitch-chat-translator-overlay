@@ -1297,7 +1297,7 @@ def _menu_download_and_continue() -> int:
     )
 
 
-def run_menu() -> int:
+def _run_legacy_menu() -> int:
     """Full Chinese interactive launcher for run.bat / run.sh."""
     root = default_jobs_dir()
     while True:
@@ -1399,6 +1399,103 @@ def run_menu() -> int:
             continue
 
         print("无效选择，请输入 0–6。")
+
+
+def _choose_existing_job(root: Path) -> int:
+    """Select and run a saved job with the same safeguards as the legacy menu."""
+    files = print_job_list(root, show_presets=False)
+    if not files:
+        return 0
+    selected = _prompt("输入编号或配置名", "1")
+    path: Path | None = None
+    try:
+        index = int(selected)
+        if 1 <= index <= len(files):
+            path = files[index - 1]
+    except ValueError:
+        try:
+            path = resolve_job_arg(selected, root)
+        except ValueError as exc:
+            print(exc)
+    if path is None:
+        print("无效选择。")
+        return 1
+    try:
+        return _confirm_and_run_job(path)
+    except (EOFError, FileNotFoundError, KeyboardInterrupt) as exc:
+        print(f"[FAIL] {exc}")
+        return 1
+
+
+def _run_tools_menu(root: Path) -> None:
+    """Keep lower-frequency operations available with a plain-language purpose."""
+    while True:
+        print("\n-------- 更多工具 --------")
+        print("  [1] 查看任务与预设：确认已有配置、布局和编码方案")
+        print("  [2] 环境诊断：检查 Python、FFmpeg、字体和翻译配置")
+        print("  [3] 下载 Twitch 素材：下载视频和聊天 HTML，再选择后续操作")
+        print("  [4] 旧版完整菜单：保留所有原有选项，适合熟悉流程的用户")
+        print("  [0] 返回主菜单")
+        choice = _prompt("请选择", "0")
+        if choice == "0":
+            return
+        if choice == "1":
+            print_job_list(root, show_presets=True)
+        elif choice == "2":
+            _run_pipeline("--doctor")
+        elif choice == "3":
+            try:
+                _menu_download_and_continue()
+            except (EOFError, KeyboardInterrupt):
+                print("已取消。")
+        elif choice == "4":
+            _run_legacy_menu()
+        else:
+            print("无效选择。")
+
+
+def _run_offline_demo() -> int:
+    script = Path(__file__).with_name("quick_demo.py")
+    return subprocess.run([sys.executable, str(script)], check=False).returncode
+
+
+def run_menu() -> int:
+    """Three-level double-click menu: start, continue work, then tools."""
+    root = default_jobs_dir()
+    while True:
+        has_last_job = last_job_path(root) is not None
+        print("\n======== Twitch 聊天覆盖：一键开始 ========")
+        print("新手先选 [1]；不会修改已有视频，也不要求先配置翻译 API。")
+        print("\n  [1] 快速开始：创建基础配置，再按问题选择用途和样式")
+        print("  [2] 继续上次任务：复用最近配置，重新选择本次视频和聊天 HTML")
+        print("  [3] 使用已有配置：选择一个任务样式后开始")
+        print("  [4] 离线体验：生成 6 秒示例视频验证环境，不使用翻译 API")
+        print("  [5] 更多工具：下载、环境诊断、预设与技术选项")
+        print("  [0] 退出")
+        default = "2" if has_last_job else "1"
+        choice = _prompt("请选择", default)
+        if choice == "0":
+            print("再见。")
+            return 0
+        if choice == "1":
+            run_quick_start()
+        elif choice == "2":
+            last = last_job_path(root)
+            if last is None:
+                print("还没有上次任务；请先使用 [1] 快速开始或 [3] 选择已有配置。")
+            else:
+                try:
+                    _confirm_and_run_job(last)
+                except (EOFError, FileNotFoundError, KeyboardInterrupt) as exc:
+                    print(f"[FAIL] {exc}")
+        elif choice == "3":
+            _choose_existing_job(root)
+        elif choice == "4":
+            _run_offline_demo()
+        elif choice == "5":
+            _run_tools_menu(root)
+        else:
+            print("无效选择，请输入 0-5。")
 
 
 def main(argv: list[str] | None = None) -> int:

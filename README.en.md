@@ -38,6 +38,10 @@ You can also drag a video file and its Twitch chat HTML onto `run.bat`. It creat
 
 The demo writes its source files and final `demo_overlay.mp4` under `outputs/quick_demo/`. Drag-and-drop previews use the normal pipeline output rules, so the final path is printed when rendering finishes.
 
+### Double-click menu
+
+The `run.bat` main menu is intentionally short: **Quick start**, **Continue last job**, **Use an existing job**, **Offline demo**, and **More tools**. The More tools screen explains when to use downloads, environment diagnostics, presets, or the legacy full menu. Advanced CLI flags and job YAML fields remain available without making first-time users choose technical parameters up front.
+
 > **Default output**: Without `--output`, writes `<video_name>_chat.mp4` next to the source.  
 > **Translation JSON**: Defaults to `<video_name>_translation.json`; reuse with `--reuse-translation`.  
 > **Re-export safety**: If the JSON already has non-empty `translation` fields, export is **skipped** (pipeline) or **refused** (burn) unless `--force-export`.  

@@ -2,6 +2,12 @@
 
 Notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- Reorganized the double-click launcher into a beginner-focused main menu, a continue-work path, and an explained tools menu while retaining the legacy full menu for advanced users.
+
 ## [0.2.1] - 2026-07-18
 
 ### Added

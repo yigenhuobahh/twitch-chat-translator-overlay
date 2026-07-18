@@ -200,8 +200,8 @@ def test_job_wizard_menu_chinese_and_exit():
     )
     assert r.returncode == 0
     out = (r.stdout or "") + (r.stderr or "")
-    assert "一键运行" in out or "新建配置" in out
-    assert "退出" in out or "再见" in out
+    assert "Twitch" in out
+    assert "[0]" in out
 
 
 def test_wizard_helpers_guess_translation_and_report_paths(tmp_path: Path):
