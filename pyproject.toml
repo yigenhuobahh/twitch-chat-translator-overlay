@@ -73,6 +73,7 @@ py-modules = [
   "render_perf",
   "render_preset",
   "run_meta",
+  "quick_demo",
   "run_tests",
   "translate_chat_openai",
   "translation_support",

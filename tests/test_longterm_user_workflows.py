@@ -142,6 +142,38 @@ def test_noninteractive_job_without_media_fails_before_pipeline(tmp_path: Path, 
     assert wizard._confirm_and_run_job(job_path) == 1
 
 
+def test_dragged_video_and_html_start_api_free_preview(tmp_path: Path, monkeypatch):
+    import job_wizard as wizard
+
+    video = tmp_path / "source.mp4"
+    chat = tmp_path / "chat.html"
+    video.write_bytes(b"video")
+    chat.write_text("<html></html>", encoding="utf-8")
+    captured: list[tuple[str, ...]] = []
+    monkeypatch.setattr(wizard, "_run_pipeline", lambda *args: captured.append(args) or 0)
+
+    assert wizard.run_drag_drop([str(video), str(chat)]) == 0
+    assert captured == [
+        (str(video), str(chat), "--mode", "preview", "--render-original", "--preview-clip", "10", "--yes")
+    ]
+
+
+def test_dragged_job_uses_existing_job_flow(tmp_path: Path, monkeypatch):
+    import job_wizard as wizard
+
+    job = tmp_path / "style.yaml"
+    job.write_text("mode: preview\n", encoding="utf-8")
+    captured: list[tuple[Path, list[str] | None]] = []
+    monkeypatch.setattr(
+        wizard,
+        "_confirm_and_run_job",
+        lambda path, extra_cli=None: captured.append((path, extra_cli)) or 0,
+    )
+
+    assert wizard.run_drag_drop([str(job), "--yes"]) == 0
+    assert captured == [(job, ["--yes"])]
+
+
 @pytest.mark.parametrize(
     ("guide_result", "cli_available", "expected_code"),
     [

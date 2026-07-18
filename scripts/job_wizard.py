@@ -29,6 +29,56 @@ from job_config import (
     write_job_file,
 )
 
+_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"}
+
+
+def run_drag_drop(arguments: list[str]) -> int:
+    """Route dropped media to a short API-free preview or an existing job."""
+    paths = [Path(_normalize_user_path(value)).expanduser() for value in arguments]
+    existing = [path for path in paths if path.is_file()]
+    jobs = [path for path in existing if path.suffix.lower() in {".yaml", ".yml"}]
+    if jobs:
+        return _confirm_and_run_job(jobs[0], extra_cli=[str(value) for value in arguments[1:]])
+
+    video = next((path for path in existing if path.suffix.lower() in _VIDEO_EXTENSIONS), None)
+    chat = next((path for path in existing if path.suffix.lower() in {".html", ".htm"}), None)
+    if video is not None and chat is None:
+        guessed = _guess_chat_html(video)
+        if guessed:
+            chat = Path(guessed)
+            print(f"[drag] detected chat HTML: {chat}")
+        elif _stdin_is_interactive():
+            try:
+                chat = Path(_prompt_path("  Chat HTML", must_exist=True))
+            except (EOFError, FileNotFoundError) as exc:
+                print(f"[FAIL] {exc}")
+                return 1
+    if video is not None and chat is not None:
+        print("[drag] creating a 10-second original-chat preview (no translation API needed).")
+        return _run_pipeline(
+            str(video), str(chat), "--mode", "preview", "--render-original", "--preview-clip", "10", "--yes"
+        )
+
+    if arguments:
+        try:
+            path = resolve_job_arg(arguments[0])
+        except ValueError:
+            print("[FAIL] Drop a video + chat HTML pair, or a job YAML file.")
+            return 1
+        return _confirm_and_run_job(path, extra_cli=arguments[1:])
+    return run_menu()
+
+
+def run_quick_start() -> int:
+    """Scaffold first-run files, then use the existing job wizard."""
+    from ux_setup import run_init
+
+    if run_init(create_job=True) != 0:
+        return 1
+    print("\nNext: choose a purpose and layout. You can drag media onto run.bat later.")
+    created = run_job_wizard()
+    return 0 if created is None else _confirm_and_run_job(created)
+
 
 def _stdin_is_interactive() -> bool:
     """True only when we can reasonably prompt the user (real TTY, not piped/devnull)."""
@@ -1367,6 +1417,10 @@ def main(argv: list[str] | None = None) -> int:
         name = argv[1] if len(argv) > 1 else None
         path = run_job_wizard(name=name)
         return 0 if path else 1
+    if cmd == "quick":
+        return run_quick_start()
+    if cmd == "drop":
+        return run_drag_drop(argv[1:])
     if cmd == "list":
         return run_list_jobs()
     if cmd == "menu":

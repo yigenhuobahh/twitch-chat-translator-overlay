@@ -27,6 +27,15 @@ python scripts/render_cn_chat.py video.mp4 chat.html --output out.mp4
 
 Windows: `install.bat` then `run.bat` (menu). Linux/macOS: `bash install.sh` then `bash run.sh`.
 
+### Fastest first run (Windows)
+
+```bat
+run.bat quick  :: scaffold .env and create a reusable job
+run.bat demo   :: render a 6-second offline demo; no API key required
+```
+
+You can also drag a video file and its Twitch chat HTML onto `run.bat`. It creates a 10-second original-chat preview first, so layout and timing can be checked before configuring translation or rendering a full VOD.
+
 > **Default output**: Without `--output`, writes `<video_name>_chat.mp4` next to the source.  
 > **Translation JSON**: Defaults to `<video_name>_translation.json`; reuse with `--reuse-translation`.  
 > **Re-export safety**: If the JSON already has non-empty `translation` fields, export is **skipped** (pipeline) or **refused** (burn) unless `--force-export`.  

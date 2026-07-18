@@ -41,6 +41,7 @@ COMPILE_SCRIPTS = [
     "render_cn_chat.py",
     "render_perf.py",
     "render_preset.py",
+    "quick_demo.py",
     "run_meta.py",
     "run_tests.py",
     "translate_chat_openai.py",

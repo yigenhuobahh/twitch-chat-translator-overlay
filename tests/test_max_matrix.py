@@ -129,8 +129,9 @@ def test_launchers_require_runnable_python_310():
 
 def test_run_bat_preserves_original_argument_vector():
     text = (ROOT / "run.bat").read_text(encoding="ascii")
-    assert r"scripts\job_wizard.py run %*" in text
-    assert 'echo job: "%JOBARG%"' in text
+    assert r"scripts\job_wizard.py drop %*" in text
+    assert r"scripts\job_wizard.py quick" in text
+    assert r"scripts\quick_demo.py" in text
     assert 'set "EXTRA="' not in text
 
 

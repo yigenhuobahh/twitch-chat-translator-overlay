@@ -39,17 +39,17 @@ if /I "%~1"=="" goto MENU
 if /I "%~1"=="menu" goto MENU
 if /I "%~1"=="new" goto NEW
 if /I "%~1"=="init-job" goto NEW
+if /I "%~1"=="quick" goto QUICK
+if /I "%~1"=="demo" goto DEMO
 if /I "%~1"=="list" goto LIST
 if /I "%~1"=="help" goto HELP
 if /I "%~1"=="-h" goto HELP
 if /I "%~1"=="--help" goto HELP
 if /I "%~1"=="doctor" goto DOCTOR
 
-set "JOBARG=%~1"
-REM Same UX as menu [2]: ask for this-run video/html when not pinned in YAML.
-REM Forward the original argument vector so cmd preserves caller quoting.
-echo job: "%JOBARG%"
-"%PY%" scripts\job_wizard.py run %*
+REM Drag video + chat HTML onto this file for a no-API 10-second preview.
+REM A dropped YAML or a legacy job name still uses the existing job wizard.
+"%PY%" scripts\job_wizard.py drop %*
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" (
   echo.
@@ -67,6 +67,18 @@ exit /b %RC%
 
 :NEW
 "%PY%" scripts\render_cn_chat.py --init-job
+set "RC=%ERRORLEVEL%"
+if not "%RC%"=="0" if not defined CI pause
+exit /b %RC%
+
+:QUICK
+"%PY%" scripts\job_wizard.py quick
+set "RC=%ERRORLEVEL%"
+if not "%RC%"=="0" if not defined CI pause
+exit /b %RC%
+
+:DEMO
+"%PY%" scripts\quick_demo.py
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" if not defined CI pause
 exit /b %RC%
@@ -97,6 +109,9 @@ exit /b %RC%
 
 :HELP
 echo run.bat              Chinese menu
+echo run.bat quick        First-run setup + job wizard
+echo run.bat demo         Offline demo (no translation API)
+echo Drag video + chat HTML onto run.bat for a 10-second preview
 echo run.bat new          New job wizard
 echo run.bat list         List jobs
 echo run.bat NAME         Run jobs\NAME.yaml
