@@ -1,0 +1,74 @@
+name: Bug report
+description: Report a reproducible problem with the TUI, CLI, download, translation, or rendering workflow.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve the project. Please remove private video paths, Twitch OAuth values, API keys, and personal chat content before submitting.
+  - type: input
+    id: version
+    attributes:
+      label: Project version or commit
+      description: For example, v0.2.2 or the output of git log -1 --oneline.
+      placeholder: v0.2.2
+    validations:
+      required: true
+  - type: dropdown
+    id: entry-point
+    attributes:
+      label: Where did the problem occur?
+      options:
+        - TUI (run.bat)
+        - Recovery or advanced CLI (run_cli.bat)
+        - Download page or TwitchDownloaderCLI
+        - Translation
+        - Rendering or output video
+        - Installation or environment check
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Operating system and Python version
+      placeholder: Windows 11, Python 3.12
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Use sample or redacted paths and a bounded VOD time range where possible.
+      placeholder: |
+        1. Open ...
+        2. Choose ...
+        3. Start ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result
+      description: Include the exact visible error or behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostic
+    attributes:
+      label: Redacted diagnostic (optional)
+      description: In TUI, use History and Artifacts > Export diagnostic. Do not paste API keys, OAuth tokens, environment files, commands containing credentials, or private chat content.
+      render: text
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed API keys, OAuth tokens, private paths, and personal chat content.
+          required: true

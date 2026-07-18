@@ -70,6 +70,14 @@ jobs:
           twitch-chat-burn --help
           twitch-chat-translate --help
 
+      - name: Smoke Windows batch launchers
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          set CI=1
+          call run.bat --help
+          call run_cli.bat help
+
       - name: Lint (ruff)
         env:
           PYTHONPATH: scripts

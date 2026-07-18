@@ -8,8 +8,30 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_public_issue_forms_protect_credentials_and_ci_exercises_windows_launchers():
+    """Support intake must be structured, privacy-aware, and kept runnable."""
+    issue_dir = ROOT / ".github" / "ISSUE_TEMPLATE"
+    bug = yaml.safe_load((issue_dir / "bug_report.yml").read_text(encoding="utf-8"))
+    feature = yaml.safe_load((issue_dir / "feature_request.yml").read_text(encoding="utf-8"))
+    config = yaml.safe_load((issue_dir / "config.yml").read_text(encoding="utf-8"))
+
+    assert bug["name"] == "Bug report"
+    assert feature["name"] == "Feature request"
+    assert config["blank_issues_enabled"] is False
+    diagnostic = next(field for field in bug["body"] if field.get("id") == "diagnostic")
+    assert "OAuth" in diagnostic["attributes"]["description"]
+    privacy = next(field for field in bug["body"] if field.get("id") == "privacy")
+    assert privacy["attributes"]["options"][0]["required"] is True
+
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "Smoke Windows batch launchers" in ci
+    assert "call run.bat --help" in ci
+    assert "call run_cli.bat help" in ci
 
 
 def _stub_job_io(monkeypatch, wizard, job: dict, captured: list[tuple[str, ...]]) -> None:

@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: TUI recovery guide
+    url: https://github.com/yigenhuobahh/twitch-chat-translator-overlay/blob/main/README.md#%E6%95%85%E9%9A%9C%E6%81%A2%E5%A4%8Dtui
+    about: Check the recovery guide before opening a report.
