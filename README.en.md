@@ -36,6 +36,8 @@ run.bat demo   :: render a 6-second offline demo; no API key required
 
 You can also drag a video file and its Twitch chat HTML onto `run.bat`. It creates a 10-second original-chat preview first, so layout and timing can be checked before configuring translation or rendering a full VOD.
 
+The demo writes its source files and final `demo_overlay.mp4` under `outputs/quick_demo/`. Drag-and-drop previews use the normal pipeline output rules, so the final path is printed when rendering finishes.
+
 > **Default output**: Without `--output`, writes `<video_name>_chat.mp4` next to the source.  
 > **Translation JSON**: Defaults to `<video_name>_translation.json`; reuse with `--reuse-translation`.  
 > **Re-export safety**: If the JSON already has non-empty `translation` fields, export is **skipped** (pipeline) or **refused** (burn) unless `--force-export`.  

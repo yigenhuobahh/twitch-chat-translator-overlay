@@ -2,6 +2,14 @@
 
 Notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Added `run.bat quick` to scaffold first-run files and continue into the guided job wizard.
+- Added `run.bat demo`, an offline six-second overlay demo that verifies FFmpeg, fonts, and rendering without a translation API.
+- Added drag-and-drop routing for a local video plus Twitch chat HTML; it creates a safe ten-second original-chat preview before a full translation render.
+
 ## [0.2.0] - 2026-07-17
 
 ### Added

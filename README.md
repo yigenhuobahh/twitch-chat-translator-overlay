@@ -1,5 +1,7 @@
 # Twitch Chat Translator Overlay
 
+> 新手入口：Windows 安装完成后运行 `run.bat quick`；无需翻译 API 的环境验证可运行 `run.bat demo`。也可以把本地视频和对应的 Twitch 聊天 HTML 一起拖到 `run.bat` 上，先生成 10 秒原文预览。
+
 将 Twitch 直播录像的聊天弹幕翻译成中文（或其他语言），以半透明覆盖层形式压制到视频画面上。
 
 发布记录：[`CHANGELOG.md`](https://github.com/yigenhuobahh/twitch-chat-translator-overlay/blob/main/CHANGELOG.md)
