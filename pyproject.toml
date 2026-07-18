@@ -75,6 +75,7 @@ py-modules = [
   "run_meta",
   "quick_demo",
   "run_tests",
+  "task_events",
   "translate_chat_openai",
   "translation_support",
   "twitch_chat_burn",

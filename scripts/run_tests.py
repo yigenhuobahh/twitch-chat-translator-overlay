@@ -44,6 +44,7 @@ COMPILE_SCRIPTS = [
     "quick_demo.py",
     "run_meta.py",
     "run_tests.py",
+    "task_events.py",
     "translate_chat_openai.py",
     "translation_support.py",
     "twitch_chat_burn.py",

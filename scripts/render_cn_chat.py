@@ -80,6 +80,7 @@ from process_util import (
     run_tracked,
 )
 from render_preset import apply_render_preset_to_namespace, load_render_preset
+from task_events import emit_task_event
 from ux_setup import print_setup_next_steps, run_init
 
 ensure_utf8_stdio()
@@ -447,10 +448,15 @@ def pause_after_translation_for_review(
 
 
 def run(cmd, cwd=None, error_hint=""):
+    launcher = Path(str(cmd[0])).stem.lower()
+    program_arg = cmd[1] if len(cmd) > 1 and launcher.startswith("python") else cmd[0]
+    program = Path(str(program_arg)).name
     if DRY_RUN:
         log(f"[dry-run] {' '.join(str(c) for c in cmd)}")
+        emit_task_event("command_skipped", program=program, reason="dry_run")
         return
     log("\n$ " + " ".join(f'"{c}"' if " " in str(c) else str(c) for c in cmd))
+    emit_task_event("command_started", program=program)
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
     try:
@@ -458,8 +464,10 @@ def run(cmd, cwd=None, error_hint=""):
         # the process tree for Ctrl+C / atexit cleanup.
         p = run_tracked(cmd, cwd=cwd, text=False, env=env, stdout=None, stderr=None)
     except FileNotFoundError as e:
+        emit_task_event("command_failed", program=program, reason="not_found")
         hint = error_hint or "找不到可执行文件，请确认已安装并加入 PATH"
         raise PipelineError(f"错误: {hint}\n  详情: {e}")
+    emit_task_event("command_exited", program=program, returncode=p.returncode)
     if p.returncode != 0:
         hint = error_hint or "命令执行失败"
         raise PipelineError(f"错误: {hint} (exit code {p.returncode})")
