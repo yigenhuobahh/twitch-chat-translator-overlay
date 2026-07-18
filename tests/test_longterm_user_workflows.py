@@ -16,6 +16,9 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_public_issue_forms_protect_credentials_and_ci_exercises_windows_launchers():
     """Support intake must be structured, privacy-aware, and kept runnable."""
     issue_dir = ROOT / ".github" / "ISSUE_TEMPLATE"
+    if not issue_dir.is_dir():
+        pytest.skip("GitHub issue forms are repository maintenance files, not package data")
+
     bug = yaml.safe_load((issue_dir / "bug_report.yml").read_text(encoding="utf-8"))
     feature = yaml.safe_load((issue_dir / "feature_request.yml").read_text(encoding="utf-8"))
     config = yaml.safe_load((issue_dir / "config.yml").read_text(encoding="utf-8"))
