@@ -84,6 +84,11 @@ from task_events import emit_task_event
 from ux_setup import print_setup_next_steps, run_init
 
 ensure_utf8_stdio()
+
+_TASK_STAGE_BY_PROGRAM = {
+    "translate_chat_openai.py": "translate",
+    "twitch_chat_burn.py": "render",
+}
 load_dotenv_if_present()
 
 
@@ -451,12 +456,17 @@ def run(cmd, cwd=None, error_hint=""):
     launcher = Path(str(cmd[0])).stem.lower()
     program_arg = cmd[1] if len(cmd) > 1 and launcher.startswith("python") else cmd[0]
     program = Path(str(program_arg)).name
+    stage = _TASK_STAGE_BY_PROGRAM.get(program)
     if DRY_RUN:
         log(f"[dry-run] {' '.join(str(c) for c in cmd)}")
         emit_task_event("command_skipped", program=program, reason="dry_run")
+        if stage:
+            emit_task_event("stage_skipped", stage=stage, reason="dry_run")
         return
     log("\n$ " + " ".join(f'"{c}"' if " " in str(c) else str(c) for c in cmd))
     emit_task_event("command_started", program=program)
+    if stage:
+        emit_task_event("stage_started", stage=stage)
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
     try:
@@ -465,9 +475,13 @@ def run(cmd, cwd=None, error_hint=""):
         p = run_tracked(cmd, cwd=cwd, text=False, env=env, stdout=None, stderr=None)
     except FileNotFoundError as e:
         emit_task_event("command_failed", program=program, reason="not_found")
+        if stage:
+            emit_task_event("stage_failed", stage=stage, reason="not_found")
         hint = error_hint or "找不到可执行文件，请确认已安装并加入 PATH"
         raise PipelineError(f"错误: {hint}\n  详情: {e}")
     emit_task_event("command_exited", program=program, returncode=p.returncode)
+    if stage:
+        emit_task_event("stage_completed" if p.returncode == 0 else "stage_failed", stage=stage)
     if p.returncode != 0:
         hint = error_hint or "命令执行失败"
         raise PipelineError(f"错误: {hint} (exit code {p.returncode})")
@@ -613,6 +627,7 @@ def _run_download_flow(args) -> int:
                     continue
             raise
 
+    emit_task_event("stage_started", stage="download")
     try:
         multi = _parse_cli_segments(raw_segments) if raw_segments else []
         if multi and (getattr(args, "begin", None) or getattr(args, "end", None)):
@@ -655,11 +670,14 @@ def _run_download_flow(args) -> int:
                 media_repair=str(getattr(args, "media_repair", "audio") or "audio"),
             )
     except TwitchDownloadError as e:
+        emit_task_event("stage_failed", stage="download")
         print(f"错误: {e}", file=sys.stderr)
         return 2
     except Exception as e:
+        emit_task_event("stage_failed", stage="download")
         print(f"错误: 下载失败: {e}", file=sys.stderr)
         return 1
+    emit_task_event("stage_completed", stage="download")
     return _post_download_next_steps(
         result.video_path,
         result.chat_html_path,

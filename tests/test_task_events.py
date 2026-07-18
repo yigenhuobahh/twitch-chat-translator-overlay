@@ -44,8 +44,14 @@ def test_pipeline_command_events_do_not_include_arguments(monkeypatch):
         lambda cmd, **_kwargs: subprocess.CompletedProcess(cmd, 0),
     )
 
-    pipeline.run(["python", "child.py", "--secret-like-value", "hidden"])
+    pipeline.run(["python", "twitch_chat_burn.py", "--secret-like-value", "hidden"])
 
-    assert [event["event"] for event in events] == ["command_started", "command_exited"]
-    assert events[0]["program"] == "child.py"
+    assert [event["event"] for event in events] == [
+        "command_started",
+        "stage_started",
+        "command_exited",
+        "stage_completed",
+    ]
+    assert events[0]["program"] == "twitch_chat_burn.py"
+    assert events[1]["stage"] == "render"
     assert all("hidden" not in event.values() for event in events)
