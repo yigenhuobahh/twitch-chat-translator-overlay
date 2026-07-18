@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -13,6 +14,8 @@ import tempfile
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal
 from textual.widgets import Button, Footer, Header, Input, RichLog, Static
+
+from process_util import kill_process_tree
 
 
 class OverlayTui(App[None]):
@@ -37,11 +40,15 @@ class OverlayTui(App[None]):
         yield Static("Choose a safe local check. Existing run.bat workflows are unchanged.", id="status")
         yield Input(placeholder="Video path for a local original-chat preview", id="video")
         yield Input(placeholder="Twitch chat HTML path", id="chat")
+        yield Input(placeholder="Optional job YAML path for a configured run", id="job")
         yield RichLog(id="log", wrap=True, highlight=False, markup=False)
         with Horizontal():
             yield Button("Offline demo", id="demo", variant="primary")
             yield Button("Environment check", id="doctor")
             yield Button("Preview local files", id="preview")
+        with Horizontal():
+            yield Button("Run configured job", id="job-run")
+            yield Button("Cancel task", id="cancel", variant="warning")
             yield Button("Quit", id="quit", variant="error")
         yield Footer()
 
@@ -50,6 +57,7 @@ class OverlayTui(App[None]):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "quit":
+            self._cancel_task()
             self.exit()
         elif event.button.id == "demo":
             self._start("Offline demo", [sys.executable, str(Path(__file__).with_name("quick_demo.py"))])
@@ -57,13 +65,24 @@ class OverlayTui(App[None]):
             self._start("Environment check", [sys.executable, str(Path(__file__).with_name("render_cn_chat.py")), "--doctor"])
         elif event.button.id == "preview":
             self._start_preview()
+        elif event.button.id == "job-run":
+            self._start_job()
+        elif event.button.id == "cancel":
+            self._cancel_task()
 
-    def _start_preview(self) -> None:
-        video = Path(self.query_one("#video", Input).value).expanduser()
-        chat = Path(self.query_one("#chat", Input).value).expanduser()
+    def _media_paths(self) -> tuple[Path, Path] | None:
+        video = Path(self.query_one("#video", Input).value.strip().strip('"')).expanduser()
+        chat = Path(self.query_one("#chat", Input).value.strip().strip('"')).expanduser()
         if not video.is_file() or not chat.is_file():
             self.query_one("#status", Static).update("Choose an existing video file and chat HTML file first.")
+            return None
+        return video, chat
+
+    def _start_preview(self) -> None:
+        media = self._media_paths()
+        if media is None:
             return
+        video, chat = media
         self._start(
             "Original-chat preview",
             [
@@ -79,6 +98,33 @@ class OverlayTui(App[None]):
                 "--yes",
             ],
         )
+
+    def _start_job(self) -> None:
+        media = self._media_paths()
+        job = Path(self.query_one("#job", Input).value.strip().strip('"')).expanduser()
+        if media is None:
+            return
+        if not job.is_file() or job.suffix.lower() not in {".yaml", ".yml"}:
+            self.query_one("#status", Static).update("Choose an existing job YAML file first.")
+            return
+        video, chat = media
+        self._start(
+            "Configured job",
+            [
+                sys.executable,
+                str(Path(__file__).with_name("render_cn_chat.py")),
+                "--job",
+                str(job),
+                str(video),
+                str(chat),
+                "--yes",
+            ],
+        )
+
+    def _cancel_task(self) -> None:
+        if self.process and self.process.poll() is None:
+            kill_process_tree(self.process.pid, force=True)
+            self.query_one("#status", Static).update("Cancelling task...")
 
     def _start(self, label: str, command: list[str]) -> None:
         if self.process and self.process.poll() is None:
@@ -111,8 +157,23 @@ class OverlayTui(App[None]):
             with self.event_path.open("r", encoding="utf-8") as handle:
                 handle.seek(self.event_offset)
                 for line in handle:
-                    log.write("event: " + line.rstrip())
+                    log.write(self._format_event(line))
                 self.event_offset = handle.tell()
+
+    @staticmethod
+    def _format_event(line: str) -> str:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return "event: invalid event record"
+        name = str(event.get("event") or "event")
+        stage = event.get("stage")
+        program = event.get("program")
+        if stage:
+            return f"{name.replace('_', ' ')}: {stage}"
+        if program:
+            return f"{name.replace('_', ' ')}: {program}"
+        return name.replace("_", " ")
 
 
 def main() -> int:
