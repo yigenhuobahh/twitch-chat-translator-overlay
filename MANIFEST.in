@@ -10,6 +10,7 @@ include .env.example
 include .gitattributes
 include .gitignore
 include .github/workflows/ci.yml
+include .github/workflows/release.yml
 include pyproject.toml
 include pytest.ini
 include run.bat

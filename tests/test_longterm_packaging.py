@@ -24,6 +24,7 @@ SDIST_CONTRACT_FILES = {
     ".gitattributes",
     ".gitignore",
     ".github/workflows/ci.yml",
+    ".github/workflows/release.yml",
     "CHANGELOG.md",
     "pytest.ini",
     "run.bat",

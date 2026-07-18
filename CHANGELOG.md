@@ -2,7 +2,7 @@
 
 Notable changes to this project are documented in this file.
 
-## [Unreleased]
+## [0.2.1] - 2026-07-18
 
 ### Added
 
@@ -46,3 +46,4 @@ Notable changes to this project are documented in this file.
 - Avoided following symlinks and Windows reparse points during cleanup.
 
 [0.2.0]: https://github.com/yigenhuobahh/twitch-chat-translator-overlay/releases/tag/v0.2.0
+[0.2.1]: https://github.com/yigenhuobahh/twitch-chat-translator-overlay/releases/tag/v0.2.1
