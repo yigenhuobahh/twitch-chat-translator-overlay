@@ -12,6 +12,8 @@ htmlcov/
 .venv/
 venv/
 build/
+dist/
+.release-verify/
 
 # Secrets / local environment
 .env

@@ -104,6 +104,7 @@ class TaskSession:
         self.result_path: Path | None = None
         self.result: dict | None = None
         self._event_offset = 0
+        self._event_tail = ""
         self._output: queue.Queue[str] = queue.Queue(maxsize=500)
         self._event_lines: deque[str] = deque(maxlen=800)
         self._log_lines: deque[str] = deque(maxlen=1200)
@@ -129,6 +130,7 @@ class TaskSession:
         with tempfile.NamedTemporaryFile(prefix="task_", suffix=".result.json", dir=directory, delete=False) as handle:
             self.result_path = Path(handle.name)
         self._event_offset = 0
+        self._event_tail = ""
         env = os.environ.copy()
         env["TWITCH_OVERLAY_EVENT_FILE"] = str(self.event_path.resolve())
         env["TWITCH_OVERLAY_RESULT_FILE"] = str(self.result_path.resolve())
@@ -201,8 +203,14 @@ class TaskSession:
             try:
                 with self.event_path.open("r", encoding="utf-8") as handle:
                     handle.seek(self._event_offset)
-                    for line in handle:
-                        raw = line.rstrip()
+                    appended = handle.read()
+                    self._event_offset = handle.tell()
+                    complete, separator, tail = (self._event_tail + appended).rpartition("\n")
+                    self._event_tail = tail if separator else self._event_tail + appended
+                    if not separator:
+                        complete = ""
+                    for line in complete.splitlines():
+                        raw = line.rstrip("\r")
                         try:
                             event = json.loads(raw)
                         except json.JSONDecodeError:
@@ -210,7 +218,6 @@ class TaskSession:
                         rendered = format_event(event)
                         events.append(rendered)
                         self._event_lines.append(rendered)
-                    self._event_offset = handle.tell()
             except OSError:
                 pass
         if self.result_path and self.result is None and self.process and self.process.poll() is not None:

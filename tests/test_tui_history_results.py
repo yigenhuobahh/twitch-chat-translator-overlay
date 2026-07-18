@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
@@ -110,6 +111,34 @@ def test_history_migrates_legacy_oauth_out_of_saved_draft(tmp_path: Path):
     assert "secret" not in path.read_text(encoding="utf-8")
 
 
+def test_history_migrates_download_url_query_credentials(tmp_path: Path):
+    path = tmp_path / "history.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "records": [
+                    {
+                        "id": "legacy-url",
+                        "state": "succeeded",
+                        "started_at": 1,
+                        "draft": {
+                            "_tui_task_type": "download",
+                            "download": "https://www.twitch.tv/videos/2819850140?oauth=secret-token",
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    records = TuiHistoryStore(path).list_records()
+
+    assert records[0]["draft"]["download"] == "2819850140"
+    assert "secret-token" not in path.read_text(encoding="utf-8")
+
+
 def test_history_round_trips_download_draft(tmp_path: Path):
     store = TuiHistoryStore(tmp_path / "history.json")
     draft = TuiDownloadDraft(source="2819850140", quality="720p60", segments_text="1:00:00-1:00:08", oauth="secret-token")
@@ -120,6 +149,38 @@ def test_history_round_trips_download_draft(tmp_path: Path):
     assert restored.segments() == ["1:00:00-1:00:08"]
     assert restored.oauth == ""
     assert "secret-token" not in json.dumps(record)
+
+
+def test_history_write_waits_for_another_instance_lock(tmp_path: Path):
+    path = tmp_path / "history.json"
+    first = TuiHistoryStore(path)
+    second = TuiHistoryStore(path)
+    first.start(None, label="first")
+    locked = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def hold_lock() -> None:
+        with first._history_lock():
+            locked.set()
+            assert release.wait(timeout=5)
+
+    def write_second() -> None:
+        second.start(None, label="second")
+        finished.set()
+
+    holder = threading.Thread(target=hold_lock)
+    writer = threading.Thread(target=write_second)
+    holder.start()
+    assert locked.wait(timeout=5)
+    writer.start()
+    assert not finished.wait(timeout=0.1)
+    release.set()
+    holder.join(timeout=5)
+    writer.join(timeout=5)
+
+    assert finished.is_set()
+    assert {record["label"] for record in first.list_records()} == {"first", "second"}
 
 
 def test_history_skips_malformed_records_and_handles_bad_draft(tmp_path: Path):

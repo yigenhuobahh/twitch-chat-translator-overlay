@@ -53,6 +53,7 @@ class OverlayTui(App[None]):
         self.active_history_id: str | None = None
         self._handled_session: TaskSession | None = None
         self.current_task_kind = "render"
+        self.require_result_manifest = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -171,6 +172,7 @@ class OverlayTui(App[None]):
                 [sys.executable, str(Path(__file__).with_name("quick_demo.py"))],
                 result_directory=Path("outputs") / "quick_demo",
                 completion_message="离线演示已生成。可打开结果目录查看 demo_overlay.mp4。",
+                require_result_manifest=True,
             )
         elif action == "cancel":
             self._cancel_task()
@@ -258,6 +260,7 @@ class OverlayTui(App[None]):
             completion_message="素材下载完成，已自动填入新任务。",
             draft=draft,
             task_kind="download",
+            require_result_manifest=True,
         )
 
     def _apply_draft(self, draft: TuiJobDraft) -> None:
@@ -301,6 +304,7 @@ class OverlayTui(App[None]):
             result_directory=result_directory,
             completion_message=completion_message,
             draft=draft,
+            require_result_manifest=True,
         )
 
     @staticmethod
@@ -340,6 +344,7 @@ class OverlayTui(App[None]):
         completion_message: str = "任务完成。",
         draft: TuiJobDraft | TuiDownloadDraft | None = None,
         task_kind: str = "render",
+        require_result_manifest: bool = False,
     ) -> None:
         if self.session and self.session.running:
             self._set_status("已有任务正在运行；请等待完成或先取消。")
@@ -350,6 +355,7 @@ class OverlayTui(App[None]):
         self.session = TaskSession(command, cwd=Path(__file__).resolve().parent.parent)
         self._handled_session = None
         self.current_task_kind = task_kind
+        self.require_result_manifest = require_result_manifest
         self.result_directory = result_directory.expanduser().resolve() if result_directory is not None else None
         self.completion_message = completion_message
         try:
@@ -394,17 +400,32 @@ class OverlayTui(App[None]):
                 self.session.cleanup()
             elif returncode == 0:
                 terminal_state = str((self.session.result or {}).get("state") or "succeeded")
-                if terminal_state == "manual_required":
+                if self.require_result_manifest and not isinstance(self.session.result, dict):
+                    self._set_status("任务进程已结束，但未能写入结果清单；无法确认产物，已标记为失败。")
+                    self._finish_history("failed", returncode)
+                    self._persist_diagnostics()
+                    self.session.cleanup(keep_failure=False)
+                elif terminal_state == "manual_required":
                     self._apply_result_directory()
                     self._set_status("翻译未完成：已导出人工复核文件，请填写后载入任务并复用翻译渲染。")
                     self._finish_history("manual_required", returncode)
                     self.session.cleanup()
                 elif self.current_task_kind == "download":
-                    self._apply_download_result()
-                    self._apply_result_directory()
-                    self._set_status(self.completion_message)
-                    self._finish_history("succeeded", returncode)
-                    self.session.cleanup()
+                    if self._apply_download_result():
+                        self._apply_result_directory()
+                        self._set_status(self.completion_message)
+                        self._finish_history("succeeded", returncode)
+                        self.session.cleanup()
+                    else:
+                        self._set_status("下载进程已结束，但结果清单缺少视频或聊天 HTML；已标记为失败。")
+                        self._finish_history("failed", returncode)
+                        self._persist_diagnostics()
+                        self.session.cleanup(keep_failure=False)
+                elif terminal_state != "succeeded":
+                    self._set_status("任务结果清单报告失败；已保留脱敏诊断。")
+                    self._finish_history("failed", returncode)
+                    self._persist_diagnostics()
+                    self.session.cleanup(keep_failure=False)
                 else:
                     self._apply_result_directory()
                     self._set_status(self.completion_message)
@@ -453,12 +474,12 @@ class OverlayTui(App[None]):
                     self.result_directory = Path(str(raw_path)).expanduser().parent.resolve()
                     return
 
-    def _apply_download_result(self) -> None:
+    def _apply_download_result(self) -> bool:
         if not self.session or not isinstance(self.session.result, dict):
-            return
+            return False
         artifacts = self.session.result.get("artifacts")
         if not isinstance(artifacts, list):
-            return
+            return False
         paths = {
             str(item.get("kind")): str(item.get("path"))
             for item in artifacts
@@ -467,12 +488,13 @@ class OverlayTui(App[None]):
         video, chat_html = paths.get("video"), paths.get("chat_html")
         if not video or not chat_html:
             self._set_status("下载完成，但结果清单缺少视频或聊天 HTML 路径。")
-            return
+            return False
         self._set_input("#video", video)
         self._set_input("#chat", chat_html)
         self.imported_draft = None
         self.last_draft = TuiJobDraft(video=video, chat_html=chat_html, mode=MODE_ORIGINAL_PREVIEW)
         self.query_one(TabbedContent).active = "new-task"
+        return True
 
     def _refresh_history(self) -> None:
         log = self.query_one("#history-log", RichLog)

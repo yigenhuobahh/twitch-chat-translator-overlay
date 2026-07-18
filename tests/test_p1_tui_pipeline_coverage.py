@@ -115,10 +115,51 @@ def test_textual_download_result_populates_new_task_fields(tmp_path: Path):
             result={"artifacts": [{"kind": "video", "path": str(video)}, {"kind": "chat_html", "path": str(chat)}]},
         )
         async with app.run_test():
-            app._apply_download_result()
+            assert app._apply_download_result() is True
             assert app.query_one("#video", Input).value == str(video)
             assert app.query_one("#chat", Input).value == str(chat)
             assert app.query_one(TabbedContent).active == "new-task"
+
+    import asyncio
+
+    asyncio.run(exercise())
+
+
+def test_textual_download_without_result_manifest_is_not_reported_as_success(tmp_path: Path):
+    pytest.importorskip("textual")
+
+    from tui_history import TuiHistoryStore
+    from tui_models import TuiDownloadDraft
+    from tui_run import OverlayTui
+
+    async def exercise() -> None:
+        app = OverlayTui()
+        app.history = TuiHistoryStore(tmp_path / "history.json")
+        async with app.run_test():
+            record = app.history.start(
+                TuiDownloadDraft(source="2819850140", segments_text="0:00:00-0:00:08"),
+                label="download",
+            )
+            app.active_history_id = record["id"]
+            app.current_task_kind = "download"
+            app.require_result_manifest = True
+            app.completion_message = "download reported complete"
+            app.session = SimpleNamespace(
+                running=False,
+                close=lambda: None,
+                poll=lambda: ([], []),
+                drain_after_exit=lambda: ([], []),
+                retain_result=lambda _path: None,
+                export_diagnostics=lambda path: Path(path),
+                cleanup=lambda **_kwargs: None,
+                dropped_output=0,
+                returncode=0,
+                cancelled=False,
+                result=None,
+            )
+            app._poll_session()
+            assert app.history.get(record["id"])["state"] == "failed"
+            assert "download reported complete" not in str(app.query_one("#status").render())
 
     import asyncio
 

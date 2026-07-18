@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from common_utils import detect_cjk_font, load_dotenv_if_present, safe_which
 from env_bootstrap import prepend_tools_ffmpeg_to_path
@@ -36,6 +37,26 @@ def _is_sensitive_field(name: object) -> bool:
 
 def _clean_path(value: str) -> str:
     return value.strip().strip('"').strip("'")
+
+
+def sanitize_download_source_for_history(value: object) -> str:
+    """Keep a reusable Twitch source while dropping URL credentials and fragments."""
+    source = str(value or "").strip()
+    if not source:
+        return ""
+    try:
+        # Known Twitch VOD and Clip URLs become their stable public ID/slug.
+        # This is both more portable and avoids persisting query-string tokens.
+        from twitch_download import parse_twitch_source
+
+        _kind, normalized = parse_twitch_source(source, kind_hint="auto")
+        source = str(normalized).strip()
+    except Exception:
+        pass
+    parsed = urlsplit(source)
+    if parsed.scheme and parsed.netloc:
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    return source.split("#", 1)[0]
 
 
 def _mode_from_fields(fields: dict[str, Any]) -> str:
@@ -343,7 +364,7 @@ class TuiDownloadDraft:
     def to_history_fields(self) -> dict[str, str]:
         return {
             "_tui_task_type": "download",
-            "download": self.source.strip(),
+            "download": sanitize_download_source_for_history(self.source),
             "download_dir": _clean_path(self.download_dir),
             "quality": self.quality.strip(),
             "segments": self.segments_text.strip(),

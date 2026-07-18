@@ -183,6 +183,11 @@ def test_download_draft_requires_bounded_segments_and_builds_multi_segment_comma
     protected = TuiDownloadDraft(source="2819850140", segments_text="1:00:00-1:00:08", oauth="secret-token")
     assert "secret-token" in protected.build_command("python", "render_cn_chat.py")
     assert "oauth" not in protected.to_history_fields()
+    query_token = TuiDownloadDraft(
+        source="https://www.twitch.tv/videos/2819850140?oauth=secret-token#fragment",
+        segments_text="1:00:00-1:00:08",
+    )
+    assert query_token.to_history_fields()["download"] == "2819850140"
 
 
 def test_task_session_drains_output_and_events(tmp_path: Path):
@@ -208,6 +213,18 @@ def test_task_session_drains_output_and_events(tmp_path: Path):
     assert events == ["stage started: render"]
     session.cleanup()
     assert session.event_path is not None and not session.event_path.exists()
+
+
+def test_task_session_keeps_a_partial_event_until_the_jsonl_line_is_complete(tmp_path: Path):
+    session = TaskSession([sys.executable, "-c", "pass"], cwd=tmp_path)
+    session.event_path = tmp_path / "events.jsonl"
+    session.event_path.write_text('{"event":"stage_started"', encoding="utf-8")
+
+    assert session.poll()[1] == []
+    with session.event_path.open("a", encoding="utf-8") as handle:
+        handle.write(',"stage":"download"}\n')
+
+    assert session.poll()[1] == ["stage started: download"]
 
 
 def test_command_redaction_hides_oauth_before_ui_logging():
