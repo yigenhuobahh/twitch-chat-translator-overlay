@@ -2165,7 +2165,15 @@ def main():
         offer_td_cli_guide(
             assume_yes=bool(getattr(args, "yes", False) or getattr(args, "fix_yes", False))
         )
-        raise SystemExit(0)
+        try:
+            from twitch_download import find_twitchdownloader_cli
+
+            installed = find_twitchdownloader_cli() is not None
+        except ImportError:
+            installed = False
+        if not installed:
+            print("  [ERROR] TwitchDownloaderCLI 仍不可用；安装或引导未完成。")
+        raise SystemExit(0 if installed else 1)
     if getattr(args, "install_td_prompt", False):
         maybe_prompt_offer_td_cli(
             assume_yes=bool(getattr(args, "yes", False) or getattr(args, "fix_yes", False))

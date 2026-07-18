@@ -5,16 +5,20 @@
 from __future__ import annotations
 
 import atexit
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+import contextlib
+import errno
 import json
 import os
 from pathlib import Path
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
+import time
 from typing import IO
 
 from common_utils import require_executable
@@ -22,6 +26,88 @@ from common_utils import require_executable
 _lock = threading.Lock()
 _active: list[subprocess.Popen] = []
 _handlers_installed = False
+_file_lock_local = threading.RLock()
+
+
+class FileLockTimeoutError(TimeoutError):
+    """Raised when a cooperative cross-process file lock stays busy."""
+
+
+def _try_lock_file(descriptor: int) -> bool:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                return False
+            raise
+    else:
+        import fcntl
+
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                return False
+            raise
+    return True
+
+
+def _unlock_file(descriptor: int) -> None:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def exclusive_file_lock(lock_path: str | Path, *, timeout: float = 30.0) -> Iterator[None]:
+    """Hold a persistent advisory lock file; the OS releases it on process exit."""
+    path = Path(lock_path)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    with _file_lock_local:
+        if path.is_symlink():
+            raise OSError(f"lock path cannot be a symlink: {path}")
+        descriptor = os.open(path, flags, 0o600)
+        locked = False
+        try:
+            opened = os.fstat(descriptor)
+            on_disk = path.lstat()
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or stat.S_ISLNK(on_disk.st_mode)
+                or (opened.st_dev, opened.st_ino) != (on_disk.st_dev, on_disk.st_ino)
+            ):
+                raise OSError(f"lock path is not a trusted regular file: {path}")
+            if opened.st_size == 0:
+                os.write(descriptor, b"\0")
+                os.fsync(descriptor)
+
+            deadline = time.monotonic() + max(0.0, float(timeout))
+            while not locked:
+                locked = _try_lock_file(descriptor)
+                if locked:
+                    break
+                if time.monotonic() >= deadline:
+                    raise FileLockTimeoutError(f"timed out waiting for file lock: {path}")
+                time.sleep(0.05)
+            yield
+        finally:
+            if locked:
+                try:
+                    _unlock_file(descriptor)
+                except OSError:
+                    pass
+            os.close(descriptor)
+
 
 # OS system-path denylist pieces for is_dangerous_publish_path (normalized / lowercased).
 _WIN_DANGEROUS_ROOTS = (

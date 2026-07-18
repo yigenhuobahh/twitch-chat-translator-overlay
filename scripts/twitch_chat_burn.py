@@ -119,6 +119,7 @@ from overlay_config import OverlayConfig
 from process_util import (
     clean_companion_flags_error,
     clean_temp_artifacts,
+    exclusive_file_lock,
     install_process_cleanup_handlers,
     is_dangerous_publish_path,
     make_job_dir,
@@ -3475,7 +3476,7 @@ def main():
     if args.preview_clip is not None:
         duration = min(duration, max(0.1, float(args.preview_clip)))
 
-    def promote_to_out_base(src_path: str) -> str | None:
+    def _promote_to_out_base_locked(src_path: str) -> str | None:
         """Copy a job-dir artifact to out_base with temp+replace and .bak restore.
 
         Concurrent runs sharing the same out_base each have a unique job_ dir.
@@ -3543,6 +3544,22 @@ def main():
                 except OSError as restore_err:
                     print(f"  警告: 无法从备份恢复 {backup}: {restore_err}", flush=True)
             return None
+
+    def promote_to_out_base(src_path: str) -> str | None:
+        """Serialize basename selection and publication across concurrent jobs."""
+        if not src_path or not os.path.isfile(src_path):
+            return None
+        if os.path.abspath(out_dir) == os.path.abspath(out_base):
+            return src_path
+        base_name = os.path.basename(src_path)
+        lock_path = os.path.join(out_base, f".{base_name}.publish.guard")
+        try:
+            with exclusive_file_lock(lock_path, timeout=30.0):
+                return _promote_to_out_base_locked(src_path)
+        except OSError as exc:
+            print(f"  警告: 等待输出发布锁失败 {lock_path}: {exc}", flush=True)
+            return None
+
 
     if args.preview_frame is not None:
         # render_overlay already wrote the preview image and set config.preview_image

@@ -284,6 +284,59 @@ def test_download_assets_multi_mocked(monkeypatch, tmp_path: Path):
     assert [m["timestamp"] for m in data["messages"]] == [1, 2, 11, 12]
 
 
+def test_multi_merge_failure_preserves_previous_final_pair(monkeypatch, tmp_path: Path):
+    import twitch_download as td
+
+    out_dir = tmp_path / "multi"
+    out_dir.mkdir()
+    final_video = out_dir / "video.mp4"
+    final_chat = out_dir / "chat.html"
+    final_video.write_bytes(b"old-video")
+    final_chat.write_text("old-chat", encoding="utf-8")
+
+    def fake_download_assets(source, **kwargs):
+        video = Path(kwargs["out_dir"]) / kwargs["video_name"]
+        chat = Path(kwargs["out_dir"]) / kwargs["chat_name"]
+        video.write_bytes(b"segment-video")
+        chat.write_text("<html>segment-chat</html>", encoding="utf-8")
+        return td.DownloadResult(
+            video_path=video,
+            chat_html_path=chat,
+            kind="vod",
+            source_id="1234567890",
+            quality=kwargs.get("quality"),
+            begin=kwargs.get("begin"),
+            end=kwargs.get("end"),
+            out_dir=Path(kwargs["out_dir"]),
+        )
+
+    def fake_concat_videos(paths, out, **kwargs):
+        out.write_bytes(b"new-video")
+        return "copy"
+
+    def fail_merge_chat_html(*args, **kwargs):
+        raise td.TwitchDownloadError("simulated chat merge failure")
+
+    monkeypatch.setattr(td, "download_assets", fake_download_assets)
+    monkeypatch.setattr(td, "probe_media_duration", lambda _path: 10.0)
+    monkeypatch.setattr(td, "concat_videos", fake_concat_videos)
+    monkeypatch.setattr(td, "merge_chat_html", fail_merge_chat_html)
+
+    with pytest.raises(td.TwitchDownloadError, match="simulated chat merge failure"):
+        td.download_assets_multi(
+            "1234567890",
+            [("0s", "10s"), ("20s", "30s")],
+            out_dir=out_dir,
+            media_check="off",
+        )
+
+    assert final_video.read_bytes() == b"old-video"
+    assert final_chat.read_text(encoding="utf-8") == "old-chat"
+    assert not (out_dir / ".twitch-download-publish.json").exists()
+    assert not (out_dir / ".twitch-download-publish.lock").exists()
+    assert not list(out_dir.glob(".*.download-*"))
+
+
 def test_merge_chat_html_removes_and_rebases_ranges(tmp_path: Path):
     import twitch_download as td
 

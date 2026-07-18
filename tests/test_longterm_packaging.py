@@ -20,6 +20,7 @@ SDIST_CONTRACT_FILES = {
     ".gitattributes",
     ".gitignore",
     ".github/workflows/ci.yml",
+    "CHANGELOG.md",
     "pytest.ini",
     "run.bat",
     "run.sh",
@@ -96,6 +97,13 @@ def test_wheel_data_files_include_complete_example_job():
     assert data_files["share/twitch-chat-translator-overlay/jobs"] == [
         "jobs/example_job.yaml"
     ]
+
+
+def test_wheel_includes_download_transaction_module_boundary():
+    config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    modules = set(config["tool"]["setuptools"]["py-modules"])
+
+    assert {"twitch_download", "twitch_download_transaction", "twitch_download_types"} <= modules
 
 
 def test_source_example_job_loader_returns_complete_template():

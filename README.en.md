@@ -2,6 +2,8 @@
 
 Translate Twitch VOD chat messages into Chinese (or other languages) and burn them onto the video as a semi-transparent overlay.
 
+Release notes: [`CHANGELOG.md`](https://github.com/yigenhuobahh/twitch-chat-translator-overlay/blob/main/CHANGELOG.md)
+
 > **Input**: A video file + TwitchDownloader chat HTML export  
 > (Optional) Use this tool’s `--download` / menu “Download media” via TwitchDownloaderCLI  
 > **Output**: MP4 with translated chat overlay

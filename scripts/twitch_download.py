@@ -34,6 +34,17 @@ from common_utils import (
     trusted_tools_root,
 )
 from process_util import run_tracked
+from twitch_download_transaction import (
+    preserved_staged_paths,
+    resolve_download_targets,
+)
+from twitch_download_transaction import (
+    publish_download_pair as _publish_download_pair,
+)
+from twitch_download_transaction import (
+    recover_download_transaction as _recover_download_transaction,
+)
+from twitch_download_types import TwitchDownloadError
 
 _REPO_ROOT = runtime_app_root(__file__)
 _TOOLS_ROOT = trusted_tools_root(__file__)
@@ -49,10 +60,6 @@ _CLIP_URL_RE = re.compile(
 )
 _BARE_VOD_RE = re.compile(r"^\d{6,}$")
 _BARE_CLIP_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{3,}$")
-
-
-class TwitchDownloadError(RuntimeError):
-    """User-facing download failure."""
 
 
 @dataclass
@@ -197,60 +204,6 @@ def _new_download_staging_path(destination: Path) -> Path:
     return destination.with_name(
         f".{destination.name}.download-{uuid.uuid4().hex}{destination.suffix}"
     )
-
-
-def _publish_download_pair(
-    staged_video: Path,
-    video_path: Path,
-    staged_chat: Path,
-    chat_path: Path,
-) -> None:
-    """Publish a validated video/chat pair, restoring existing files on failure."""
-    pairs = ((staged_video, video_path), (staged_chat, chat_path))
-    backups: dict[Path, Path] = {}
-    published: list[Path] = []
-    try:
-        for _staged, destination in pairs:
-            if destination.exists() or destination.is_symlink():
-                if not destination.is_file() and not destination.is_symlink():
-                    raise TwitchDownloadError(
-                        f"下载目标已存在且不是文件: {destination}"
-                    )
-                backup = destination.with_name(
-                    f".{destination.name}.backup-{uuid.uuid4().hex}"
-                )
-                os.replace(destination, backup)
-                backups[destination] = backup
-        for staged, destination in pairs:
-            os.replace(staged, destination)
-            published.append(destination)
-    except Exception as exc:
-        rollback_errors: list[str] = []
-        for destination in reversed(published):
-            if destination in backups:
-                continue
-            try:
-                destination.unlink(missing_ok=True)
-            except OSError as rollback_exc:
-                rollback_errors.append(f"{destination}: {rollback_exc}")
-        for destination, backup in reversed(list(backups.items())):
-            try:
-                os.replace(backup, destination)
-            except OSError as rollback_exc:
-                rollback_errors.append(f"{backup} -> {destination}: {rollback_exc}")
-        if rollback_errors:
-            raise TwitchDownloadError(
-                "发布下载结果失败，且旧文件回滚不完整: " + "; ".join(rollback_errors)
-            ) from exc
-        raise TwitchDownloadError(
-            f"发布下载结果失败，旧文件已恢复: {exc}"
-        ) from exc
-    else:
-        for backup in backups.values():
-            try:
-                backup.unlink(missing_ok=True)
-            except OSError:
-                pass
 
 
 def build_video_cmd(
@@ -410,16 +363,6 @@ def download_assets(
     """Download video + embedded chat HTML into out_dir."""
     app_root = root or _REPO_ROOT
     tools_root = _TOOLS_ROOT
-    cli = find_twitchdownloader_cli(tools_root)
-    if cli is None:
-        raise TwitchDownloadError(
-            "未找到 TwitchDownloaderCLI。\n"
-            "  1) 从 https://github.com/lay295/TwitchDownloader/releases 下载 CLI\n"
-            "  2) 运行 --offer-td-cli 安装到可信工具目录\n"
-            "  3) 或加入 PATH / 设置 TWITCHDOWNLOADER_CLI\n"
-            "  安装结束时也可选择可选增强下载引导。"
-        )
-
     kind_r, source_id = parse_twitch_source(source, kind_hint=kind)
     if kind_r == "clip" and (begin or end):
         print(
@@ -438,12 +381,25 @@ def download_assets(
     except ImportError:
         pass
     base.mkdir(parents=True, exist_ok=True)
-    video_path = base / video_name
-    chat_path = base / chat_name
-    if video_path == chat_path:
-        raise TwitchDownloadError("视频和聊天下载目标不能是同一个文件")
+    transaction_root, video_path, chat_path = resolve_download_targets(
+        base,
+        base / video_name,
+        base / chat_name,
+    )
+    _recover_download_transaction(transaction_root)
     video_path.parent.mkdir(parents=True, exist_ok=True)
     chat_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cli = find_twitchdownloader_cli(tools_root)
+    if cli is None:
+        raise TwitchDownloadError(
+            "未找到 TwitchDownloaderCLI。\n"
+            "  1) 从 https://github.com/lay295/TwitchDownloader/releases 下载 CLI\n"
+            "  2) 运行 --offer-td-cli 安装到可信工具目录\n"
+            "  3) 或加入 PATH / 设置 TWITCHDOWNLOADER_CLI\n"
+            "  安装结束时也可选择可选增强下载引导。"
+        )
+
     staged_video = _new_download_staging_path(video_path)
     staged_chat = _new_download_staging_path(chat_path)
     repaired_video: Path | None = None
@@ -500,15 +456,28 @@ def download_assets(
             raise TwitchDownloadError(f"聊天下载未生成新的指定文件: {chat_path}")
 
         validate_chat_html(staged_chat)
-        _publish_download_pair(video_to_publish, video_path, staged_chat, chat_path)
+        _publish_download_pair(
+            video_to_publish,
+            video_path,
+            staged_chat,
+            chat_path,
+            transaction_root=transaction_root,
+        )
     finally:
+        preserve_paths = preserved_staged_paths(transaction_root)
         for temporary in (staged_video, staged_chat, repaired_video):
-            if temporary is None:
+            if temporary is None or preserve_paths is None:
+                continue
+            try:
+                resolved_temporary = temporary.resolve(strict=False)
+            except OSError:
+                continue
+            if resolved_temporary in preserve_paths:
                 continue
             try:
                 temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
+            except OSError as exc:
+                print(f"  [WARN] 无法清理下载临时文件 {temporary}: {exc}", file=sys.stderr, flush=True)
     print(f"\n[OK] 视频: {video_path}", flush=True)
     print(f"[OK] 聊天: {chat_path}", flush=True)
     return DownloadResult(
@@ -1326,6 +1295,14 @@ def download_assets_multi(
     except ImportError:
         pass
     base.mkdir(parents=True, exist_ok=True)
+    transaction_root, final_video, final_chat = resolve_download_targets(
+        base,
+        base / video_name,
+        base / chat_name,
+    )
+    _recover_download_transaction(transaction_root)
+    final_video.parent.mkdir(parents=True, exist_ok=True)
+    final_chat.parent.mkdir(parents=True, exist_ok=True)
 
     seg_downloads: list[SegmentDownload] = []
     n = len(crops)
@@ -1366,41 +1343,74 @@ def download_assets_multi(
 
     timeline_duration = sum(s.duration_s for s in seg_downloads)
     cut_ranges = normalize_cut_ranges(remove_ranges, timeline_duration)
-    final_video = base / video_name
-    final_chat = base / chat_name
-    mode = concat_videos(
-        [s.video_path for s in seg_downloads],
-        final_video,
-        list_path=base / "concat_list.txt",
-        remove_ranges=cut_ranges,
-        output_fps=output_fps,
-        encoder=encoder,
-    )
+    staged_video = _new_download_staging_path(final_video)
+    staged_chat = _new_download_staging_path(final_chat)
+    repaired_video: Path | None = None
+    mode = ""
+
+    try:
+        mode = concat_videos(
+            [s.video_path for s in seg_downloads],
+            staged_video,
+            list_path=base / "concat_list.txt",
+            remove_ranges=cut_ranges,
+            output_fps=output_fps,
+            encoder=encoder,
+        )
+
+        expected = timeline_duration - sum(cut_end - cut_start for cut_start, cut_end in cut_ranges)
+        from media_health import repair_media, validate_media_health
+        health = validate_media_health(
+            staged_video, mode=media_check, require_audio=True, expected_duration=expected
+        )
+        _print_media_health_warnings(health)
+        video_to_publish = staged_video
+        if not health.ok and str(media_repair or "off").lower() == "audio":
+            try:
+                repaired_video = repair_media(staged_video, encoder=encoder)
+                health = validate_media_health(
+                    repaired_video, mode=media_check, require_audio=True, expected_duration=expected
+                )
+                _print_media_health_warnings(health)
+                if health.ok:
+                    video_to_publish = repaired_video
+            except (OSError, RuntimeError) as e:
+                raise TwitchDownloadError(f"合并视频修复失败，原文件未覆盖: {e}") from e
+        if not health.ok:
+            raise TwitchDownloadError("合并视频健康检查失败，已阻止合并聊天/翻译/渲染: " + health.reason())
+
+        print("-- 合并聊天时间轴 ...", flush=True)
+        merge_chat_html(
+            seg_downloads,
+            source_id=source_id,
+            out_path=staged_chat,
+            remove_ranges=cut_ranges,
+        )
+        _publish_download_pair(
+            video_to_publish,
+            final_video,
+            staged_chat,
+            final_chat,
+            transaction_root=transaction_root,
+        )
+    finally:
+        preserve_paths = preserved_staged_paths(transaction_root)
+        for temporary in (staged_video, staged_chat, repaired_video):
+            if temporary is None or preserve_paths is None:
+                continue
+            try:
+                resolved_temporary = temporary.resolve(strict=False)
+            except OSError:
+                continue
+            if resolved_temporary in preserve_paths:
+                continue
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError as exc:
+                print(f"  [WARN] 无法清理合并临时文件 {temporary}: {exc}", file=sys.stderr, flush=True)
+
     print(f"[OK] 合并视频: {final_video}  (mode={mode})", flush=True)
-
-    expected = timeline_duration - sum(cut_end - cut_start for cut_start, cut_end in cut_ranges)
-    from media_health import repair_media, validate_media_health
-    health = validate_media_health(final_video, mode=media_check, require_audio=True, expected_duration=expected)
-    _print_media_health_warnings(health)
-    if not health.ok and str(media_repair or "off").lower() == "audio":
-        try:
-            repaired = repair_media(final_video, encoder=encoder)
-            health = validate_media_health(repaired, mode=media_check, require_audio=True, expected_duration=expected)
-            _print_media_health_warnings(health)
-            if health.ok:
-                final_video = repaired
-        except (OSError, RuntimeError) as e:
-            raise TwitchDownloadError(f"合并视频修复失败，原文件未覆盖: {e}") from e
-    if not health.ok:
-        raise TwitchDownloadError("合并视频健康检查失败，已阻止合并聊天/翻译/渲染: " + health.reason())
-
-    print("-- 合并聊天时间轴 ...", flush=True)
-    merge_chat_html(
-        seg_downloads,
-        source_id=source_id,
-        out_path=final_chat,
-        remove_ranges=cut_ranges,
-    )
+    print(f"[OK] 合并聊天: {final_chat}", flush=True)
 
     return DownloadResult(
         video_path=final_video.resolve(),

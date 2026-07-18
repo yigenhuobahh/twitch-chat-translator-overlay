@@ -1,6 +1,7 @@
 # Source distribution extras (wheel data files come from pyproject.toml).
 include README.md
 include README.en.md
+include CHANGELOG.md
 include LICENSE
 include CONTRIBUTING.md
 include requirements.txt

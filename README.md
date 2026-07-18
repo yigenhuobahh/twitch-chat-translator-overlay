@@ -2,6 +2,8 @@
 
 将 Twitch 直播录像的聊天弹幕翻译成中文（或其他语言），以半透明覆盖层形式压制到视频画面上。
 
+发布记录：[`CHANGELOG.md`](https://github.com/yigenhuobahh/twitch-chat-translator-overlay/blob/main/CHANGELOG.md)
+
 > **输入**：一段录像视频 + TwitchDownloader 导出的聊天 HTML  
 > （可选）用本工具 `--download` / 菜单「下载素材并继续」调用 TwitchDownloaderCLI 自动获取  
 > **输出**：带中文翻译弹幕的 MP4 视频
@@ -656,7 +658,7 @@ outputs/                       # 生成视频（.gitignore）
 tests/                         # 测试（含 smoke / max / concurrent / UX）
   fixtures/                    # HTML 变体、翻译 JSON 等测试夹具
   test_max_*.py                # 全面套件（run_tests.py --max）
-  test_*.py                    # 测试模块（400+ 用例；以当前 CI / pytest 输出为准）
+  test_*.py                    # 测试模块（500+ 用例；以当前 CI / pytest 输出为准）
 requirements.txt               # 运行依赖
 requirements-dev.txt           # 开发/测试依赖
 .env.example                   # 翻译 API 配置模板

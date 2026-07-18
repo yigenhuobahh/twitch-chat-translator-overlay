@@ -15,6 +15,8 @@ CLI that burns **TwitchDownloader chat HTML** onto a VOD as a semi-transparent o
 ```
 render_cn_chat.py          # pipeline CLI + doctor + download entry
   twitch_download.py       # optional TD CLI wrapper + multi-segment merge/cut
+    twitch_download_transaction.py # serialized process-crash recovery for video/chat pairs
+    twitch_download_types.py       # shared download exception contract
     media_health.py        # stream/timeline validation + automatic audio repair
   translate_chat_openai.py # batch translate + .progress.json resume
   job_wizard.py            # run.bat menu
@@ -36,7 +38,8 @@ Tests: `PYTHONPATH=scripts`, runner `scripts/run_tests.py` (optional `--lint` / 
 6. **Clean live jobs** — `run_meta` pid + freshness; dead/stale `running` is not live; never auto-wipe resume `.progress.json` by default.  
 7. **Progress resume** — Require fingerprints; missing fp ⇒ do not trust progress rows.  
 8. **Download chat** — Always TD `chatdownload -E` / `.html`; validate embeds when emote tags present.  
-9. **Dual CLI** — Shared layout/encode/fps flags go through `*_FORWARD_SPECS` + `append_*_args` in `render_cn_chat.py` (see `SHARED_FORWARD_FLAGS` / `BURN_ONLY_FLAGS`). Burn-only path flags: export/import/force-export/job-dir/no-job-dir/out-dir. Pipeline forwards `--strict-import` only on import/render burn cmds via `append_strict_import_arg`.
+9. **Download pair publication** — Single/multi final video + chat publish through `twitch_download_transaction`; the journal/guard guarantee a consistent pair for cooperating process crashes on one local filesystem, not hostile concurrent writers or power loss.
+10. **Dual CLI** — Shared layout/encode/fps flags go through `*_FORWARD_SPECS` + `append_*_args` in `render_cn_chat.py` (see `SHARED_FORWARD_FLAGS` / `BURN_ONLY_FLAGS`). Burn-only path flags: export/import/force-export/job-dir/no-job-dir/out-dir. Pipeline forwards `--strict-import` only on import/render burn cmds via `append_strict_import_arg`.
 
 ## High-value next work (not blocking)
 
@@ -61,7 +64,7 @@ python scripts\run_tests.py --max          # long; needs FFmpeg for smoke/max
 python scripts\twitch_chat_burn.py video.mp4 chat.html --preview-clip 3 --overlay-codec png --offset 0 --out-dir out --no-job-dir
 ```
 
-Current baseline is **400+ tests**. Treat the latest CI / `pytest` output as release evidence rather than maintaining an exact count here. The `sdist-smoke` CI job must build, unpack, rebuild a wheel, and test the source distribution; scheduled CI runs `--max`.
+Current baseline is **500+ tests**. Treat the latest CI / `pytest` output as release evidence rather than maintaining an exact count here. The `sdist-smoke` CI job must build, unpack, rebuild a wheel, and test the source distribution; scheduled CI runs `--max`.
 
 ## Do not commit
 

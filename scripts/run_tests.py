@@ -32,6 +32,8 @@ COMPILE_SCRIPTS = [
     "job_config.py",
     "job_wizard.py",
     "twitch_download.py",
+    "twitch_download_transaction.py",
+    "twitch_download_types.py",
     "layout_preset.py",
     "media_health.py",
     "overlay_config.py",
