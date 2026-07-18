@@ -21,6 +21,7 @@ def test_event_writer_appends_jsonl(tmp_path, monkeypatch):
     assert task_events.emit_task_event("command_started", program="render_cn_chat.py") is True
     event = json.loads(path.read_text(encoding="utf-8"))
     assert event["event"] == "command_started"
+    assert event["schema_version"] == task_events.EVENT_SCHEMA_VERSION
     assert event["program"] == "render_cn_chat.py"
     assert isinstance(event["timestamp"], float)
 

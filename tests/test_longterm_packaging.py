@@ -28,6 +28,7 @@ SDIST_CONTRACT_FILES = {
     "CHANGELOG.md",
     "pytest.ini",
     "run.bat",
+    "run_cli.bat",
     "run_tui.bat",
     "run.sh",
     "install.bat",
@@ -180,5 +181,23 @@ def test_ci_has_sdist_and_scheduled_max_gates():
     assert "python -m pip wheel --no-deps" in workflow
     assert 'python -m pytest -q -m "not smoke and not slow"' in workflow
     assert "scheduled-max:" in workflow
-    assert "python scripts/run_tests.py --max" in workflow
+    assert "coverage:" in workflow
+    assert "python scripts/run_tests.py --max --coverage" in workflow
     assert "schedule:" in workflow
+
+
+def test_release_runs_quality_gate_before_uploading_artifacts():
+    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+    assert "Run release gates" in workflow
+    assert "python scripts/run_tests.py --max --coverage" in workflow
+    assert workflow.index("Run release gates") < workflow.index("Build release artifacts")
+
+
+def test_coverage_gate_is_configured_for_core_scripts_only():
+    config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    coverage = config["tool"]["coverage"]
+
+    assert coverage["run"]["source"] == ["scripts"]
+    assert coverage["report"]["fail_under"] == 65
+    assert {"scripts/fix_merge.py", "scripts/quick_demo.py", "scripts/run_tests.py"} <= set(coverage["run"]["omit"])

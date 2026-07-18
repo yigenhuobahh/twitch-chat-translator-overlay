@@ -72,6 +72,7 @@ from job_config import (
 )
 from job_wizard import run_job_wizard, run_list_jobs
 from layout_preset import apply_layout_preset_to_namespace, load_layout_preset
+from media_health import validate_media_health
 from process_util import (
     clean_companion_flags_error,
     clean_temp_artifacts,
@@ -81,6 +82,7 @@ from process_util import (
 )
 from render_preset import apply_render_preset_to_namespace, load_render_preset
 from task_events import emit_task_event
+from task_results import write_task_result
 from ux_setup import print_setup_next_steps, run_init
 
 ensure_utf8_stdio()
@@ -242,10 +244,46 @@ def append_shared_burn_args(cmd: list, args) -> list:
 DRY_RUN = False
 VERBOSE = False
 QUIET = False
+_TASK_RESULT_CONTEXT: dict[str, object] = {"mode": "unknown", "artifacts": []}
 
 
 class PipelineError(SystemExit):
     pass
+
+
+def mark_manual_translation_required() -> None:
+    """Record that a requested translated task stopped for human input."""
+    _TASK_RESULT_CONTEXT["terminal_state"] = "manual_required"
+
+
+def validate_source_media(video: Path, *, mode: str, dry_run: bool = False) -> None:
+    """Fail before translation when the local input cannot be decoded safely."""
+    selected_mode = str(mode or "fast").lower()
+    if selected_mode == "off":
+        log("[media] 输入视频健康检查已关闭。")
+        emit_task_event("stage_skipped", stage="source_media_check", reason="disabled", completed=0, total=1)
+        return
+    if dry_run:
+        log(f"[dry-run] 跳过输入视频健康检查（{selected_mode}）。")
+        emit_task_event("stage_skipped", stage="source_media_check", reason="dry_run", completed=0, total=1)
+        return
+
+    label = "完整解码" if selected_mode == "decode" else "快速"
+    log(f"[media] {label}检查输入视频，发现问题会在翻译/渲染前停止…")
+    emit_task_event("stage_started", stage="source_media_check", completed=0, total=1)
+    # Local workflows may legitimately use silent video. Validate its video
+    # stream and any present audio stream without turning silence into failure.
+    health = validate_media_health(video, mode=selected_mode, require_audio=False)
+    if not health.ok:
+        emit_task_event("stage_failed", stage="source_media_check", completed=0, total=1)
+        raise PipelineError(
+            "错误: 输入视频健康检查失败，已在翻译或渲染前停止。\n"
+            f"  详情: {health.reason()}\n"
+            "  建议: 重新下载有问题的片段，或使用 --source-media-check fast 进行快速复查。"
+        )
+    for warning in health.warnings:
+        log(f"[media] 提示: {warning}")
+    emit_task_event("stage_completed", stage="source_media_check", completed=1, total=1)
 
 
 def log(msg, level="info"):
@@ -461,12 +499,12 @@ def run(cmd, cwd=None, error_hint=""):
         log(f"[dry-run] {' '.join(str(c) for c in cmd)}")
         emit_task_event("command_skipped", program=program, reason="dry_run")
         if stage:
-            emit_task_event("stage_skipped", stage=stage, reason="dry_run")
+            emit_task_event("stage_skipped", stage=stage, reason="dry_run", completed=0, total=1)
         return
     log("\n$ " + " ".join(f'"{c}"' if " " in str(c) else str(c) for c in cmd))
     emit_task_event("command_started", program=program)
     if stage:
-        emit_task_event("stage_started", stage=stage)
+        emit_task_event("stage_started", stage=stage, completed=0, total=1)
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
     try:
@@ -476,12 +514,17 @@ def run(cmd, cwd=None, error_hint=""):
     except FileNotFoundError as e:
         emit_task_event("command_failed", program=program, reason="not_found")
         if stage:
-            emit_task_event("stage_failed", stage=stage, reason="not_found")
+            emit_task_event("stage_failed", stage=stage, reason="not_found", completed=0, total=1)
         hint = error_hint or "找不到可执行文件，请确认已安装并加入 PATH"
         raise PipelineError(f"错误: {hint}\n  详情: {e}")
     emit_task_event("command_exited", program=program, returncode=p.returncode)
     if stage:
-        emit_task_event("stage_completed" if p.returncode == 0 else "stage_failed", stage=stage)
+        emit_task_event(
+            "stage_completed" if p.returncode == 0 else "stage_failed",
+            stage=stage,
+            completed=1 if p.returncode == 0 else 0,
+            total=1,
+        )
     if p.returncode != 0:
         hint = error_hint or "命令执行失败"
         raise PipelineError(f"错误: {hint} (exit code {p.returncode})")
@@ -627,7 +670,7 @@ def _run_download_flow(args) -> int:
                     continue
             raise
 
-    emit_task_event("stage_started", stage="download")
+    emit_task_event("stage_started", stage="download", completed=0, total=1)
     try:
         multi = _parse_cli_segments(raw_segments) if raw_segments else []
         if multi and (getattr(args, "begin", None) or getattr(args, "end", None)):
@@ -670,14 +713,19 @@ def _run_download_flow(args) -> int:
                 media_repair=str(getattr(args, "media_repair", "audio") or "audio"),
             )
     except TwitchDownloadError as e:
-        emit_task_event("stage_failed", stage="download")
+        emit_task_event("stage_failed", stage="download", completed=0, total=1)
         print(f"错误: {e}", file=sys.stderr)
         return 2
     except Exception as e:
-        emit_task_event("stage_failed", stage="download")
+        emit_task_event("stage_failed", stage="download", completed=0, total=1)
         print(f"错误: 下载失败: {e}", file=sys.stderr)
         return 1
-    emit_task_event("stage_completed", stage="download")
+    global _TASK_RESULT_CONTEXT
+    _TASK_RESULT_CONTEXT = {
+        "mode": "download",
+        "artifacts": [("video", result.video_path), ("chat_html", result.chat_html_path)],
+    }
+    emit_task_event("stage_completed", stage="download", completed=1, total=1)
     return _post_download_next_steps(
         result.video_path,
         result.chat_html_path,
@@ -762,6 +810,7 @@ def _fallback_manual_after_export(
         export_review_xlsx(trans_json, review_xlsx)
     except Exception as e:
         raise PipelineError(f"错误: 导出人工复核表失败: {e}") from e
+    mark_manual_translation_required()
     print("\n[OK] 已改为人工翻译流程。请编辑 XLSX 最后一列 translation：")
     print(f"     {review_xlsx}")
     print(f"     JSON: {trans_json}")
@@ -1876,7 +1925,7 @@ def apply_mode_defaults(args) -> list[str]:
     raise PipelineError(f"错误: 未知 --mode {mode!r}，可选 auto|preview|translate|render|full")
 
 
-def main():
+def _main():
     # Activate only the trusted source/user-data portable FFmpeg directory.
     prepend_tools_ffmpeg_to_path()
     parser = argparse.ArgumentParser(description="Generate translated chat overlay video from Twitch HTML")
@@ -1991,6 +2040,12 @@ def main():
         default="fast",
         choices=["off", "fast", "decode"],
         help="媒体健康门禁：fast=流/时长/AAC包检查（默认）；decode=额外完整解码；off=不建议，仅跳过检查。",
+    )
+    parser.add_argument(
+        "--source-media-check",
+        default="fast",
+        choices=["off", "fast", "decode"],
+        help="本地输入视频门禁：fast=快速检查（默认）；decode=翻译/渲染前完整解码；off=仅用于排障。",
     )
     parser.add_argument(
         "--media-repair",
@@ -2400,6 +2455,8 @@ def main():
     if not translator.is_file() and not args.skip_translate and not args.reuse_translation and not args.manual_translation and not args.render_original:
         raise PipelineError(f"错误: 找不到翻译脚本: {translator}\n  请确认 scripts/ 目录完整性。")
 
+    validate_source_media(video, mode=args.source_media_check, dry_run=args.dry_run)
+
     workdir = None
     if args.workdir:
         workdir = Path(args.workdir).resolve()
@@ -2427,6 +2484,18 @@ def main():
         final_output = output_default
     if is_dangerous_publish_path(final_output) or is_dangerous_publish_path(final_output.parent):
         raise PipelineError(f"错误: --output 不能写到系统目录: {final_output}")
+
+    global _TASK_RESULT_CONTEXT
+    _TASK_RESULT_CONTEXT = {
+        "mode": str(getattr(args, "mode", "auto") or "auto"),
+        "artifacts": [
+            ("video", final_output),
+            ("translation_json", trans_json),
+            ("review_xlsx", review_xlsx),
+            ("review_tsv", review_tsv),
+            ("preview_image", getattr(args, "preview_image", None)),
+        ],
+    }
 
     if args.render_original:
         log("[1/1] 不使用 LLM，直接渲染原始聊天文本和 HTML 中已有 emote")
@@ -2494,6 +2563,7 @@ def main():
         log("\n[2/2] 导出人工复核表（无需 LLM）")
         export_review_tsv(trans_json, review_tsv)
         export_review_xlsx(trans_json, review_xlsx)
+        mark_manual_translation_required()
         print("\n[OK] 请优先编辑 XLSX 最后一列 translation：")
         print(f"     {review_xlsx}")
         print("     完成后使用以下命令回写并渲染：")
@@ -2603,6 +2673,7 @@ def main():
     if args.review:
         export_review_tsv(trans_json, review_tsv)
         export_review_xlsx(trans_json, review_xlsx)
+        mark_manual_translation_required()
         print("  请优先编辑 XLSX 的最后一列 translation；TSV 仅作为兼容备份。")
         print("\n[OK] 已停在人工复核环节，尚未渲染视频。")
         print("     修改 XLSX 后运行同一命令并把 --review 换成 --review-done。")
@@ -2702,6 +2773,41 @@ def main():
         and str(getattr(args, "mode", "auto") or "auto") not in ("preview",)
     ):
         log("提示: 下次可先 --preview-clip 10 或 --mode preview 确认 offset/布局，再出长片")
+
+
+def _terminal_exit_code(value: object) -> int:
+    try:
+        return int(value) if value is not None else 0
+    except (TypeError, ValueError):
+        return 1
+
+
+def _write_terminal_result(state: str, returncode: int) -> None:
+    terminal_state = str(_TASK_RESULT_CONTEXT.get("terminal_state") or state)
+    write_task_result(
+        state=terminal_state,
+        mode=str(_TASK_RESULT_CONTEXT.get("mode", "unknown")),
+        returncode=returncode,
+        artifacts=list(_TASK_RESULT_CONTEXT.get("artifacts", [])),
+    )
+
+
+def main():
+    """Run the pipeline and publish an optional narrow terminal result manifest."""
+    global _TASK_RESULT_CONTEXT
+    _TASK_RESULT_CONTEXT = {"mode": "unknown", "artifacts": []}
+    try:
+        result = _main()
+    except SystemExit as exc:
+        code = _terminal_exit_code(exc.code)
+        _write_terminal_result("succeeded" if code == 0 else "failed", code)
+        raise
+    except BaseException:
+        _write_terminal_result("failed", 1)
+        raise
+    code = _terminal_exit_code(result)
+    _write_terminal_result("succeeded" if code == 0 else "failed", code)
+    return result
 
 
 if __name__ == "__main__":

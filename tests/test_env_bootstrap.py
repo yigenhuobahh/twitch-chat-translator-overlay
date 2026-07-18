@@ -187,6 +187,31 @@ def test_ensure_translate_api_fallback_manual(monkeypatch, tmp_path):
     assert exported["n"] == 2
 
 
+def test_ensure_translate_api_fallback_marks_manual_required_for_tui_result(monkeypatch, tmp_path):
+    import render_cn_chat as pipe
+
+    monkeypatch.setattr(pipe, "probe_translate_api", lambda **_kwargs: (False, "offline"))
+    monkeypatch.setattr(pipe, "export_review_tsv", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pipe, "export_review_xlsx", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pipe, "_TASK_RESULT_CONTEXT", {"mode": "full", "artifacts": []})
+    translation = tmp_path / "translation.json"
+    translation.write_text('{"messages": []}', encoding="utf-8")
+
+    mode = pipe.ensure_translate_api_or_fallback(
+        video=tmp_path / "video.mp4",
+        chat_html=tmp_path / "chat.html",
+        trans_json=translation,
+        review_tsv=tmp_path / "review.tsv",
+        review_xlsx=tmp_path / "review.xlsx",
+        workdir=None,
+        final_output=tmp_path / "output.mp4",
+        yes=True,
+    )
+
+    assert mode == "manual"
+    assert pipe._TASK_RESULT_CONTEXT["terminal_state"] == "manual_required"
+
+
 def test_ensure_translate_api_retry_then_ok(monkeypatch, tmp_path):
     import render_cn_chat as pipe
 

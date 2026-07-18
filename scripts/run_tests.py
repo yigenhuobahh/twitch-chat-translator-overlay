@@ -8,6 +8,7 @@ Examples:
   python scripts/run_tests.py --unit-only
   python scripts/run_tests.py --smoke
   python scripts/run_tests.py --max        # comprehensive long-term suite
+  python scripts/run_tests.py --max --coverage
   python scripts/run_tests.py --install-dev
 """
 
@@ -21,6 +22,7 @@ import sys
 from common_utils import safe_which
 
 ROOT = Path(__file__).resolve().parents[1]
+COVERAGE_FAIL_UNDER = 65
 
 # Keep compile-check in sync with pyproject py-modules / critical scripts.
 COMPILE_SCRIPTS = [
@@ -45,7 +47,11 @@ COMPILE_SCRIPTS = [
     "run_meta.py",
     "run_tests.py",
     "task_events.py",
+    "task_results.py",
+    "tui_history.py",
+    "tui_models.py",
     "tui_run.py",
+    "tui_task.py",
     "translate_chat_openai.py",
     "translation_support.py",
     "twitch_chat_burn.py",
@@ -77,6 +83,30 @@ def ensure_pytest(install_dev: bool) -> bool:
             return False
         try:
             import pytest  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+
+def ensure_pytest_cov(install_dev: bool) -> bool:
+    try:
+        import pytest_cov  # noqa: F401
+        return True
+    except ImportError:
+        if not install_dev:
+            print(
+                "pytest-cov 未安装。可先运行:\n"
+                "  python scripts/run_tests.py --install-dev\n"
+                "或:\n"
+                "  pip install -r requirements-dev.txt",
+                file=sys.stderr,
+            )
+            return False
+        code = run([sys.executable, "-m", "pip", "install", "-r", str(ROOT / "requirements-dev.txt")])
+        if code != 0:
+            return False
+        try:
+            import pytest_cov  # noqa: F401
             return True
         except ImportError:
             return False
@@ -219,6 +249,11 @@ def main() -> int:
         help="run ruff lint (also on by default with --max; config in pyproject.toml)",
     )
     parser.add_argument("--no-lint", action="store_true", help="skip ruff even when --max/--lint")
+    parser.add_argument(
+        "--coverage",
+        action="store_true",
+        help=f"with --max, require core scripts coverage >= {COVERAGE_FAIL_UNDER}%",
+    )
     parser.add_argument("-k", dest="keyword", default=None, help="pytest -k expression")
     parser.add_argument("-q", "--quiet", action="store_true")
     parser.add_argument("--strict", action="store_true", help="fail on pytest warnings (useful for CI hardening)")
@@ -231,11 +266,16 @@ def main() -> int:
     if args.lint and args.no_lint:
         print("错误: --lint 与 --no-lint 不能同时使用", file=sys.stderr)
         return 2
+    if args.coverage and not args.max:
+        print("错误: --coverage 只能与 --max 一起使用，避免快速测试产生不稳定基线", file=sys.stderr)
+        return 2
 
     if not ensure_pytest(args.install_dev):
         print("\n[fallback] 使用 tests/test_core.py 自带 runner（无 pytest）", flush=True)
         code = run([sys.executable, str(ROOT / "tests" / "test_core.py")])
         return code
+    if args.coverage and not ensure_pytest_cov(args.install_dev):
+        return 2
 
     if not args.no_compile:
         code = compile_check()
@@ -296,6 +336,15 @@ def main() -> int:
     # Max suite: show skip reasons and durations for long-term signal
     if args.max:
         pytest_cmd.extend(["-ra", "--durations=25"])
+    if args.coverage:
+        pytest_cmd.extend(
+            [
+                "--cov=scripts",
+                "--cov-report=term",
+                "--cov-fail-under",
+                str(COVERAGE_FAIL_UNDER),
+            ]
+        )
 
     code = run(pytest_cmd)
     if code != 0:

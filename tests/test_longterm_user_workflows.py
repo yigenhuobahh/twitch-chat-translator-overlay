@@ -234,7 +234,7 @@ def test_optional_td_install_prompt_remains_best_effort(monkeypatch):
 @pytest.mark.parametrize(
     ("name", "entrypoint"),
     [
-        ("run.bat", r'"%PY%" scripts\job_wizard.py'),
+        ("run_cli.bat", r'"%PY%" scripts\job_wizard.py'),
         ("doctor.bat", r'"%PY%" scripts\render_cn_chat.py --doctor'),
     ],
 )
@@ -247,6 +247,24 @@ def test_windows_launchers_prefer_and_validate_venv(name: str, entrypoint: str):
     launch = text.index(entrypoint, version_check)
 
     assert venv_guard < venv_select < path_fallback < version_check < launch
+
+
+def test_run_bat_opens_tui_only_without_arguments_and_keeps_cli_forwarding():
+    text = (ROOT / "run.bat").read_text(encoding="ascii")
+    assert 'if /I "%~1"==""' in text
+    assert "run_tui.bat" in text
+    assert 'run_cli.bat" %*' in text
+
+
+def test_run_cli_preserves_explicit_pipeline_arguments_before_drag_drop_route():
+    text = (ROOT / "run_cli.bat").read_text(encoding="ascii")
+    pipeline = text.index(":PIPELINE")
+    route = text.index(r'"%PY%" scripts\job_wizard.py drop %*')
+
+    assert 'if "%FIRST:~0,1%"=="-" goto PIPELINE' in text
+    assert 'if not "%~3"=="" if exist "%~1" goto PIPELINE' in text
+    assert 'if /I "%~1"=="--help" goto PIPELINE' in text
+    assert pipeline > route
 
 
 def test_install_bat_propagates_required_step_failures():

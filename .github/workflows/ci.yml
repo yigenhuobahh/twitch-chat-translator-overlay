@@ -87,6 +87,33 @@ jobs:
         run: |
           python scripts/run_tests.py --smoke --no-lint
 
+  coverage:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install FFmpeg, fonts, and project
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-noto-cjk fonts-wqy-zenhei
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+          python -m pip install -e .
+
+      - name: Run full coverage gate
+        env:
+          PYTHONPATH: scripts
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: python scripts/run_tests.py --max --coverage
+
   wheel-smoke:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
@@ -245,4 +272,4 @@ jobs:
           PYTHONPATH: scripts
           PYTHONIOENCODING: utf-8
           PYTHONUTF8: "1"
-        run: python scripts/run_tests.py --max
+        run: python scripts/run_tests.py --max --coverage

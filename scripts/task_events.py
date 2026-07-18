@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 EVENT_FILE_ENV = "TWITCH_OVERLAY_EVENT_FILE"
+EVENT_SCHEMA_VERSION = 1
 
 
 def emit_task_event(kind: str, **fields: Any) -> bool:
@@ -26,7 +27,12 @@ def emit_task_event(kind: str, **fields: Any) -> bool:
     try:
         path = Path(raw_path).expanduser()
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"event": str(kind), "timestamp": time.time(), **fields}
+        payload = {
+            "schema_version": EVENT_SCHEMA_VERSION,
+            "event": str(kind),
+            "timestamp": time.time(),
+            **fields,
+        }
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         with path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(encoded + "\n")

@@ -1,6 +1,6 @@
 # Twitch Chat Translator Overlay
 
-> 新手入口：Windows 安装完成后运行 `run.bat quick`；无需翻译 API 的环境验证可运行 `run.bat demo`。也可以把本地视频和对应的 Twitch 聊天 HTML 一起拖到 `run.bat` 上，先生成 10 秒原文预览。
+> 新手入口：Windows 安装完成后直接双击 `run.bat` 打开引导式 TUI；无需翻译 API 的环境验证可在 TUI 中运行「离线演示」。高级命令、下载流程和拖放预览保留在 `run_cli.bat`。
 
 将 Twitch 直播录像的聊天弹幕翻译成中文（或其他语言），以半透明覆盖层形式压制到视频画面上。
 
@@ -21,12 +21,10 @@
 install.bat
 
 # 2. 双击 run.bat
-#    [1] 新建配置 → 问答引导，生成带逐项注释的 jobs\xxx.yaml
-#    [2] 使用已有配置 → 一键复用
-#    或: run.bat new
-#    或: run.bat example_job
-#    跑完成功后会问：是否打开输出目录、是否清理 workdir/temp 下 *.partial*
-#    （无 workdir 时不提供清理，避免误清视频目录旁其他 job）
+#    在「新任务」中填写视频和 Twitch 聊天 HTML
+#    先选「原文预览」检查时间轴，再选「正式翻译渲染」出片
+#    可在「保存与导入」保存/加载 jobs\xxx.yaml
+#    可在「高级设置」调整布局、编码、规则和翻译并发
 
 ```
 
@@ -52,7 +50,7 @@ python scripts\render_cn_chat.py --job jobs\example_job.yaml
 # 便携 FFmpeg: 解压到 tools/ffmpeg/（bin 下有 ffmpeg/ffprobe）
 ```
 
-> **配置文件**：`jobs/*.yaml` 里每个参数都有中文注释；示例见 [`jobs/example_job.yaml`](jobs/example_job.yaml)。CLI 显式参数优先于 YAML。
+> **配置文件**：TUI 的「保存为新 YAML」直接生成 `jobs/*.yaml` 兼容配置；示例见 [`jobs/example_job.yaml`](jobs/example_job.yaml)。CLI 显式参数优先于 YAML。
 > **默认输出**：不带 `--output` 时为源视频同目录 `<视频名>_chat.mp4`。
 > **`--mode`**：`auto`/`full` 完整流程；`preview` 默认 10s；`translate` 只翻译；`render` 只渲染（需 reuse/original）。
 > **短名预设**：`--layout-preset compact`、`--render-preset fast`。
@@ -61,6 +59,16 @@ python scripts\render_cn_chat.py --job jobs\example_job.yaml
 > 只有在 YAML 里**取消注释**路径时才固定跟配置走。
 > **预设短名**：`layout_preset: default|compact|mobile`、`render_preset: default|fast|hq`
 > （`default` 对应 `layout_default.yaml` / `render_default.yaml`，不是翻译用的 `profiles/default.yaml`）。
+
+### Windows TUI 与恢复入口
+- 「下载素材」页复用已安装的 TwitchDownloaderCLI，可下载公开 VOD 并按分号分隔的多个时间段合并，也可直接下载天然有界的公开 Clip；完成后会自动将视频和聊天 HTML 填入「新任务」。为避免误下载整段长 VOD，TUI 必须填写至少一个裁切段。订阅限定内容可在 TUI 的掩码 OAuth 字段中输入；它只传给本次下载，绝不写入日志、诊断、YAML、结果清单或历史记录。TUI 默认完整解码每个下载片段、合并结果和后续本地源视频；长视频会多花一次顺序读取时间，但可在翻译前发现坏片段。
+
+- `run.bat`：双击默认打开完整 TUI。输入本地视频和聊天 HTML 后，可直接选择原文预览、翻译预览、正式翻译渲染或复用已有翻译渲染。
+- 「任务与结果」页显示阶段进度和实时日志，可取消整个任务树；失败时可导出已脱敏的诊断文本，成功后可打开结果目录。翻译服务不可用时会明确停在「等待人工翻译」，并打开 JSON/XLSX/TSV 所在目录，不会把它误报为成片成功。
+- 「历史与产物」页会保留最近 100 个本机任务的终态与实际产物路径；上次异常关闭的任务会标为中断，可载入原配置重跑。历史不保存 API 凭据、命令行或翻译内容。
+- 「保存与导入」页支持将表单保存为可复现 YAML，或导入已有 YAML 后继续编辑。
+- `run_cli.bat`：高级和恢复入口，保留原菜单、下载素材和拖放视频/HTML 预览。`run.bat demo`、`run.bat doctor`、`run.bat <任务名>` 等带参数调用会自动转交此入口；以 `--` 开头的原始 pipeline 参数、或「视频 + HTML + 额外参数」会直接传给 pipeline，不会被拖放预览改写。
+- 首次做长任务时建议先运行原文预览；正式翻译渲染可直接启动，但仅在需要翻译时才检查 `.env` 中的翻译服务配置。
 
 ### 并行跑多个任务安全吗？
 
@@ -159,6 +167,10 @@ python scripts/render_cn_chat.py --download https://www.twitch.tv/videos/1234567
 python scripts/render_cn_chat.py --download <VOD_URL> --download-only `
   --download-trim-mode Safe --media-check decode --media-repair audio
 ```
+
+### 本地视频的前置检查
+
+无论视频来自下载页还是外部工具，pipeline 都会在翻译或渲染前检查本地输入视频，避免耗费 API 调用后才发现坏片段。CLI 默认 `--source-media-check fast`，兼顾已有自动化的启动速度；`--source-media-check decode` 会完整解码整个输入，适合正式任务和重要成片验收。TUI 默认使用后者。`off` 只用于排障，日常不建议关闭。
 
 > 健康检查不负责 ASS/SRT/Aegisub；它只确保本工具的下载、拼接和 overlay 输入/输出能安全进入下一阶段。
 
@@ -598,6 +610,17 @@ python scripts\render_cn_chat.py --doctor
 python scripts\render_cn_chat.py video.mp4 chat.html --doctor
 ```
 
+## 故障恢复（TUI）
+
+遇到问题时，先在「历史与产物」中选中对应任务；这里记录的是实际结果清单中的路径，不需要猜测预览、成片或复核文件名。
+
+- **任务失败或没有生成成片**：选择「导出诊断」，按错误提示修正输入、FFmpeg、字体或翻译配置后，用「载入配置」检查参数，再选择「重新运行」。诊断会省略命令行、环境变量名和凭据。
+- **状态为“等待人工翻译”**：这表示已导出待翻译的 JSON/XLSX/TSV，尚未渲染视频。编辑复核表后，使用「复用翻译渲染」或 CLI 的 `--review-done` 完成回写和成片。
+- **媒体健康检查失败**：更换或重新下载提示的片段。TUI 默认完整解码输入视频，避免在耗费翻译后才发现损坏；不要把检查关闭当作修复，`off` 只适合定位问题。
+- **TUI 无法启动或界面异常退出**：运行 `run_cli.bat doctor` 查看环境，再运行 `install.bat` 补齐依赖。`run_cli.bat` 也始终保留原菜单和拖放预览，可作为恢复入口。
+
+成功、取消和失败任务的临时事件文件会自动清理；历史记录和失败诊断默认只保留在本机，可在「历史与产物」中清理。
+
 会检查：FFmpeg/ffprobe 是否可用、字体能否加载、视频能否读取、HTML 能否解析、翻译 API 是否配置。
 
 ## 运行测试
@@ -617,6 +640,9 @@ python scripts\run_tests.py --lint
 
 # 全面 max 套件（发版前 / 大改后 / 长期回归：含 lint）
 python scripts\run_tests.py --max
+
+# 覆盖率门槛（完整核心套件，当前最低 65%；CI / 发布同样执行）
+python scripts\run_tests.py --max --coverage
 
 # 直接用 pytest
 python -m pytest tests/ -v

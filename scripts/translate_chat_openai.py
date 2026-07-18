@@ -28,6 +28,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import threading
 import time
 import uuid
 
@@ -772,9 +773,14 @@ def main():
 
     failed_indexes = set(failed_set)
     error_counts = {}
-    import threading
     progress_lock = threading.Lock()
     error_counts_lock = threading.Lock()
+    try:
+        from task_events import emit_task_event
+    except ImportError:  # pragma: no cover - script remains standalone
+        def emit_task_event(*_args, **_kwargs) -> bool:
+            return False
+    completed_batches = 0
 
     def bump_error(kind: str) -> None:
         with error_counts_lock:
@@ -848,6 +854,14 @@ def main():
                     for msg in batch:
                         failed_indexes.add(msg["index"])
                     persist_progress()
+            completed_batches += 1
+            emit_task_event(
+                "stage_progress",
+                stage="translate",
+                completed=completed_batches,
+                total=total_batches,
+                unit="batches",
+            )
 
     # Retry non-preserve missing messages once, still in original batch sizes.
     missing_for_retry = []

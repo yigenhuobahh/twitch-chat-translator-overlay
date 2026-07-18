@@ -122,9 +122,9 @@ echo.
 echo ======== Install done ========
 echo Next:
 echo   1. Edit .env if you need translation API
-echo   2. Double-click run.bat  -^> [1] New job  or  [3] Download media
-echo   3. Or: run.bat new
-echo   4. Reuse: run.bat example_job
+echo   2. Double-click run.bat for the guided TUI
+echo   3. Advanced/recovery menu: run_cli.bat
+echo   4. Existing CLI command: run.bat example_job
 echo   5. Optional download: python scripts\render_cn_chat.py --download ^<url^>
 echo.
 if not defined CI pause

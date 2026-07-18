@@ -2,11 +2,22 @@
 
 Notable changes to this project are documented in this file.
 
-## [Unreleased]
+## [0.2.2] - 2026-07-18
 
 ### Changed
 
 - Reorganized the double-click launcher into a beginner-focused main menu, a continue-work path, and an explained tools menu while retaining the legacy full menu for advanced users.
+- Made the Textual task UI the default double-click entry. Existing command arguments, drag-and-drop behavior, and the recovery menu are preserved through `run_cli.bat`.
+- Explicit pipeline flags and video/chat invocations with extra options now bypass the drag-and-drop preview route, preserving their requested CLI behavior.
+
+### Added
+
+- Added a form-based TUI for local preview, translated preview, full render, reuse-render, YAML import/export, advanced settings, diagnostics, cancellation, and result-folder access.
+- Added bounded task-output capture and versioned JSONL task events for responsive progress reporting and safe diagnostic export.
+- Added opt-in atomic pipeline result manifests and a bounded local TUI history with lifecycle recovery, exact artifact paths, rerun support, and diagnostic references.
+- Added a TUI download page backed by the existing TwitchDownloaderCLI flow, with bounded VOD segments, artifact manifests, automatic new-task fill, and rerunnable local download history.
+- Added an ephemeral masked OAuth field for subscription-restricted TUI downloads; command logs, diagnostics, manifests, YAML, and history redact or omit it.
+- Added a `manual_required` task outcome so translation fallback is shown as pending human work instead of a successful render; failed-task diagnostics now persist without retaining transient event files.
 
 ## [0.2.1] - 2026-07-18
 

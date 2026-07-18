@@ -25,22 +25,27 @@ python scripts/render_cn_chat.py --job jobs/example_job.yaml
 python scripts/render_cn_chat.py video.mp4 chat.html --output out.mp4
 ```
 
-Windows: `install.bat` then `run.bat` (menu). Linux/macOS: `bash install.sh` then `bash run.sh`.
+Windows: `install.bat` then double-click `run.bat` for the guided Textual UI. Linux/macOS: `bash install.sh` then `bash run.sh`.
 
 ### Fastest first run (Windows)
 
 ```bat
-run.bat quick  :: scaffold .env and create a reusable job
-run.bat demo   :: render a 6-second offline demo; no API key required
+run.bat          :: guided local video/chat workflow in the TUI
+run_cli.bat quick :: scaffold .env and create a reusable job
+run_cli.bat demo  :: render a 6-second offline demo; no API key required
 ```
 
-You can also drag a video file and its Twitch chat HTML onto `run.bat`. It creates a 10-second original-chat preview first, so layout and timing can be checked before configuring translation or rendering a full VOD.
+You can also drag a video file and its Twitch chat HTML onto `run_cli.bat`. It creates a 10-second original-chat preview first, so layout and timing can be checked before configuring translation or rendering a full VOD. Existing `run.bat` commands with arguments are forwarded to this recovery/advanced CLI entry point.
 
 The demo writes its source files and final `demo_overlay.mp4` under `outputs/quick_demo/`. Drag-and-drop previews use the normal pipeline output rules, so the final path is printed when rendering finishes.
 
-### Double-click menu
+### Windows TUI and recovery CLI
 
-The `run.bat` main menu is intentionally short: **Quick start**, **Continue last job**, **Use an existing job**, **Offline demo**, and **More tools**. The More tools screen explains when to use downloads, environment diagnostics, presets, or the legacy full menu. Advanced CLI flags and job YAML fields remain available without making first-time users choose technical parameters up front.
+The default `run.bat` TUI accepts local video and chat HTML, supports original/translated previews, full translation render, reuse-render, YAML import/export, cancellation, result-folder access, and a redacted diagnostic export. Its Download page uses the installed TwitchDownloaderCLI to fetch public VODs and one-or-more bounded VOD segments, then fills the downloaded video and chat HTML into a new task. For subscription-restricted VODs, its masked OAuth field is used only for the current download; it is excluded from command logs, subprocess output, diagnostics, YAML, manifests, and history. If translation cannot proceed, the TUI reports a manual-translation task instead of claiming that a video was rendered. The TUI defaults to a full-decode gate for every downloaded segment, merge result, and later local source video, so corrupt media is caught before translation starts; this adds one sequential read for long videos. Its History and Artifacts page keeps the most recent 100 local task states and exact artifact paths, preserves a live task when another TUI instance opens, and can reload or rerun their saved local configuration without storing credentials, commands, or translated content. Advanced settings contain presets, encoder options, rules, profiles, and manual-review controls. `run_cli.bat` retains the original menu and drag-and-drop. Raw pipeline options and `video chat.html` invocations with extra options are forwarded directly instead of being rewritten as a drag-and-drop preview.
+
+### TUI recovery
+
+Open **History and Artifacts** and select the task first: its paths come from the result manifest, rather than guessed output names. Export a diagnostic for failed tasks, fix the reported input, FFmpeg, font, or translation configuration, then reload the saved configuration and rerun it. Diagnostics omit commands, environment-variable names, and credentials. A **manual translation required** state means that JSON/XLSX/TSV was created but no video was rendered; edit the review sheet and use reuse-render (or CLI `--review-done`). A failed media gate should be fixed by replacing or re-downloading the named segment; disabling the gate is diagnostic-only. If the TUI does not start, run `run_cli.bat doctor`, then `install.bat`; `run_cli.bat` remains the recovery menu and drag-and-drop entry point. Temporary event files are cleaned after terminal tasks, while local history and failed diagnostics can be cleared from the History page.
 
 > **Default output**: Without `--output`, writes `<video_name>_chat.mp4` next to the source.  
 > **Translation JSON**: Defaults to `<video_name>_translation.json`; reuse with `--reuse-translation`.  
@@ -53,7 +58,7 @@ Processes TwitchDownloader chat (text + **embedded** emotes) into an on-video ch
 
 - **No online emote fetch** — only CSS `content:url(data:image…base64…)` embeds  
 - **No ASR/subtitles** — chat only  
-- **No GUI** — CLI + optional terminal wizard  
+- **Terminal UI + CLI** — Textual UI for local workflows; CLI remains for recovery and advanced operations
 - **No arbitrary HTML** — TwitchDownloader HTML (and a limited legacy web path)
 
 ## Workflow
@@ -102,6 +107,10 @@ python scripts/render_cn_chat.py --download https://www.twitch.tv/videos/123 \
 Interactive runs open a next-step menu (preview / manual table / translate). Use `--download-only` or `--yes` for scripts.
 
 VOD trims use `--download-trim-mode Safe` by default; choose `Exact` only when an exact cut point is more important than avoiding TwitchDownloader timestamp drift. Downloaded segments, merged video, and final chat output pass a media-health gate before publication. `--media-check fast` is the default, `decode` adds a full decode, and `off` is intended only for troubleshooting. For failed download or merge gates, `--media-repair audio` (the default) writes a sibling `*.repaired.mp4`, preserves the original, and continues only after the repaired file passes validation; use `--media-repair off` to disable that repair. A failed final chat-output gate stops publication and preserves the partial file for diagnosis rather than attempting automatic repair.
+
+### Local input-video gate
+
+Before translation or rendering, the pipeline also checks the local input video, so a bad segment does not surface only after API work has completed. CLI defaults to `--source-media-check fast` to preserve existing automation speed; `--source-media-check decode` fully decodes the input before the expensive workflow and is recommended for important renders. The TUI uses `decode` by default. `off` is for diagnosis only.
 
 ### Manual translation
 
@@ -174,6 +183,7 @@ Pause: Enter = continue full render; `P` / `P 30` = short preview; `S` = stop fo
 | `--download` / `--download-only` / `--quality` / `--begin` / `--end` | Optional TD CLI acquire and single-window trim |
 | `--segment` / `--cut` / `--download-output-fps` / `--download-encoder` | Multi-window merge, post-merge removal, and output encoding |
 | `--download-trim-mode` / `--media-check` / `--media-repair` | Trim safety, media validation, and repair policy |
+| `--source-media-check` | Local input-video preflight; `decode` fully decodes before expensive work |
 | `--doctor` / `--offer-fix` / `--offer-td-cli` | Environment / optional tools |
 | `--workdir` / `--output` / `--clean` / `--clean-all` | Paths & cleanup |
 

@@ -92,6 +92,7 @@ class TestHumanCliWorkflows:
         html = FIXTURES_DIR / "twitchdownloader_chat.html"
         work = tmp_path / "work"
         out = tmp_path / "out" / "unused.mp4"
+        manual_manifest = tmp_path / "manual.result.json"
         cmd = [
             sys.executable,
             str(SCRIPTS_DIR / "render_cn_chat.py"),
@@ -105,7 +106,7 @@ class TestHumanCliWorkflows:
             "--offset",
             "0",
         ]
-        r = _run(cmd)
+        r = _run(cmd, {"TWITCH_OVERLAY_RESULT_FILE": str(manual_manifest)})
         assert r.returncode == 0, r.stdout + "\n" + r.stderr
 
         trans = work / f"{video.stem}_translation.json"
@@ -115,11 +116,34 @@ class TestHumanCliWorkflows:
         assert tsv.is_file(), r.stdout
         assert xlsx.is_file(), r.stdout
         assert not out.exists()
+        assert json.loads(manual_manifest.read_text(encoding="utf-8"))["state"] == "manual_required"
 
         data = json.loads(trans.read_text(encoding="utf-8"))
         assert len(data["messages"]) == 3
         joined = (r.stdout or "") + (r.stderr or "")
         assert "review-done" in joined or "复核" in joined
+
+        review_manifest = tmp_path / "review.result.json"
+        review = _run(
+            [
+                sys.executable,
+                str(SCRIPTS_DIR / "render_cn_chat.py"),
+                str(video),
+                str(html),
+                "--reuse-translation",
+                "--review",
+                "--translation-json",
+                str(trans),
+                "--review-xlsx",
+                str(xlsx),
+                "--workdir",
+                str(work),
+                "--yes",
+            ],
+            {"TWITCH_OVERLAY_RESULT_FILE": str(review_manifest)},
+        )
+        assert review.returncode == 0, review.stdout + "\n" + review.stderr
+        assert json.loads(review_manifest.read_text(encoding="utf-8"))["state"] == "manual_required"
 
     @pytest.mark.smoke
     def test_review_xlsx_edit_then_review_done_render(
@@ -817,4 +841,3 @@ class TestTranslateCliWithStubApi:
         assert out2["messages"][0]["translation"].startswith("译-")
         assert out2["messages"][1]["translation"].startswith("译-")
         assert any(cache_dir.rglob("*")), "expected cache files"
-

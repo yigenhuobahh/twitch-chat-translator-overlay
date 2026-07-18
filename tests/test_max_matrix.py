@@ -110,7 +110,7 @@ def test_public_console_scripts_declared():
 
 
 def test_run_bat_is_ascii_crlf():
-    for name in ("run.bat", "run_tui.bat", "install.bat", "update.bat", "doctor.bat"):
+    for name in ("run.bat", "run_cli.bat", "run_tui.bat", "install.bat", "update.bat", "doctor.bat"):
         p = ROOT / name
         if not p.is_file():
             continue
@@ -120,7 +120,7 @@ def test_run_bat_is_ascii_crlf():
 
 
 def test_launchers_require_runnable_python_310():
-    for name in ("run.bat", "install.bat", "update.bat", "doctor.bat", "run.sh", "install.sh", "update.sh", "doctor.sh"):
+    for name in ("run.bat", "run_cli.bat", "run_tui.bat", "install.bat", "update.bat", "doctor.bat", "run.sh", "install.sh", "update.sh", "doctor.sh"):
         text = (ROOT / name).read_text(encoding="ascii" if name.endswith(".bat") else "utf-8")
         assert "sys.version_info>=(3,10)" in text, f"{name} must reject stale or broken Python"
         if name.endswith(".bat"):
@@ -129,9 +129,11 @@ def test_launchers_require_runnable_python_310():
 
 def test_run_bat_preserves_original_argument_vector():
     text = (ROOT / "run.bat").read_text(encoding="ascii")
-    assert r"scripts\job_wizard.py drop %*" in text
-    assert r"scripts\job_wizard.py quick" in text
-    assert r"scripts\quick_demo.py" in text
+    assert 'run_cli.bat" %*' in text
+    cli = (ROOT / "run_cli.bat").read_text(encoding="ascii")
+    assert r"scripts\job_wizard.py drop %*" in cli
+    assert r"scripts\job_wizard.py quick" in cli
+    assert r"scripts\quick_demo.py" in cli
     assert 'set "EXTRA="' not in text
 
 

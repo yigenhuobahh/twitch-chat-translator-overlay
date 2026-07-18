@@ -14,6 +14,7 @@ CLI that burns **TwitchDownloader chat HTML** onto a VOD as a semi-transparent o
 
 ```
 render_cn_chat.py          # pipeline CLI + doctor + download entry
+  task_results.py          # opt-in terminal artifact manifest for interactive clients
   twitch_download.py       # optional TD CLI wrapper + multi-segment merge/cut
     twitch_download_transaction.py # serialized process-crash recovery for video/chat pairs
     twitch_download_types.py       # shared download exception contract
@@ -24,6 +25,10 @@ render_cn_chat.py          # pipeline CLI + doctor + download entry
   twitch_chat_burn.py      # parse schedule render compose
     chat_parser.py / chat_window.py / encode_options.py / render_perf.py
     process_util.py / run_meta.py / overlay_config.py
+tui_run.py                 # Textual workbench; forms, lifecycle, history and artifacts
+  tui_models.py            # job/YAML form mapping and preflight validation
+  tui_task.py              # bounded subprocess/event reader and diagnostic export
+  tui_history.py           # local, bounded UI history (not render recovery state)
 ```
 
 Tests: `PYTHONPATH=scripts`, runner `scripts/run_tests.py` (optional `--lint` / `--max`).
@@ -40,6 +45,8 @@ Tests: `PYTHONPATH=scripts`, runner `scripts/run_tests.py` (optional `--lint` / 
 8. **Download chat** — Always TD `chatdownload -E` / `.html`; validate embeds when emote tags present.  
 9. **Download pair publication** — Single/multi final video + chat publish through `twitch_download_transaction`; the journal/guard guarantee a consistent pair for cooperating process crashes on one local filesystem, not hostile concurrent writers or power loss.
 10. **Dual CLI** — Shared layout/encode/fps flags go through `*_FORWARD_SPECS` + `append_*_args` in `render_cn_chat.py` (see `SHARED_FORWARD_FLAGS` / `BURN_ONLY_FLAGS`). Burn-only path flags: export/import/force-export/job-dir/no-job-dir/out-dir. Pipeline forwards `--strict-import` only on import/render burn cmds via `append_strict_import_arg`.
+
+11. **TUI results and history** - Only an opted-in `TWITCH_OVERLAY_RESULT_FILE` receives a terminal manifest. It contains state, mode, return code and existing artifact paths only: never command lines, environment variables, diagnostics, or credentials. `tui_history.py` retains at most 100 local UI records; `run_meta.json` remains the rendering audit/recovery source of truth.
 
 ## High-value next work (not blocking)
 

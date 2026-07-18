@@ -74,3 +74,17 @@ def test_packet_check_samples_first_and_last_minute(monkeypatch, tmp_path: Path)
 
     assert health.ok
     assert intervals == ["0%+60", "540.000%+60"]
+
+
+def test_decode_mode_marks_a_file_unhealthy_when_full_decode_fails(monkeypatch, tmp_path: Path):
+    import media_health as mh
+
+    source = tmp_path / "vod.mp4"
+    source.write_bytes(b"x")
+    monkeypatch.setattr(mh, "probe_media_health", lambda *args, **kwargs: mh.MediaHealth(path=source, ok=True))
+    monkeypatch.setattr(mh, "decode_check_media", lambda _path: (False, "corrupt packet"))
+
+    health = mh.validate_media_health(source, mode="decode", require_audio=False)
+
+    assert not health.ok
+    assert any("完整解码失败" in issue for issue in health.issues)
