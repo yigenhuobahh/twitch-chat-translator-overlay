@@ -12,13 +12,14 @@ import tempfile
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal
-from textual.widgets import Button, Footer, Header, RichLog, Static
+from textual.widgets import Button, Footer, Header, Input, RichLog, Static
 
 
 class OverlayTui(App[None]):
     CSS = """
     Screen { layout: vertical; }
     #status { height: 3; padding: 1; }
+    Input { margin: 0 1; }
     RichLog { height: 1fr; border: round $accent; }
     Horizontal { height: 3; }
     Button { margin: 0 1; }
@@ -34,10 +35,13 @@ class OverlayTui(App[None]):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("Choose a safe local check. Existing run.bat workflows are unchanged.", id="status")
+        yield Input(placeholder="Video path for a local original-chat preview", id="video")
+        yield Input(placeholder="Twitch chat HTML path", id="chat")
         yield RichLog(id="log", wrap=True, highlight=False, markup=False)
         with Horizontal():
             yield Button("Offline demo", id="demo", variant="primary")
             yield Button("Environment check", id="doctor")
+            yield Button("Preview local files", id="preview")
             yield Button("Quit", id="quit", variant="error")
         yield Footer()
 
@@ -51,6 +55,30 @@ class OverlayTui(App[None]):
             self._start("Offline demo", [sys.executable, str(Path(__file__).with_name("quick_demo.py"))])
         elif event.button.id == "doctor":
             self._start("Environment check", [sys.executable, str(Path(__file__).with_name("render_cn_chat.py")), "--doctor"])
+        elif event.button.id == "preview":
+            self._start_preview()
+
+    def _start_preview(self) -> None:
+        video = Path(self.query_one("#video", Input).value).expanduser()
+        chat = Path(self.query_one("#chat", Input).value).expanduser()
+        if not video.is_file() or not chat.is_file():
+            self.query_one("#status", Static).update("Choose an existing video file and chat HTML file first.")
+            return
+        self._start(
+            "Original-chat preview",
+            [
+                sys.executable,
+                str(Path(__file__).with_name("render_cn_chat.py")),
+                str(video),
+                str(chat),
+                "--mode",
+                "preview",
+                "--render-original",
+                "--preview-clip",
+                "10",
+                "--yes",
+            ],
+        )
 
     def _start(self, label: str, command: list[str]) -> None:
         if self.process and self.process.poll() is None:
