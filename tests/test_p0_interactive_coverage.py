@@ -191,6 +191,51 @@ def test_try_fix_ffmpeg_uses_winget_and_refreshes_path(monkeypatch):
     assert refreshed == [True]
 
 
+def test_run_cmd_does_not_enable_shell_interpretation(monkeypatch):
+    import env_bootstrap as env
+
+    captured: dict[str, object] = {}
+
+    def run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(env.subprocess, "run", run)
+    assert env._run_cmd(["sudo", "apt-get", "update"]) == 0
+    assert captured == {"command": ["sudo", "apt-get", "update"], "kwargs": {}}
+
+
+def test_try_fix_ffmpeg_linux_updates_before_installing(monkeypatch):
+    import env_bootstrap as env
+
+    state = {"installed": False}
+    commands: list[list[str]] = []
+
+    def which(name: str):
+        if name in {"ffmpeg", "ffprobe"} and state["installed"]:
+            return "/usr/bin/" + name
+        return None
+
+    def run(command: list[str]) -> int:
+        commands.append(command)
+        if command[:3] == ["sudo", "apt-get", "install"]:
+            state["installed"] = True
+        return 0
+
+    monkeypatch.setattr(env, "safe_which", which)
+    monkeypatch.setattr(env, "_system", lambda: "Linux")
+    monkeypatch.setattr(env, "_prompt_yes", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(env, "prepend_tools_ffmpeg_to_path", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(env, "_run_cmd", run)
+
+    assert env.try_fix_ffmpeg() is True
+    assert commands == [
+        ["sudo", "apt-get", "update"],
+        ["sudo", "apt-get", "install", "-y", "ffmpeg", "fonts-noto-cjk", "fonts-wqy-zenhei"],
+    ]
+
+
 def test_td_cli_manual_guide_creates_local_readme(tmp_path: Path, monkeypatch):
     import webbrowser
 

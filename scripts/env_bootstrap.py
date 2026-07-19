@@ -559,10 +559,10 @@ def _prompt_yes(msg: str, *, default: bool = False, assume_yes: bool = False) ->
     return raw in ("y", "yes", "1")
 
 
-def _run_cmd(cmd: list[str] | str, *, shell: bool = False) -> int:
-    print(f"$ {cmd if isinstance(cmd, str) else ' '.join(cmd)}")
+def _run_cmd(cmd: list[str]) -> int:
+    print(f"$ {' '.join(cmd)}")
     try:
-        r = subprocess.run(cmd, shell=shell)
+        r = subprocess.run(cmd)
         return int(r.returncode)
     except FileNotFoundError:
         return 127
@@ -619,10 +619,8 @@ def try_fix_ffmpeg(*, assume_yes: bool = False) -> bool:
         for c in _ffmpeg_fix_cmds()[0]:
             print(f"    {c}")
         if _prompt_yes("是否尝试 sudo apt 安装 ffmpeg + 中文字体？", default=False, assume_yes=assume_yes):
-            _run_cmd(
-                "sudo apt-get update && sudo apt-get install -y ffmpeg fonts-noto-cjk fonts-wqy-zenhei",
-                shell=True,
-            )
+            if _run_cmd(["sudo", "apt-get", "update"]) == 0:
+                _run_cmd(["sudo", "apt-get", "install", "-y", "ffmpeg", "fonts-noto-cjk", "fonts-wqy-zenhei"])
 
     prepend_tools_ffmpeg_to_path()
     return bool(safe_which("ffmpeg") and safe_which("ffprobe"))
@@ -710,7 +708,8 @@ def try_portable_ffmpeg(*, assume_yes: bool = False, root: Path | None = None) -
             _GYAN_ESSENTIALS_URL,
             headers={"User-Agent": "twitch-chat-cn-overlay"},
         )
-        with urlopen(request, timeout=120.0) as response:  # noqa: S310 - fixed vendor URL
+        # The endpoint is a fixed HTTPS vendor URL, not user input.
+        with urlopen(request, timeout=120.0) as response:  # nosec B310
             stream_response_to_path(
                 response,
                 zip_path,

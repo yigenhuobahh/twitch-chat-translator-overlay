@@ -132,13 +132,13 @@ def progress_path_for(json_path: str | Path) -> Path:
 
 def fingerprint_message(msg: dict) -> str:
     raw = f"{msg.get('index')}\0{msg.get('original', '')}\0{msg.get('author', '')}"
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha1(raw.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
 
 
 def fingerprint_translation(value) -> str:
     """Fingerprint the JSON translation value observed at a progress save."""
     raw = str(value or "")
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha1(raw.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
 
 
 def paths_refer_to_same_file(first: str | Path, second: str | Path) -> bool:

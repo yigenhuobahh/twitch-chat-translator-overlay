@@ -1510,7 +1510,8 @@ def fetch_latest_td_cli_release_asset(
         },
     )
     try:
-        with urlopen(req, timeout=timeout) as resp:  # noqa: S310 — fixed GitHub API
+        # The endpoint is a fixed HTTPS GitHub API URL, not user input.
+        with urlopen(req, timeout=timeout) as resp:  # nosec B310
             raw = resp.read(2 * 1024 * 1024 + 1)
             if len(raw) > 2 * 1024 * 1024:
                 raise TwitchDownloadError("GitHub releases 响应超过 2 MiB 上限")
@@ -1632,7 +1633,8 @@ def try_portable_td_cli(
     try:
         print("  下载中…")
         request = Request(url, headers={"User-Agent": "twitch-chat-cn-overlay"})
-        with urlopen(request, timeout=timeout) as response:  # noqa: S310 - release asset URL
+        # ``url`` was validated above as a GitHub HTTPS release-asset path.
+        with urlopen(request, timeout=timeout) as response:  # nosec B310
             stream_response_to_path(
                 response,
                 zip_path,

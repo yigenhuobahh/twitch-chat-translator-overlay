@@ -116,7 +116,7 @@ def cache_key(
         (base_url or "").strip().rstrip("/"),
         str(prompt_version or ""),
     ])
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    return hashlib.sha1(raw.encode("utf-8"), usedforsecurity=False).hexdigest()
 
 
 class TranslationCache:
