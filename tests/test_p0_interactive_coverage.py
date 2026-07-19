@@ -124,6 +124,63 @@ def test_wizard_main_routes_known_commands(monkeypatch):
     assert seen == [("menu", None), ("quick", None), ("drop", ["video.mp4", "chat.html"])]
 
 
+def test_job_wizard_result_helpers_keep_output_and_cleaning_scoped(tmp_path: Path):
+    import job_wizard as wizard
+
+    video = tmp_path / "source.mp4"
+    video.write_bytes(b"video")
+    sibling_output = tmp_path / "source_chat.mp4"
+    sibling_output.write_bytes(b"output")
+    workdir = tmp_path / "job-work"
+    temp = workdir / "temp"
+    temp.mkdir(parents=True)
+    job_path = tmp_path / "job.yaml"
+    job_path.write_text("mode: preview\n", encoding="utf-8")
+
+    session = wizard._apply_extra_cli_path_overrides(
+        {"video": str(video), "workdir": str(tmp_path / "old-work")},
+        ["--output", str(tmp_path / "override.mp4"), f"--workdir={workdir}", "--translation-json", "table.json"],
+    )
+    assert session["output"].endswith("override.mp4")
+    assert session["workdir"] == str(workdir)
+    assert session["translation_json"] == "table.json"
+    assert wizard._resolve_clean_root(session, {}) == temp
+    assert wizard._infer_output_from_job({"video": str(video)}, job_path) == sibling_output
+
+
+def test_job_wizard_result_helper_falls_back_to_recent_job_output(tmp_path: Path):
+    import job_wizard as wizard
+
+    job_path = tmp_path / "job.yaml"
+    job_path.write_text("mode: preview\n", encoding="utf-8")
+    older = tmp_path / "older_chat.mp4"
+    newer = tmp_path / "newer_chat.mp4"
+    older.write_bytes(b"old")
+    newer.write_bytes(b"new")
+    newer.touch()
+
+    assert wizard._infer_output_from_job({}, job_path) == newer
+
+
+def test_job_wizard_optional_cleanup_only_targets_isolated_temp(tmp_path: Path, monkeypatch):
+    import job_wizard as wizard
+    import process_util
+
+    temp = tmp_path / "workdir" / "temp"
+    temp.mkdir(parents=True)
+    calls: list[object] = []
+    monkeypatch.setattr(wizard, "_prompt", lambda *_args, **_kwargs: "y")
+    monkeypatch.setattr(process_util, "is_dangerous_publish_path", lambda path: calls.append(path) or False)
+    monkeypatch.setattr(
+        process_util,
+        "clean_temp_artifacts",
+        lambda path, **kwargs: calls.append((path, kwargs)) or (2, 1024),
+    )
+
+    wizard._maybe_clean_temp_after_run({"workdir": str(temp.parent)}, {})
+    assert calls == [temp, (temp, {"clean_all": False, "clean_progress": False})]
+
+
 def test_probe_translate_api_covers_success_and_provider_failure(monkeypatch):
     import env_bootstrap as env
 

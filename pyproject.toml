@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "twitch-chat-translator-overlay"
-version = "0.2.3"
+version = "0.2.4.dev0"
 description = "Translate TwitchDownloader chat HTML and burn Chinese (or other language) overlays onto VOD videos."
 readme = "README.md"
 requires-python = ">=3.10"
