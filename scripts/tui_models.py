@@ -304,6 +304,25 @@ class TuiDownloadDraft:
     def segments(self) -> list[str]:
         return [item.strip() for item in self.segments_text.replace(";", "\n").splitlines() if item.strip()]
 
+    def requested_duration_s(self) -> float | None:
+        """Return the requested VOD-window duration when segments are valid.
+
+        TwitchDownloaderCLI may expand a short request to HLS segment boundaries,
+        so callers must treat this as the user's requested duration rather than
+        a promise about the downloaded file's duration.
+        """
+        if not self.segments():
+            return None
+        try:
+            from twitch_download import parse_segment_line
+
+            parsed = [parse_segment_line(item) for item in self.segments()]
+            if any(segment is None for segment in parsed):
+                return None
+            return sum(float(segment.end_s - segment.begin_s) for segment in parsed if segment is not None)
+        except Exception:
+            return None
+
     def validate(self) -> list[str]:
         problems: list[str] = []
         source_kind: str | None = None

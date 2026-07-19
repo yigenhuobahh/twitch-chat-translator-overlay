@@ -492,3 +492,41 @@ def test_textual_demo_records_manifest_artifacts(tmp_path: Path):
     import asyncio
 
     asyncio.run(exercise())
+
+
+def test_textual_download_surfaces_hls_boundary_expansion(tmp_path: Path, monkeypatch):
+    pytest.importorskip("textual")
+    from textual.widgets import TabbedContent
+
+    from tui_run import OverlayTui
+    import twitch_download
+
+    video = tmp_path / "video.mp4"
+    chat = tmp_path / "chat.html"
+    video.write_bytes(b"video")
+    chat.write_text("<html></html>", encoding="utf-8")
+    monkeypatch.setattr(twitch_download, "probe_media_duration", lambda _path: 20.0)
+
+    async def exercise() -> None:
+        app = OverlayTui()
+        app.history = TuiHistoryStore(tmp_path / "history.json")
+        async with app.run_test(size=(140, 45)):
+            app.query_one(TabbedContent).active = "download"
+            app.download_requested_duration_s = 8.0
+            app.session = type(
+                "Session",
+                (),
+                {
+                    "result": {"artifacts": [{"kind": "video", "path": str(video)}, {"kind": "chat_html", "path": str(chat)}]},
+                    "running": False,
+                },
+            )()
+            assert app._apply_download_result() is True
+            assert "实际下载视频为 20.0 秒" in app.download_duration_note
+            monkeypatch.setattr(twitch_download, "probe_media_duration", lambda _path: 9.0)
+            assert app._download_duration_note(str(video)) == ""
+            app.session = None
+
+    import asyncio
+
+    asyncio.run(exercise())

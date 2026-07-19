@@ -2,6 +2,21 @@
 
 Notable changes to this project are documented in this file.
 
+## [0.2.3] - 2026-07-19
+
+### Added
+
+- Added GitHub issue forms and a Windows batch-launcher smoke check so support reports and release-entry regressions are easier to catch.
+
+### Fixed
+
+- Removed OAuth query parameters and fragments from locally stored TUI download history, including safely rewriting compatible older history records.
+- Serialized concurrent TUI history updates so separately launched windows cannot silently discard one another's completed tasks.
+- Preserved incomplete trailing task-event records until their JSONL line is complete, preventing progress events from being lost during polling.
+- Prevented the TUI from reporting a task as successful when its expected result manifest or downloaded video/chat artifacts are missing.
+- Made Twitch HLS crop-boundary expansion visible in the TUI, so a short requested VOD window that downloads longer cannot silently consume extra translation time.
+- Ignored local package-build and release-verification directories so generated artifacts do not accidentally enter commits.
+
 ## [0.2.2] - 2026-07-18
 
 ### Changed
@@ -64,3 +79,5 @@ Notable changes to this project are documented in this file.
 
 [0.2.0]: https://github.com/yigenhuobahh/twitch-chat-translator-overlay/releases/tag/v0.2.0
 [0.2.1]: https://github.com/yigenhuobahh/twitch-chat-translator-overlay/releases/tag/v0.2.1
+[0.2.2]: https://github.com/yigenhuobahh/twitch-chat-translator-overlay/releases/tag/v0.2.2
+[0.2.3]: https://github.com/yigenhuobahh/twitch-chat-translator-overlay/releases/tag/v0.2.3

@@ -54,6 +54,8 @@ class OverlayTui(App[None]):
         self._handled_session: TaskSession | None = None
         self.current_task_kind = "render"
         self.require_result_manifest = False
+        self.download_requested_duration_s: float | None = None
+        self.download_duration_note = ""
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -61,7 +63,7 @@ class OverlayTui(App[None]):
         with TabbedContent(initial="new-task"):
             with TabPane("下载素材", id="download"):
                 with VerticalScroll():
-                    yield Static("下载使用已安装的 TwitchDownloaderCLI。VOD 为避免误下载整段内容，必须填写至少一个裁切段；Clip 本身可直接下载。多个 VOD 片段用分号分隔。完成后会自动填入新任务。", classes="hint")
+                    yield Static("下载使用已安装的 TwitchDownloaderCLI。VOD 为避免误下载整段内容，必须填写至少一个裁切段；Clip 本身可直接下载。多个 VOD 片段用分号分隔。短时间窗可能按 Twitch 的 HLS 分片边界扩展，完成后会提示实际时长。", classes="hint")
                     yield Input(placeholder="公开 Twitch VOD/Clip 链接或数字 ID", id="download-url")
                     yield Input(value="1080p60", placeholder="画质，例如 1080p60 / 720p60", id="download-quality")
                     yield Input(value="decode", placeholder="下载视频检查：decode / fast / off", id="download-media-check")
@@ -254,6 +256,8 @@ class OverlayTui(App[None]):
         if problems:
             self._set_status("无法开始下载：" + " ".join(problems))
             return
+        self.download_requested_duration_s = draft.requested_duration_s()
+        self.download_duration_note = ""
         self._start_command(
             "正在下载素材",
             draft.build_command(sys.executable, self._pipeline()),
@@ -413,7 +417,7 @@ class OverlayTui(App[None]):
                 elif self.current_task_kind == "download":
                     if self._apply_download_result():
                         self._apply_result_directory()
-                        self._set_status(self.completion_message)
+                        self._set_status(self.completion_message + self.download_duration_note)
                         self._finish_history("succeeded", returncode)
                         self.session.cleanup()
                     else:
@@ -493,8 +497,29 @@ class OverlayTui(App[None]):
         self._set_input("#chat", chat_html)
         self.imported_draft = None
         self.last_draft = TuiJobDraft(video=video, chat_html=chat_html, mode=MODE_ORIGINAL_PREVIEW)
+        self.download_duration_note = self._download_duration_note(video)
         self.query_one(TabbedContent).active = "new-task"
         return True
+
+    def _download_duration_note(self, video: str) -> str:
+        """Explain a material Twitch crop-boundary expansion without failing a valid download."""
+        expected = self.download_requested_duration_s
+        if expected is None or expected <= 0:
+            return ""
+        try:
+            from twitch_download import probe_media_duration
+
+            actual = probe_media_duration(Path(video))
+        except Exception:
+            return ""
+        # Allow normal muxing drift, but make a boundary-aligned expansion visible
+        # before a user spends time translating more video than they selected.
+        if abs(actual - expected) <= max(2.0, expected * 0.25):
+            return ""
+        return (
+            f" 请求时间窗约 {expected:.1f} 秒，实际下载视频为 {actual:.1f} 秒；"
+            "Twitch 短片段可能按 HLS 分片边界扩展，请在开始翻译前确认素材范围。"
+        )
 
     def _refresh_history(self) -> None:
         log = self.query_one("#history-log", RichLog)

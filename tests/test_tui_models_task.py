@@ -178,8 +178,10 @@ def test_download_draft_requires_bounded_segments_and_builds_multi_segment_comma
     assert command.count("--segment") == 2
     assert "1:00:20-1:00:28" in command
     assert "--media-check" in command and "decode" in command
+    assert draft.requested_duration_s() == 16.0
     assert TuiDownloadDraft(source="2819850140").validate()
     assert TuiDownloadDraft(source="https://clips.twitch.tv/ExampleClip").validate() == []
+    assert TuiDownloadDraft(source="https://clips.twitch.tv/ExampleClip").requested_duration_s() is None
     protected = TuiDownloadDraft(source="2819850140", segments_text="1:00:00-1:00:08", oauth="secret-token")
     assert "secret-token" in protected.build_command("python", "render_cn_chat.py")
     assert "oauth" not in protected.to_history_fields()
@@ -364,6 +366,7 @@ def test_textual_download_button_builds_existing_cli_command(monkeypatch):
         assert "--download-only" in command and command.count("--segment") == 2
         assert "secret-token" in command
         assert captured["kwargs"]["task_kind"] == "download"
+        assert app.download_requested_duration_s == 16.0
 
     import asyncio
 
