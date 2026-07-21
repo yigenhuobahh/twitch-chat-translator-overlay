@@ -92,6 +92,7 @@ class OverlayTui(App[None]):
                     yield RichLog(id="log", wrap=True, highlight=False, markup=False)
                     with Horizontal():
                         yield Button("环境检查", id="doctor")
+                        yield Button("生成 Issue 摘要", id="support-summary")
                         yield Button("离线演示", id="demo")
                         yield Button("取消任务", id="cancel", variant="warning")
                         yield Button("打开结果目录", id="open-result")
@@ -168,6 +169,8 @@ class OverlayTui(App[None]):
             self._save_job()
         elif action == "doctor":
             self._start_command("环境检查", [sys.executable, str(self._pipeline()), "--doctor"], completion_message="环境检查完成。")
+        elif action == "support-summary":
+            self._start_support_summary()
         elif action == "demo":
             self._start_command(
                 "离线演示",
@@ -378,6 +381,21 @@ class OverlayTui(App[None]):
         self._set_status(label)
         self._log("$ " + " ".join(redact_command(command)))
 
+    def _start_support_summary(self) -> None:
+        """Generate a reviewable doctor summary without requiring media or an API."""
+        report_directory = Path(__file__).resolve().parent.parent / "outputs" / "support-reports"
+        report_path = report_directory / f"issue-summary-{time.time_ns()}.txt"
+        self._start_command(
+            "生成 Issue 自检摘要",
+            [sys.executable, str(Path(__file__).with_name("support_report.py")), "--output", str(report_path)],
+            result_directory=report_directory,
+            completion_message=(
+                "Issue 自检摘要已生成。打开结果目录查看；提交前仍请自行检查并删除私人路径、聊天内容和凭据。"
+            ),
+            task_kind="support-summary",
+            require_result_manifest=True,
+        )
+
     def _poll_session(self) -> None:
         if not self.session:
             return
@@ -468,7 +486,7 @@ class OverlayTui(App[None]):
         artifacts = self.session.result.get("artifacts")
         if not isinstance(artifacts, list):
             return
-        preferred = ("video", "review_xlsx", "translation_json", "review_tsv", "preview_image")
+        preferred = ("video", "review_xlsx", "translation_json", "review_tsv", "preview_image", "support_summary")
         for kind in preferred:
             for artifact in artifacts:
                 if not isinstance(artifact, dict) or artifact.get("kind") != kind:
@@ -597,7 +615,7 @@ class OverlayTui(App[None]):
             self._set_status("该历史任务没有可打开的产物。")
             return
         first: dict = {}
-        for kind in ("video", "review_xlsx", "translation_json", "review_tsv", "preview_image"):
+        for kind in ("video", "review_xlsx", "translation_json", "review_tsv", "preview_image", "support_summary"):
             first = next(
                 (artifact for artifact in artifacts if isinstance(artifact, dict) and artifact.get("kind") == kind),
                 {},

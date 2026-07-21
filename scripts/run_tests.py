@@ -46,6 +46,7 @@ COMPILE_SCRIPTS = [
     "quick_demo.py",
     "run_meta.py",
     "run_tests.py",
+    "support_report.py",
     "task_events.py",
     "task_results.py",
     "tui_history.py",

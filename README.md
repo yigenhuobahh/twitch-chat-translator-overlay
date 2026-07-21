@@ -6,6 +6,8 @@
 
 发布记录：[`CHANGELOG.md`](https://github.com/yigenhuobahh/twitch-chat-translator-overlay/blob/main/CHANGELOG.md)
 
+维护者发布前请遵循 [`RELEASING.md`](RELEASING.md)；普通用户不需要执行其中步骤。
+
 需要帮助或发现问题？请使用 [GitHub Issue 模板](https://github.com/yigenhuobahh/twitch-chat-translator-overlay/issues/new/choose)；它会提示需要提供的信息并避免误贴凭据。
 
 > **输入**：一段录像视频 + TwitchDownloader 导出的聊天 HTML  
@@ -77,7 +79,7 @@ python scripts\render_cn_chat.py --job jobs\example_job.yaml
 - 「下载素材」页复用已安装的 TwitchDownloaderCLI，可下载公开 VOD 并按分号分隔的多个时间段合并，也可直接下载天然有界的公开 Clip；完成后会自动将视频和聊天 HTML 填入「新任务」。为避免误下载整段长 VOD，TUI 必须填写至少一个裁切段。Twitch 的 HLS 短片段可能在分片边界扩展，TUI 会在实际时长明显偏离请求时提示用户，避免在错误范围上开始翻译。订阅限定内容可在 TUI 的掩码 OAuth 字段中输入；它只传给本次下载，绝不写入日志、诊断、YAML、结果清单或历史记录。TUI 默认完整解码每个下载片段、合并结果和后续本地源视频；长视频会多花一次顺序读取时间，但可在翻译前发现坏片段。
 
 - `run.bat`：双击默认打开完整 TUI。输入本地视频和聊天 HTML 后，可直接选择原文预览、翻译预览、正式翻译渲染或复用已有翻译渲染。
-- 「任务与结果」页显示阶段进度和实时日志，可取消整个任务树；失败时可导出已脱敏的诊断文本，成功后可打开结果目录。翻译服务不可用时会明确停在「等待人工翻译」，并打开 JSON/XLSX/TSV 所在目录，不会把它误报为成片成功。
+- 「任务与结果」页显示阶段进度和实时日志，可取消整个任务树；「生成 Issue 摘要」会在不读取素材、不调用翻译 API 的情况下运行环境检查，并在 `outputs/support-reports/` 写入可审阅的摘要。失败时也可导出诊断文本，成功后可打开结果目录。翻译服务不可用时会明确停在「等待人工翻译」，并打开 JSON/XLSX/TSV 所在目录，不会把它误报为成片成功。
 - 「历史与产物」页会保留最近 100 个本机任务的终态与实际产物路径；上次异常关闭的任务会标为中断，可载入原配置重跑。历史不保存 API 凭据、命令行或翻译内容。
 - 「保存与导入」页支持将表单保存为可复现 YAML，或导入已有 YAML 后继续编辑。
 - `run_cli.bat`：高级和恢复入口，保留原菜单、下载素材和拖放视频/HTML 预览。`run.bat demo`、`run.bat doctor`、`run.bat <任务名>` 等带参数调用会自动转交此入口；以 `--` 开头的原始 pipeline 参数、或「视频 + HTML + 额外参数」会直接传给 pipeline，不会被拖放预览改写。
@@ -107,10 +109,11 @@ python scripts\render_cn_chat.py b.mp4 b.html --render-original --workdir work\b
 
 提交前请先做一次最小复现：运行「离线演示」或 10 秒「原文预览」。这能快速区分环境、素材和翻译服务问题。
 
-1. TUI 失败：在「任务与结果」或「历史与产物」选择失败任务，点击「导出诊断」；诊断已脱敏，但仍请自行确认没有私人路径、聊天内容、OAuth 或 API Key。
-2. 启动失败：运行 `run_cli.bat doctor`，复制其通过/失败项目；不要复制 `.env`。
-3. 打开 [Bug 报告模板](https://github.com/yigenhuobahh/twitch-chat-translator-overlay/issues/new/choose)，写明入口（TUI/CLI/下载）、系统与 Python 版本、可复现步骤、预期结果和实际结果。
-4. 私有 VOD、聊天 HTML、完整视频和凭据不需要上传。可使用文件类型、时长、分辨率和已脱敏的路径代替。
+1. TUI 或启动异常：在「任务与结果」点击「生成 Issue 摘要」。它不读取视频/聊天文件、不调用翻译 API，会在 `outputs/support-reports/` 生成环境检查摘要；上传前仍请自行确认没有私人信息。
+2. 任务失败：在「任务与结果」或「历史与产物」选择失败任务，点击「导出诊断」；诊断会移除常见凭据和命令行，但仍请自行确认没有私人路径、聊天内容、OAuth 或 API Key。
+3. 启动失败且 TUI 无法打开：运行 `run_cli.bat doctor`，复制其通过/失败项目；不要复制 `.env`。
+4. 打开 [Bug 报告模板](https://github.com/yigenhuobahh/twitch-chat-translator-overlay/issues/new/choose)，写明入口（TUI/CLI/下载）、系统与 Python 版本、可复现步骤、预期结果和实际结果。
+5. 私有 VOD、聊天 HTML、完整视频和凭据不需要上传。可使用文件类型、时长、分辨率和已脱敏的路径代替。
 
 对于“希望怎样更好用”的想法，请使用 [功能建议模板](https://github.com/yigenhuobahh/twitch-chat-translator-overlay/issues/new/choose)，优先描述使用场景和希望看到的结果。
 

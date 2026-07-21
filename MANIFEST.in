@@ -2,6 +2,7 @@
 include README.md
 include README.en.md
 include CHANGELOG.md
+include RELEASING.md
 include LICENSE
 include CONTRIBUTING.md
 include requirements.txt

@@ -7,6 +7,7 @@ Notable changes to this project are documented in this file.
 ### Changed
 
 - Started the next development cycle as `0.2.4.dev0` after the v0.2.3 release.
+- Added an opt-in TUI Issue summary that runs the existing environment check and writes a reviewable local report with credentials and common absolute paths removed.
 
 ## [0.2.3] - 2026-07-19
 

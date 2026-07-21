@@ -44,7 +44,7 @@ The demo writes its source files and final `demo_overlay.mp4` under `outputs/qui
 1. Run `install.bat`, then double-click `run.bat`; do not configure a translation API yet.
 2. In **Task and Results**, run **Offline demo**. It needs no API key and checks FFmpeg, fonts, and basic rendering.
 3. Add your video and Twitch chat HTML, then run **Original preview** before a full translation render.
-4. If something fails, export the diagnostic, review and redact paths or private content yourself, then use the [GitHub issue templates](https://github.com/yigenhuobahh/twitch-chat-translator-overlay/issues/new/choose). Never attach API keys, OAuth values, private chat HTML, or private videos.
+4. If something fails, use **Generate Issue Summary** in **Task and Results** first. It runs the environment check without reading media or calling a translation API, then writes a reviewable report under `outputs/support-reports/`. For a failed task, also export its diagnostic; review and redact paths or private content yourself before using the [GitHub issue templates](https://github.com/yigenhuobahh/twitch-chat-translator-overlay/issues/new/choose). Never attach API keys, OAuth values, private chat HTML, or private videos.
 
 ### Windows TUI and recovery CLI
 

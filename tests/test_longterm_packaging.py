@@ -26,6 +26,7 @@ SDIST_CONTRACT_FILES = {
     ".github/workflows/ci.yml",
     ".github/workflows/release.yml",
     "CHANGELOG.md",
+    "RELEASING.md",
     "pytest.ini",
     "run.bat",
     "run_cli.bat",
