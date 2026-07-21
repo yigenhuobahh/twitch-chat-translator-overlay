@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
+  - name: First-run guide and issue checklist
+    url: https://github.com/yigenhuobahh/twitch-chat-translator-overlay/blob/main/README.md#%E6%96%B0%E4%BA%BA%E6%8E%A8%E8%8D%90%E8%B7%AF%E7%BA%BF
+    about: Run the offline demo and a short original preview before reporting a problem.
   - name: TUI recovery guide
     url: https://github.com/yigenhuobahh/twitch-chat-translator-overlay/blob/main/README.md#%E6%95%85%E9%9A%9C%E6%81%A2%E5%A4%8Dtui
     about: Check the recovery guide before opening a report.

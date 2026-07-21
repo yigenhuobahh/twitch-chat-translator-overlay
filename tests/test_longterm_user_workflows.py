@@ -28,8 +28,17 @@ def test_public_issue_forms_protect_credentials_and_ci_exercises_windows_launche
     assert config["blank_issues_enabled"] is False
     diagnostic = next(field for field in bug["body"] if field.get("id") == "diagnostic")
     assert "OAuth" in diagnostic["attributes"]["description"]
+    fields = {field.get("id"): field for field in bug["body"] if field.get("id")}
+    assert {"doctor", "media", "screenshot"}.issubset(fields)
+    assert "never paste .env" in fields["doctor"]["attributes"]["description"]
     privacy = next(field for field in bug["body"] if field.get("id") == "privacy")
     assert privacy["attributes"]["options"][0]["required"] is True
+    assert any(link["name"] == "First-run guide and issue checklist" for link in config["contact_links"])
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "新人推荐路线" in readme
+    assert "反馈与提交 Issue" in readme
+    assert "离线演示" in readme
 
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "Smoke Windows batch launchers" in ci

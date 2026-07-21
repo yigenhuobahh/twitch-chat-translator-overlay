@@ -6,13 +6,15 @@
 
 发布记录：[`CHANGELOG.md`](https://github.com/yigenhuobahh/twitch-chat-translator-overlay/blob/main/CHANGELOG.md)
 
+需要帮助或发现问题？请使用 [GitHub Issue 模板](https://github.com/yigenhuobahh/twitch-chat-translator-overlay/issues/new/choose)；它会提示需要提供的信息并避免误贴凭据。
+
 > **输入**：一段录像视频 + TwitchDownloader 导出的聊天 HTML  
 > （可选）用本工具 `--download` / 菜单「下载素材并继续」调用 TwitchDownloaderCLI 自动获取  
 > **输出**：带中文翻译弹幕的 MP4 视频
 
 ## 极速上手（一键安装 / 一键运行）
 
-> 如果您没搞懂，可以把该readme下载或复制粘贴发给AI，如果发现确实是脚本问题，可以开issue或者pr
+> **第一次使用只做三件事：**安装后双击 `run.bat` → 在「任务与结果」运行「离线演示」→ 用自己的素材做一次「原文预览」。这三步均成功后，再开始正式翻译渲染。
 
 **Windows（推荐）**
 
@@ -27,6 +29,17 @@ install.bat
 #    可在「高级设置」调整布局、编码、规则和翻译并发
 
 ```
+
+### 新人推荐路线
+
+首次环境验证与预览通常约 5 分钟。
+
+1. 双击 `install.bat`，完成后双击 `run.bat`。不要先手动配置 API。
+2. 在 TUI 的「任务与结果」点击「离线演示」：它不消耗翻译额度，会检查 FFmpeg、字体和基础渲染，并生成 `outputs/quick_demo/demo_overlay.mp4`。
+3. 准备本地视频与 TwitchDownloader 导出的聊天 HTML；在「新任务」先点击「原文预览」。确认弹幕时间、位置和字体正确后，再点击「正式翻译渲染」。
+4. 没有本地素材时，可在「下载素材」填公开 VOD/Clip；VOD 必须填写一个或多个时间段，完成后会自动回填到「新任务」。
+
+如果任一步失败，先看下方「故障恢复（TUI）」；仍无法恢复时，导出脱敏诊断并按「反馈与提交 Issue」提交。
 
 **Linux / macOS**
 
@@ -89,6 +102,17 @@ python scripts\render_cn_chat.py b.mp4 b.html --render-original --workdir work\b
 底层引擎请勿对同一 `--out-dir` 加 `--no-job-dir` 并行。
 
 ---
+
+## 反馈与提交 Issue
+
+提交前请先做一次最小复现：运行「离线演示」或 10 秒「原文预览」。这能快速区分环境、素材和翻译服务问题。
+
+1. TUI 失败：在「任务与结果」或「历史与产物」选择失败任务，点击「导出诊断」；诊断已脱敏，但仍请自行确认没有私人路径、聊天内容、OAuth 或 API Key。
+2. 启动失败：运行 `run_cli.bat doctor`，复制其通过/失败项目；不要复制 `.env`。
+3. 打开 [Bug 报告模板](https://github.com/yigenhuobahh/twitch-chat-translator-overlay/issues/new/choose)，写明入口（TUI/CLI/下载）、系统与 Python 版本、可复现步骤、预期结果和实际结果。
+4. 私有 VOD、聊天 HTML、完整视频和凭据不需要上传。可使用文件类型、时长、分辨率和已脱敏的路径代替。
+
+对于“希望怎样更好用”的想法，请使用 [功能建议模板](https://github.com/yigenhuobahh/twitch-chat-translator-overlay/issues/new/choose)，优先描述使用场景和希望看到的结果。
 
 ## 这个工具解决什么问题
 

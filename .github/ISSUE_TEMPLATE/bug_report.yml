@@ -10,8 +10,8 @@ body:
     id: version
     attributes:
       label: Project version or commit
-      description: For example, v0.2.2 or the output of git log -1 --oneline.
-      placeholder: v0.2.2
+      description: Use a release tag (for example v0.2.3) or the output of git log -1 --oneline for a Git checkout.
+      placeholder: v0.2.3
     validations:
       required: true
   - type: dropdown
@@ -35,6 +35,18 @@ body:
       placeholder: Windows 11, Python 3.12
     validations:
       required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Environment check (recommended)
+      description: Run run_cli.bat doctor (Windows) or python scripts/render_cn_chat.py --doctor. Paste only the pass/fail summary; never paste .env or credentials.
+      render: text
+  - type: input
+    id: media
+    attributes:
+      label: Media summary (optional)
+      description: For video/chat/download/render issues, give a non-private summary such as MP4, 20 min, 1920x1080, VOD segment 1:00-1:10.
+      placeholder: MP4, 12:30, 1920x1080, original preview
   - type: textarea
     id: steps
     attributes:
@@ -60,10 +72,15 @@ body:
     validations:
       required: true
   - type: textarea
+    id: screenshot
+    attributes:
+      label: Screenshot or screen recording (optional)
+      description: Attach only redacted images. Do not show credentials, private paths, or private chat messages.
+  - type: textarea
     id: diagnostic
     attributes:
-      label: Redacted diagnostic (optional)
-      description: In TUI, use History and Artifacts > Export diagnostic. Do not paste API keys, OAuth tokens, environment files, commands containing credentials, or private chat content.
+      label: Diagnostic export (optional)
+      description: In TUI, use History and Artifacts > Export diagnostic, then review and redact paths or private content before sharing. Do not paste API keys, OAuth tokens, environment files, commands containing credentials, or private chat content.
       render: text
   - type: checkboxes
     id: privacy
