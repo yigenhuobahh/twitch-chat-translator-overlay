@@ -127,3 +127,22 @@ def test_tui_support_summary_starts_a_report_task(monkeypatch):
     root = Path(tui_run.__file__).resolve().parent.parent
     assert command[:2] == [sys.executable, str(root / "scripts" / "support_report.py")]
     assert command[-2:] == ["--output", str(root / "outputs" / "support-reports" / "issue-summary-123456.txt")]
+
+
+def test_tui_opens_the_structured_bug_template(monkeypatch):
+    pytest.importorskip("textual")
+    from tui_run import OverlayTui
+
+    opened: list[str] = []
+    monkeypatch.setattr("tui_run.webbrowser.open", lambda url: opened.append(url) or True)
+
+    async def exercise() -> None:
+        app = OverlayTui()
+        async with app.run_test():
+            app._open_issue_template()
+            assert app.ISSUE_TEMPLATE_URL == "https://github.com/yigenhuobahh/twitch-chat-translator-overlay/issues/new?template=bug_report.yml"
+            assert opened == ["https://github.com/yigenhuobahh/twitch-chat-translator-overlay/issues/new?template=bug_report.yml"]
+
+    import asyncio
+
+    asyncio.run(exercise())

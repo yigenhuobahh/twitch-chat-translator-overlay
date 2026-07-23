@@ -3,13 +3,19 @@
 """Fail-closed media health gates for download and render stages."""
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 import json
 import math
+import os
 from pathlib import Path
+import queue
 import subprocess
+import threading
+import time
 
 from common_utils import require_executable, safe_which
+from task_events import EVENT_FILE_ENV, emit_task_event
 
 _BENIGN_EXTRA_STREAMS = {"attachment", "data", "subtitle"}
 _AUDIO_PACKET_SAMPLE_SECONDS = 60.0
@@ -169,8 +175,122 @@ def probe_media_health(path: Path, *, require_audio: bool = True,
     return result
 
 
-def decode_check_media(path: Path) -> tuple[bool, str]:
+def _decode_check_with_progress(path: Path, *, duration: float) -> tuple[bool, str]:
+    """Decode through FFmpeg progress output when an interactive client opted in."""
+    try:
+        command = [
+            require_executable("ffmpeg"),
+            "-v",
+            "error",
+            "-xerror",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            "-i",
+            str(path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-f",
+            "null",
+            "-",
+        ]
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+    except OSError as exc:
+        return False, f"Full decode check failed: {exc}"
+
+    emit_task_event("stage_started", stage="media_decode", completed=0, total=100)
+    deadline = time.monotonic() + 24 * 3600
+    lines: queue.Queue[str | None] = queue.Queue(maxsize=256)
+    errors: deque[str] = deque(maxlen=20)
+    last_percent = -1
+
+    def read_output() -> None:
+        if process.stdout is None:
+            lines.put(None)
+            return
+        for output_line in iter(lambda: process.stdout.readline(8192), ""):
+            try:
+                lines.put_nowait(output_line)
+            except queue.Full:
+                try:
+                    lines.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    lines.put_nowait(output_line)
+                except queue.Full:
+                    pass
+        try:
+            lines.put_nowait(None)
+        except queue.Full:
+            pass
+
+    reader = threading.Thread(target=read_output, name="media-health-progress", daemon=True)
+    reader.start()
+    timed_out = False
+    output_finished = False
+    while True:
+        if time.monotonic() >= deadline:
+            timed_out = True
+            try:
+                process.kill()
+            except OSError:
+                pass
+            process.wait()
+            break
+        try:
+            line = lines.get(timeout=0.2)
+        except queue.Empty:
+            if process.poll() is not None and (output_finished or not reader.is_alive()):
+                break
+            continue
+        if line is None:
+            output_finished = True
+            if process.poll() is not None:
+                break
+            continue
+        text = line.strip()
+        if text.startswith("out_time_ms="):
+            try:
+                current_us = max(0.0, float(text.split("=", 1)[1]))
+            except ValueError:
+                continue
+            if duration > 0:
+                percent = min(99, max(0, int(current_us / 1_000_000 / duration * 100)))
+                if percent > last_percent:
+                    last_percent = percent
+                    emit_task_event("stage_progress", stage="media_decode", completed=percent, total=100)
+        elif text == "progress=end":
+            last_percent = 100
+            emit_task_event("stage_progress", stage="media_decode", completed=100, total=100)
+        elif text:
+            errors.append(text[-500:])
+    reader.join(timeout=1.0)
+    if timed_out:
+        emit_task_event("stage_failed", stage="media_decode", completed=max(0, last_percent), total=100)
+        return False, "Full decode check timed out"
+    returncode = process.wait()
+    if returncode == 0:
+        emit_task_event("stage_completed", stage="media_decode", completed=100, total=100)
+        return True, ""
+    emit_task_event("stage_failed", stage="media_decode", completed=max(0, last_percent), total=100)
+    return False, "\n".join(errors)[-700:]
+
+
+def decode_check_media(path: Path, *, duration: float = 0.0) -> tuple[bool, str]:
     """Full FFmpeg decode check; caller must choose this potentially slow mode."""
+    if os.environ.get(EVENT_FILE_ENV) and safe_which("ffmpeg"):
+        return _decode_check_with_progress(path, duration=duration)
     if not safe_which("ffmpeg"):
         return False, "未找到 ffmpeg，无法执行完整解码检查"
     try:
@@ -193,7 +313,7 @@ def validate_media_health(path: Path, *, mode: str = "fast", require_audio: bool
         health.issues = [x for x in health.issues if not x.startswith("含不支持的附加流:")]
         health.ok = not health.issues
     if health.ok and mode == "decode":
-        ok, reason = decode_check_media(path)
+        ok, reason = decode_check_media(path, duration=health.duration)
         if not ok:
             health.ok = False
             health.issues.append("完整解码失败" + (f": {reason}" if reason else ""))

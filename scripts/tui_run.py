@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 import time
+import webbrowser
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, VerticalScroll
@@ -41,6 +42,7 @@ class OverlayTui(App[None]):
     .hint { color: $text-muted; margin: 1 0; }
     """
     TITLE = "Twitch Chat Overlay"
+    ISSUE_TEMPLATE_URL = "https://github.com/yigenhuobahh/twitch-chat-translator-overlay/issues/new?template=bug_report.yml"
 
     def __init__(self) -> None:
         super().__init__()
@@ -93,6 +95,7 @@ class OverlayTui(App[None]):
                     with Horizontal():
                         yield Button("环境检查", id="doctor")
                         yield Button("生成 Issue 摘要", id="support-summary")
+                        yield Button("打开 Bug 模板", id="open-issue")
                         yield Button("离线演示", id="demo")
                         yield Button("取消任务", id="cancel", variant="warning")
                         yield Button("打开结果目录", id="open-result")
@@ -171,6 +174,8 @@ class OverlayTui(App[None]):
             self._start_command("环境检查", [sys.executable, str(self._pipeline()), "--doctor"], completion_message="环境检查完成。")
         elif action == "support-summary":
             self._start_support_summary()
+        elif action == "open-issue":
+            self._open_issue_template()
         elif action == "demo":
             self._start_command(
                 "离线演示",
@@ -395,6 +400,14 @@ class OverlayTui(App[None]):
             task_kind="support-summary",
             require_result_manifest=True,
         )
+
+    def _open_issue_template(self) -> None:
+        """Open the repository's structured Bug report form in the default browser."""
+        try:
+            opened = webbrowser.open(self.ISSUE_TEMPLATE_URL)
+        except webbrowser.Error:
+            opened = False
+        self._set_status("已打开 Bug 报告模板。" if opened else "无法自动打开浏览器，请使用 README 中的 Issue 链接。")
 
     def _poll_session(self) -> None:
         if not self.session:
