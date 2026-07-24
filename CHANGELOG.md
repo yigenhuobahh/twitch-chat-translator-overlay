@@ -4,6 +4,10 @@ Notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Started the next development cycle as `0.2.5.dev0` after the v0.2.4 release.
+
 ## [0.2.4] - 2026-07-24
 
 ### Changed
