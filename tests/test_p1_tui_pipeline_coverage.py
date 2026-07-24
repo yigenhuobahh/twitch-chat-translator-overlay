@@ -93,6 +93,66 @@ def test_textual_history_uses_manifest_for_artifacts_rerun_and_diagnostics(tmp_p
     assert "OPENAI_COMPAT_API_KEY" not in text
 
 
+def test_textual_history_rerun_starts_from_a_new_advanced_job_snapshot(tmp_path: Path, monkeypatch):
+    pytest.importorskip("textual")
+    from textual.widgets import Input
+
+    from tui_history import TuiHistoryStore
+    from tui_models import MODE_ORIGINAL_PREVIEW, TuiJobDraft
+    import tui_run
+    from tui_run import OverlayTui
+
+    video = tmp_path / "video.mp4"
+    chat = tmp_path / "chat.html"
+    video.write_bytes(b"video")
+    chat.write_text("<html></html>", encoding="utf-8")
+    draft = TuiJobDraft(
+        video=str(video),
+        chat_html=str(chat),
+        mode=MODE_ORIGINAL_PREVIEW,
+        extra_fields={"offset": 12.5, "max_visible": 7},
+    )
+    commands: list[list[str]] = []
+
+    class FakeSession:
+        def __init__(self, command: list[str], **_kwargs):
+            commands.append(command)
+            self.process = SimpleNamespace(pid=123)
+            self.running = False
+            self.returncode = None
+            self.dropped_output = 0
+
+        def start(self) -> None:
+            pass
+
+        def poll(self):
+            return [], []
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(tui_run, "TaskSession", FakeSession)
+    monkeypatch.setattr(TuiJobDraft, "validate", lambda *_args, **_kwargs: [])
+
+    async def exercise() -> None:
+        app = OverlayTui()
+        app.history = TuiHistoryStore(tmp_path / "history.json")
+        original = app.history.start(draft, label="advanced")
+        async with app.run_test():
+            app.query_one("#history-id", Input).value = original["id"]
+            app._rerun_history()
+            assert commands
+            command = commands[0]
+            snapshot = Path(command[command.index("--job") + 1])
+            assert snapshot.is_file() and snapshot != Path(original["job_path"])
+            text = snapshot.read_text(encoding="utf-8")
+            assert "offset: 12.5" in text and "max_visible: 7" in text
+
+    import asyncio
+
+    asyncio.run(exercise())
+
+
 def test_textual_download_result_populates_new_task_fields(tmp_path: Path):
     pytest.importorskip("textual")
     from textual.widgets import Input, TabbedContent
@@ -160,6 +220,38 @@ def test_textual_download_without_result_manifest_is_not_reported_as_success(tmp
             app._poll_session()
             assert app.history.get(record["id"])["state"] == "failed"
             assert "download reported complete" not in str(app.query_one("#status").render())
+
+    import asyncio
+
+    asyncio.run(exercise())
+
+
+def test_textual_oauth_download_history_rerun_waits_for_new_credential(tmp_path: Path, monkeypatch):
+    pytest.importorskip("textual")
+    from textual.widgets import Input, TabbedContent
+
+    from tui_history import TuiHistoryStore
+    from tui_models import TuiDownloadDraft
+    from tui_run import OverlayTui
+
+    async def exercise() -> None:
+        app = OverlayTui()
+        app.history = TuiHistoryStore(tmp_path / "history.json")
+        record = app.history.start(
+            TuiDownloadDraft(
+                source="2819850140",
+                segments_text="1:00:00-1:00:08",
+                oauth="private-token",
+            ),
+            label="protected download",
+        )
+        monkeypatch.setattr(app, "_start_download", lambda _draft=None: pytest.fail("must wait for OAuth"))
+        async with app.run_test():
+            app.query_one("#history-id", Input).value = record["id"]
+            app._rerun_history()
+            assert app.query_one(TabbedContent).active == "download"
+            assert app.query_one("#download-oauth", Input).value == ""
+            assert "OAuth" in str(app.query_one("#status").render())
 
     import asyncio
 

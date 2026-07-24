@@ -27,13 +27,27 @@ def test_support_summary_removes_credentials_and_common_private_paths(monkeypatc
             "cache: /home/alice/.cache/twitch\n"
             "[OK] 翻译 Base URL: https://user:password@internal.example/v1?api_key=query-secret\n"
             "OPENAI_COMPAT_BASE_URL=https://another-user:another-password@example.invalid/v1\n"
+            "AGNES_BASE_URL=https://legacy-user:legacy-password@example.invalid/v1\n"
+            "CLIENT_SECRET=client-secret-value\n"
+            "Authorization: Basic basic-secret-value\n"
         ),
         generated_at=datetime(2026, 7, 21, 10, 0, tzinfo=timezone.utc),
     )
 
     assert "0.2.4.dev0" in summary
     assert "doctor exit code: 1" in summary
-    assert all(secret not in summary for secret in ("secret-value", "password", "query-secret", "another-password"))
+    assert all(
+        secret not in summary
+        for secret in (
+            "secret-value",
+            "password",
+            "query-secret",
+            "another-password",
+            "legacy-password",
+            "client-secret-value",
+            "basic-secret-value",
+        )
+    )
     assert "Alice" not in summary and "alice" not in summary
     assert "[local path]" in summary
     assert "Before sharing" in summary

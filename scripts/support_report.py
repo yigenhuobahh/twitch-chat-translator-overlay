@@ -21,14 +21,8 @@ from tui_task import redact_text
 
 _WINDOWS_PATH = re.compile(r"(?i)(?:[a-z]:\\|\\\\)[^\r\n]+")
 _HOME_PATH = re.compile(r"(?<!https:)(?<!http:)(?<!file:)/(?:Users|home)/[^\s\r\n]+", re.IGNORECASE)
-_BASE_URL_VALUE = re.compile(
-    r"(?im)([^\r\n]*(?:OPENAI_COMPAT_BASE_URL|翻译 Base URL|Translation Base URL)\s*[:=]\s*)[^\r\n]*"
-)
-
-
 def redact_for_sharing(value: str) -> str:
     """Remove credentials and common private absolute-path forms from text."""
-    value = _BASE_URL_VALUE.sub(r"\1[redacted]", value)
     value = redact_text(value)
     value = _WINDOWS_PATH.sub("[local path]", value)
     return _HOME_PATH.sub("[local path]", value)

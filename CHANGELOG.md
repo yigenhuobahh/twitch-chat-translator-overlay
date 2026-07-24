@@ -10,6 +10,15 @@ Notable changes to this project are documented in this file.
 - Added an opt-in TUI Issue summary that runs the existing environment check and writes a reviewable local report with credentials and common absolute paths removed.
 - Added a direct Bug report button next to the TUI Issue summary and percentage progress events for long full-decode media checks.
 
+### Fixed
+
+- Prevented the TUI and pipeline from replacing the source video when the output path points to the same file.
+- Preserved imported YAML advanced fields and CLI-only modes in durable TUI history snapshots, so history reruns use the recorded configuration.
+- Required OAuth-protected download reruns to request a fresh credential instead of starting anonymously; the credential remains absent from history and diagnostics.
+- Extended diagnostic redaction to client secrets, Basic authorization values, legacy translation base URLs, and URL user information.
+- Kept the TUI full-decode media check as the default when imported YAML omits that setting.
+- Kept translate-only completion messages tied to the translation JSON even when reuse settings are present, instead of claiming that a video was rendered.
+
 ## [0.2.3] - 2026-07-19
 
 ### Added

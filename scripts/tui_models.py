@@ -21,7 +21,18 @@ MODE_ORIGINAL_PREVIEW = "original_preview"
 MODE_TRANSLATED_PREVIEW = "translated_preview"
 MODE_FULL_RENDER = "full_render"
 MODE_REUSE_RENDER = "reuse_render"
-MODES = (MODE_ORIGINAL_PREVIEW, MODE_TRANSLATED_PREVIEW, MODE_FULL_RENDER, MODE_REUSE_RENDER)
+MODE_TRANSLATE_ONLY = "translate_only"
+MODE_RENDER_ONLY = "render_only"
+MODE_AUTO = "auto"
+MODES = (
+    MODE_ORIGINAL_PREVIEW,
+    MODE_TRANSLATED_PREVIEW,
+    MODE_FULL_RENDER,
+    MODE_REUSE_RENDER,
+    MODE_TRANSLATE_ONLY,
+    MODE_RENDER_ONLY,
+    MODE_AUTO,
+)
 _FORM_FIELDS = {
     "video", "chat_html", "output", "translation_json", "mode", "render_original", "reuse_translation",
     "target_language", "layout_preset", "render_preset", "preview_clip", "profile", "rules", "encoder",
@@ -60,12 +71,21 @@ def sanitize_download_source_for_history(value: object) -> str:
 
 
 def _mode_from_fields(fields: dict[str, Any]) -> str:
+    mode = str(fields.get("mode", "")).lower()
+    if mode == "preview":
+        return MODE_ORIGINAL_PREVIEW if fields.get("render_original") else MODE_TRANSLATED_PREVIEW
+    if mode == "translate":
+        return MODE_TRANSLATE_ONLY
+    if mode == "render":
+        return MODE_REUSE_RENDER if fields.get("reuse_translation") else MODE_RENDER_ONLY
+    if mode == "full":
+        return MODE_FULL_RENDER
+    if mode == "auto":
+        return MODE_AUTO
     if fields.get("render_original"):
         return MODE_ORIGINAL_PREVIEW
     if fields.get("reuse_translation"):
         return MODE_REUSE_RENDER
-    if str(fields.get("mode", "")).lower() == "preview":
-        return MODE_TRANSLATED_PREVIEW
     return MODE_FULL_RENDER
 
 
@@ -95,6 +115,8 @@ class TuiJobDraft:
     keep_temp: bool = False
     review: bool = False
     manual_translation: bool = False
+    render_original: bool = False
+    reuse_translation: bool = False
     source_job: str = ""
     extra_fields: dict[str, Any] | None = None
 
@@ -132,10 +154,12 @@ class TuiJobDraft:
             encoder=text("encoder"),
             crf=text("crf"),
             workers=text("workers"),
-            source_media_check=text("source_media_check", "fast"),
+            source_media_check=text("source_media_check", "decode"),
             keep_temp=bool(fields.get("keep_temp", False)),
             review=bool(fields.get("review", False)),
             manual_translation=bool(fields.get("manual_translation", False)),
+            render_original=bool(fields.get("render_original", False)),
+            reuse_translation=bool(fields.get("reuse_translation", False)),
             source_job=source_job or text("_job_path"),
             extra_fields={
                 key: value
@@ -170,8 +194,18 @@ class TuiJobDraft:
             fields.update(mode="preview", preview_clip=self.preview_clip)
         elif self.mode == MODE_REUSE_RENDER:
             fields.update(mode="render", reuse_translation=True)
+        elif self.mode == MODE_TRANSLATE_ONLY:
+            fields.update(mode="translate")
+        elif self.mode == MODE_RENDER_ONLY:
+            fields.update(mode="render")
+        elif self.mode == MODE_AUTO:
+            fields.update(mode="auto")
         else:
             fields.update(mode="full")
+        if self.render_original:
+            fields["render_original"] = True
+        if self.reuse_translation:
+            fields["reuse_translation"] = True
         if self.encoder.strip():
             fields["encoder"] = self.encoder.strip()
         if self.crf.strip():
@@ -181,7 +215,18 @@ class TuiJobDraft:
         return {key: value for key, value in fields.items() if value not in (None, "")}
 
     def requires_translation(self) -> bool:
-        return not self.manual_translation and self.mode in (MODE_TRANSLATED_PREVIEW, MODE_FULL_RENDER)
+        return (
+            not self.manual_translation
+            and not self.render_original
+            and not self.reuse_translation
+            and self.mode != MODE_REUSE_RENDER
+            and self.mode in (
+                MODE_TRANSLATED_PREVIEW,
+                MODE_FULL_RENDER,
+                MODE_TRANSLATE_ONLY,
+                MODE_AUTO,
+            )
+        )
 
     def validate(self, *, check_api: bool = True, check_environment: bool = True) -> list[str]:
         """Return user-facing validation errors without changing files."""
@@ -216,8 +261,14 @@ class TuiJobDraft:
                 problems.append("输出路径不能是文件夹。")
             elif output.suffix.lower() not in {".mp4", ".mkv", ".mov"}:
                 problems.append("输出文件建议使用 .mp4、.mkv 或 .mov 后缀。")
-        if self.mode == MODE_REUSE_RENDER and not Path(_clean_path(self.translation_json)).expanduser().is_file():
+            elif self.video.strip() and output.resolve() == video.resolve():
+                problems.append("输出文件不能与源视频相同；请选择新的文件名，避免覆盖原片。")
+        if (self.mode == MODE_REUSE_RENDER or self.reuse_translation) and not Path(
+            _clean_path(self.translation_json)
+        ).expanduser().is_file():
             problems.append("复用翻译渲染需要选择已存在的翻译 JSON。")
+        if self.render_original and self.reuse_translation:
+            problems.append("原文渲染不能同时复用翻译；请只选择一种渲染来源。")
         if self.review and self.manual_translation:
             problems.append("请选择人工复核或手工翻译其中一种，不要同时启用。")
         if self.mode == MODE_ORIGINAL_PREVIEW and (self.profile.strip() or self.rules.strip() or self.review or self.manual_translation):
@@ -247,11 +298,18 @@ class TuiJobDraft:
             return ["输出文件已存在；pipeline 会保留备份并避免直接覆盖。"]
         return []
 
-    def build_command(self, python: str, pipeline: str | Path) -> list[str]:
+    def build_command(
+        self,
+        python: str,
+        pipeline: str | Path,
+        *,
+        job_path: str | Path | None = None,
+    ) -> list[str]:
         """Build a pipeline command from the canonical existing CLI options."""
         fields = self.to_job_fields()
         command = [python, str(pipeline)]
-        source_job = Path(self.source_job).expanduser() if self.source_job.strip() else None
+        source_value = str(job_path) if job_path is not None else self.source_job
+        source_job = Path(source_value).expanduser() if source_value.strip() else None
         if source_job and source_job.is_file():
             # Keep advanced fields from an imported YAML active.  Form fields
             # below remain explicit CLI overrides, so edits in the TUI win.
@@ -300,6 +358,7 @@ class TuiDownloadDraft:
     segments_text: str = ""
     media_check: str = "decode"
     oauth: str = ""
+    authentication_required: bool = False
 
     def segments(self) -> list[str]:
         return [item.strip() for item in self.segments_text.replace(";", "\n").splitlines() if item.strip()]
@@ -380,7 +439,7 @@ class TuiDownloadDraft:
             command.extend(["--segment", segment])
         return command
 
-    def to_history_fields(self) -> dict[str, str]:
+    def to_history_fields(self) -> dict[str, Any]:
         return {
             "_tui_task_type": "download",
             "download": sanitize_download_source_for_history(self.source),
@@ -388,6 +447,7 @@ class TuiDownloadDraft:
             "quality": self.quality.strip(),
             "segments": self.segments_text.strip(),
             "media_check": self.media_check.strip().lower() or "decode",
+            "authentication_required": bool(self.oauth.strip() or self.authentication_required),
         }
 
     @classmethod
@@ -400,4 +460,5 @@ class TuiDownloadDraft:
             quality=str(fields.get("quality") or "1080p60"),
             segments_text=str(fields.get("segments") or ""),
             media_check=str(fields.get("media_check") or "decode"),
+            authentication_required=bool(fields.get("authentication_required", False)),
         )

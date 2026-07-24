@@ -2450,6 +2450,11 @@ def _main():
         raise PipelineError(f"错误: 视频文件不存在: {video}\n  请确认路径正确，或用 TwitchDownloader 下载视频后重试。")
     if not chat_html.is_file():
         raise PipelineError(f"错误: 聊天 HTML 文件不存在: {chat_html}\n  请用 TwitchDownloader 导出聊天 HTML，确保选择 HTML 格式。")
+    explicit_output = Path(args.output).resolve() if args.output else None
+    if explicit_output == video:
+        raise PipelineError(
+            "错误: --output 不能与源视频指向同一文件；请选择新的输出文件名，避免覆盖原片。"
+        )
     if not burn.is_file():
         raise PipelineError(f"错误: 找不到核心脚本: {burn}\n  请确认从项目根目录运行，或检查 scripts/ 目录完整性。")
     if not translator.is_file() and not args.skip_translate and not args.reuse_translation and not args.manual_translation and not args.render_original:
@@ -2476,14 +2481,18 @@ def _main():
     review_tsv = Path(args.review_tsv).resolve() if args.review_tsv else wd(video.with_name(video.stem + "_translation_review.tsv"))
     review_xlsx = Path(args.review_xlsx).resolve() if args.review_xlsx else review_tsv.with_suffix(".xlsx")
     output_default = video.with_name(video.stem + "_chat.mp4")
-    if args.output:
-        final_output = Path(args.output).resolve()
+    if explicit_output is not None:
+        final_output = explicit_output
     elif workdir:
         final_output = workdir / (video.stem + "_chat.mp4")
     else:
         final_output = output_default
     if is_dangerous_publish_path(final_output) or is_dangerous_publish_path(final_output.parent):
         raise PipelineError(f"错误: --output 不能写到系统目录: {final_output}")
+    if final_output == video:
+        raise PipelineError(
+            "错误: --output 不能与源视频指向同一文件；请选择新的输出文件名，避免覆盖原片。"
+        )
 
     global _TASK_RESULT_CONTEXT
     _TASK_RESULT_CONTEXT = {

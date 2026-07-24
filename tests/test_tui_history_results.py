@@ -139,6 +139,36 @@ def test_history_migrates_download_url_query_credentials(tmp_path: Path):
     assert "secret-token" not in path.read_text(encoding="utf-8")
 
 
+def test_history_migrates_legacy_download_oauth_to_authentication_marker(tmp_path: Path):
+    path = tmp_path / "history.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "records": [
+                    {
+                        "id": "legacy-download",
+                        "state": "failed",
+                        "started_at": 1,
+                        "draft": {
+                            "_tui_task_type": "download",
+                            "download": "2819850140",
+                            "oauth": "secret-token",
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = TuiHistoryStore(path)
+    restored = store.download_for(store.list_records()[0])
+
+    assert restored is not None and restored.authentication_required is True
+    assert "secret-token" not in path.read_text(encoding="utf-8")
+
+
 def test_history_round_trips_download_draft(tmp_path: Path):
     store = TuiHistoryStore(tmp_path / "history.json")
     draft = TuiDownloadDraft(source="2819850140", quality="720p60", segments_text="1:00:00-1:00:08", oauth="secret-token")
@@ -148,7 +178,44 @@ def test_history_round_trips_download_draft(tmp_path: Path):
     assert restored.source == "2819850140"
     assert restored.segments() == ["1:00:00-1:00:08"]
     assert restored.oauth == ""
+    assert restored.authentication_required is True
     assert "secret-token" not in json.dumps(record)
+
+
+def test_history_job_snapshot_preserves_advanced_fields_for_rerun(tmp_path: Path):
+    store = TuiHistoryStore(tmp_path / "history.json")
+    draft = TuiJobDraft(
+        video="video.mp4",
+        chat_html="chat.html",
+        mode=MODE_ORIGINAL_PREVIEW,
+        extra_fields={"offset": 12.5, "overlay_codec": "qtrle", "max_visible": 7},
+    )
+
+    record = store.start(draft, label="advanced")
+    restored = store.draft_for(record)
+
+    assert restored is not None
+    assert restored.extra_fields == {"offset": 12.5, "overlay_codec": "qtrle", "max_visible": 7}
+    assert restored.source_job
+    snapshot = Path(restored.source_job)
+    assert snapshot.is_file()
+    command = restored.build_command("python", "render_cn_chat.py")
+    assert command[2:4] == ["--job", str(snapshot)]
+    snapshot_text = snapshot.read_text(encoding="utf-8")
+    assert "offset: 12.5" in snapshot_text
+    assert "overlay_codec: qtrle" in snapshot_text
+    assert "max_visible: 7" in snapshot_text
+
+
+def test_history_removes_job_snapshot_when_history_write_fails(tmp_path: Path, monkeypatch):
+    store = TuiHistoryStore(tmp_path / "history.json")
+    draft = TuiJobDraft(video="video.mp4", chat_html="chat.html", mode=MODE_ORIGINAL_PREVIEW)
+    monkeypatch.setattr(store, "_save", lambda _records: (_ for _ in ()).throw(OSError("disk full")))
+
+    with pytest.raises(OSError, match="disk full"):
+        store.start(draft, label="write failure")
+
+    assert not list((tmp_path / "jobs").glob("*.yaml"))
 
 
 def test_history_write_waits_for_another_instance_lock(tmp_path: Path):
@@ -199,21 +266,43 @@ def test_history_skips_malformed_records_and_handles_bad_draft(tmp_path: Path):
         ),
         encoding="utf-8",
     )
-    records = TuiHistoryStore(path).list_records()
+    store = TuiHistoryStore(path)
+    records = store.list_records()
     assert [record["id"] for record in records] == ["bad-draft"]
-    assert TuiHistoryStore.draft_for(records[0]) is None
+    assert store.draft_for(records[0]) is None
 
 
 def test_history_clear_removes_managed_artifacts(tmp_path: Path):
     store = TuiHistoryStore(tmp_path / "history.json")
     manifest = store.manifest_path("task")
     diagnostic = store.path.parent / "diagnostics" / "task.txt"
+    job = store.path.parent / "jobs" / "task.yaml"
     manifest.parent.mkdir(parents=True)
     diagnostic.parent.mkdir(parents=True)
+    job.parent.mkdir(parents=True)
     manifest.write_text("{}", encoding="utf-8")
     diagnostic.write_text("diagnostic", encoding="utf-8")
+    job.write_text("mode: preview", encoding="utf-8")
     store.clear()
-    assert not manifest.exists() and not diagnostic.exists()
+    assert not manifest.exists() and not diagnostic.exists() and not job.exists()
+
+
+def test_textual_history_write_failure_does_not_start_task(tmp_path: Path, monkeypatch):
+    pytest.importorskip("textual")
+    from tui_run import OverlayTui
+
+    async def exercise() -> None:
+        app = OverlayTui()
+        app.history = TuiHistoryStore(tmp_path / "history.json")
+        monkeypatch.setattr(app.history, "start", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")))
+        async with app.run_test():
+            app._start_command("probe", [sys.executable, "-c", "print('must not run')"])
+            assert app.session is None
+            assert "任务未启动" in str(app.query_one("#status").render())
+
+    import asyncio
+
+    asyncio.run(exercise())
 
 
 def test_history_limit_prunes_expired_managed_artifacts(tmp_path: Path):

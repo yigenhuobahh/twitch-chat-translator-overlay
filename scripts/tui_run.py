@@ -18,7 +18,9 @@ from tui_history import TuiHistoryStore
 from tui_models import (
     MODE_FULL_RENDER,
     MODE_ORIGINAL_PREVIEW,
+    MODE_RENDER_ONLY,
     MODE_REUSE_RENDER,
+    MODE_TRANSLATE_ONLY,
     MODE_TRANSLATED_PREVIEW,
     TuiDownloadDraft,
     TuiJobDraft,
@@ -217,12 +219,13 @@ class OverlayTui(App[None]):
             preview_clip = float(self._input("#preview-clip") or 10)
         except ValueError:
             preview_clip = 0
+        selected_mode = mode or (self.imported_draft.mode if self.imported_draft else MODE_ORIGINAL_PREVIEW)
         return TuiJobDraft(
             video=self._input("#video"),
             chat_html=self._input("#chat"),
             output=self._input("#output"),
             translation_json=self._input("#translation-json"),
-            mode=mode or (self.imported_draft.mode if self.imported_draft else MODE_ORIGINAL_PREVIEW),
+            mode=selected_mode,
             target_language=self._input("#target-language"),
             layout_preset=self._input("#layout-preset"),
             render_preset=self._input("#render-preset"),
@@ -236,6 +239,16 @@ class OverlayTui(App[None]):
             keep_temp=self.query_one("#keep-temp", Checkbox).value,
             review=self.query_one("#review", Checkbox).value,
             manual_translation=self.query_one("#manual-translation", Checkbox).value,
+            render_original=bool(
+                self.imported_draft
+                and selected_mode == self.imported_draft.mode
+                and self.imported_draft.render_original
+            ),
+            reuse_translation=bool(
+                self.imported_draft
+                and selected_mode == self.imported_draft.mode
+                and self.imported_draft.reuse_translation
+            ),
             source_job=self._input("#job-path"),
             extra_fields=dict(self.imported_draft.extra_fields or {}) if self.imported_draft else None,
         )
@@ -283,6 +296,7 @@ class OverlayTui(App[None]):
             "#preview-clip": str(draft.preview_clip), "#profile": draft.profile, "#rules": draft.rules,
             "#encoder": draft.encoder, "#crf": draft.crf, "#workers": draft.workers,
             "#source-media-check": draft.source_media_check,
+            "#job-path": draft.source_job,
         }
         for selector, value in values.items():
             self._set_input(selector, value)
@@ -331,8 +345,14 @@ class OverlayTui(App[None]):
             return review_directory, "翻译与人工复核文件已生成。可打开复核目录继续复核。"
         if draft.mode in (MODE_ORIGINAL_PREVIEW, MODE_TRANSLATED_PREVIEW):
             return directory.resolve(), "预览任务完成。可打开结果目录检查生成的预览文件。"
-        if draft.mode == MODE_REUSE_RENDER:
+        if draft.render_original and draft.mode != MODE_ORIGINAL_PREVIEW:
+            return directory.resolve(), "原文渲染完成。可打开结果目录查看成片。"
+        if draft.mode == MODE_TRANSLATE_ONLY:
+            return directory.resolve(), "翻译任务完成。可打开结果目录查看翻译 JSON。"
+        if draft.mode == MODE_REUSE_RENDER or draft.reuse_translation:
             return directory.resolve(), "复用翻译渲染完成。可打开结果目录查看成片。"
+        if draft.mode == MODE_RENDER_ONLY:
+            return directory.resolve(), "仅渲染任务完成。可打开结果目录查看成片。"
         return directory.resolve(), "正式翻译渲染完成。可打开结果目录查看成片。"
 
     @staticmethod
@@ -361,7 +381,19 @@ class OverlayTui(App[None]):
         if self.session and self.session.running:
             self._set_status("已有任务正在运行；请等待完成或先取消。")
             return
-        queued = self.history.start(draft, label=label)
+        try:
+            queued = self.history.start(draft, label=label)
+        except (OSError, ValueError) as exc:
+            self._set_status(f"无法保存本地任务历史，任务未启动：{type(exc).__name__}")
+            return
+        if (
+            isinstance(draft, TuiJobDraft)
+            and len(command) > 1
+            and Path(command[1]).resolve() == self._pipeline().resolve()
+        ):
+            snapshot = self.history.job_for(queued)
+            if snapshot is not None:
+                command = draft.build_command(sys.executable, self._pipeline(), job_path=snapshot)
         self.active_history_id = queued["id"]
         self._refresh_history()
         self.session = TaskSession(command, cwd=Path(__file__).resolve().parent.parent)
@@ -608,6 +640,10 @@ class OverlayTui(App[None]):
         download = self.history.download_for(record)
         if download is not None:
             self._apply_download_draft(download)
+            if download.authentication_required:
+                self.query_one(TabbedContent).active = "download"
+                self._set_status("该任务使用过 OAuth；凭据未保存。请重新输入 OAuth 后点击开始下载。")
+                return
             self._start_download(download)
             return
         draft = self.history.draft_for(record)

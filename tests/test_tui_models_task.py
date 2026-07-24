@@ -13,9 +13,12 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from tui_models import (
+    MODE_AUTO,
     MODE_FULL_RENDER,
     MODE_ORIGINAL_PREVIEW,
+    MODE_RENDER_ONLY,
     MODE_REUSE_RENDER,
+    MODE_TRANSLATE_ONLY,
     MODE_TRANSLATED_PREVIEW,
     TuiDownloadDraft,
     TuiJobDraft,
@@ -100,6 +103,83 @@ def test_imported_yaml_preserves_unexposed_advanced_fields(tmp_path: Path):
     assert str(chat) in command
 
 
+@pytest.mark.parametrize(
+    ("yaml_mode", "expected_mode"),
+    [("translate", MODE_TRANSLATE_ONLY), ("render", MODE_RENDER_ONLY)],
+)
+def test_imported_yaml_preserves_cli_only_modes_and_tui_media_default(
+    tmp_path: Path, yaml_mode: str, expected_mode: str
+):
+    video = tmp_path / "source.mp4"
+    chat = tmp_path / "chat.html"
+    video.write_text("x", encoding="utf-8")
+    chat.write_text("x", encoding="utf-8")
+    source = tmp_path / f"{yaml_mode}.yaml"
+    source.write_text(f"video: {video}\nchat_html: {chat}\nmode: {yaml_mode}\n", encoding="utf-8")
+
+    loaded = TuiJobDraft.from_job_file(source)
+
+    assert loaded.mode == expected_mode
+    assert loaded.to_job_fields()["mode"] == yaml_mode
+    assert loaded.source_media_check == "decode"
+
+
+@pytest.mark.parametrize("strategy", ["render_original", "reuse_translation"])
+def test_imported_render_mode_preserves_render_strategy(tmp_path: Path, strategy: str):
+    video = tmp_path / "source.mp4"
+    chat = tmp_path / "chat.html"
+    video.write_text("x", encoding="utf-8")
+    chat.write_text("x", encoding="utf-8")
+    source = tmp_path / f"render-{strategy}.yaml"
+    source.write_text(
+        f"video: {video}\nchat_html: {chat}\nmode: render\n{strategy}: true\n",
+        encoding="utf-8",
+    )
+
+    loaded = TuiJobDraft.from_job_file(source)
+    fields = loaded.to_job_fields()
+
+    assert fields["mode"] == "render"
+    assert fields[strategy] is True
+    if strategy == "render_original":
+        assert loaded.mode == MODE_RENDER_ONLY
+        assert loaded.render_original is True
+    else:
+        assert loaded.mode == MODE_REUSE_RENDER
+
+
+@pytest.mark.parametrize(
+    ("yaml_mode", "expected_mode"),
+    [("full", MODE_FULL_RENDER), ("auto", MODE_AUTO)],
+)
+@pytest.mark.parametrize("strategy", ["render_original", "reuse_translation"])
+def test_imported_full_modes_preserve_render_strategy(
+    tmp_path: Path,
+    yaml_mode: str,
+    expected_mode: str,
+    strategy: str,
+):
+    video = tmp_path / "source.mp4"
+    chat = tmp_path / "chat.html"
+    translation = tmp_path / "translation.json"
+    for path in (video, chat, translation):
+        path.write_text("x", encoding="utf-8")
+    source = tmp_path / f"{yaml_mode}-{strategy}.yaml"
+    source.write_text(
+        f"video: {video}\nchat_html: {chat}\ntranslation_json: {translation}\n"
+        f"mode: {yaml_mode}\n{strategy}: true\n",
+        encoding="utf-8",
+    )
+
+    loaded = TuiJobDraft.from_job_file(source)
+    fields = loaded.to_job_fields()
+
+    assert loaded.mode == expected_mode
+    assert fields["mode"] == yaml_mode
+    assert fields[strategy] is True
+    assert loaded.requires_translation() is False
+
+
 def test_imported_yaml_oauth_is_not_serialized_into_tui_fields_or_command(tmp_path: Path):
     video = tmp_path / "source.mp4"
     chat = tmp_path / "chat.html"
@@ -126,6 +206,9 @@ def test_event_format_and_redaction_are_safe():
         "oauth=secret-value",
         '"oauth": "secret-value"',
         "Authorization: OAuth secret-value",
+        "Authorization: Basic secret-value",
+        "CLIENT_SECRET=secret-value",
+        "client_secret=secret-value",
         "--oauth secret-value",
         "--oauth=secret-value",
         "OPENAI_COMPAT_API_KEY is missing",
@@ -137,6 +220,21 @@ def test_event_format_and_redaction_are_safe():
             assert "[redacted]" in redacted
         assert "OPENAI_COMPAT_API_KEY" not in redacted
         assert "AGNES_BASE_URL" not in redacted
+
+
+def test_output_cannot_replace_source_video(tmp_path: Path):
+    video = tmp_path / "source.mp4"
+    chat = tmp_path / "chat.html"
+    video.write_text("video", encoding="utf-8")
+    chat.write_text("chat", encoding="utf-8")
+    draft = TuiJobDraft(
+        video=str(video),
+        chat_html=str(chat),
+        output=str(video),
+        mode=MODE_ORIGINAL_PREVIEW,
+    )
+
+    assert draft.validate(check_api=False, check_environment=False)
 
 
 def test_manual_translation_and_legacy_api_do_not_fail_api_preflight(tmp_path: Path, monkeypatch):
@@ -238,8 +336,12 @@ def test_command_redaction_hides_oauth_before_ui_logging():
     ]
 
 
-def test_task_session_redacts_oauth_from_child_output(tmp_path: Path):
-    child = "print('--oauth secret-token'); print('Authorization: OAuth secret-token')"
+def test_task_session_redacts_oauth_and_url_credentials_from_child_output(tmp_path: Path):
+    child = (
+        "print('--oauth secret-token'); "
+        "print('Authorization: OAuth secret-token'); "
+        "print('request failed at https://alice:url-password@example.invalid/v1')"
+    )
     session = TaskSession([sys.executable, "-c", child], cwd=tmp_path)
     session.start()
     deadline = time.monotonic() + 10
@@ -251,6 +353,7 @@ def test_task_session_redacts_oauth_from_child_output(tmp_path: Path):
 
     assert session.returncode == 0
     assert "secret-token" not in "\n".join(lines)
+    assert "url-password" not in "\n".join(lines)
     assert "[redacted]" in "\n".join(lines)
     session.cleanup()
 
@@ -275,6 +378,8 @@ def test_diagnostic_exports_omit_commands_and_environment_variable_names(tmp_pat
         "$ python render.py --oauth [redacted] --output private.mp4",
         "missing OPENAI_COMPAT_API_KEY",
         "Authorization: Bearer secret-token",
+        "AGNES_BASE_URL=https://alice:url-password@example.invalid/v1",
+        "request failed at https://bob:other-password@example.invalid/v1",
     ))
     diagnostic = session.export_diagnostics(tmp_path / "diagnostic.txt")
     text = diagnostic.read_text(encoding="utf-8")
@@ -283,16 +388,23 @@ def test_diagnostic_exports_omit_commands_and_environment_variable_names(tmp_pat
     assert "private.mp4" not in text
     assert "OPENAI_COMPAT_API_KEY" not in text
     assert "secret-token" not in text
+    assert "url-password" not in text and "other-password" not in text
     assert "[command omitted for privacy]" in text
     assert "[environment variable]" in text
 
     legacy = tmp_path / "legacy.txt"
-    legacy.write_text("$ python render.py --output private.mp4\nAGNES_API_KEY missing\n", encoding="utf-8")
+    legacy.write_text(
+        "$ python render.py --output private.mp4\n"
+        "AGNES_API_KEY missing\n"
+        "AGNES_BASE_URL=https://legacy:legacy-password@example.invalid/v1\n",
+        encoding="utf-8",
+    )
     sanitize_diagnostic_file(legacy)
     migrated = legacy.read_text(encoding="utf-8")
     assert "$ python" not in migrated
     assert "private.mp4" not in migrated
     assert "AGNES_API_KEY" not in migrated
+    assert "legacy-password" not in migrated
 
 
 def test_task_session_start_failure_cleans_transient_files(tmp_path: Path):
@@ -428,6 +540,13 @@ def test_tui_result_context_is_specific_to_task_mode(tmp_path: Path):
     )
     assert manual_directory == tmp_path
     assert "复核目录" in manual_message
+
+    translate_directory, translate_message = OverlayTui._result_context(
+        TuiJobDraft(video=str(video), chat_html=str(chat), mode=MODE_TRANSLATE_ONLY, reuse_translation=True)
+    )
+    assert translate_directory == tmp_path
+    assert "翻译任务完成" in translate_message
+    assert "成片" not in translate_message
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows launcher behavior")

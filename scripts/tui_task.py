@@ -19,24 +19,32 @@ from process_util import kill_process_tree
 from task_results import read_task_result
 
 EVENT_DIRECTORY = Path("outputs") / ".tui-events"
-_BEARER_SECRET = re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+")
+_BASE_URL_VALUE = re.compile(
+    r"(?im)([^\r\n]*(?:(?:OPENAI_COMPAT|AGNES)_BASE_URL|翻译 Base URL|Translation Base URL)\s*[:=]\s*)[^\r\n]*"
+)
+_URL_USERINFO = re.compile(r"(?i)(https?://)[^\s/@:]+:[^\s/@]+@")
+_AUTHORIZATION_SECRET = re.compile(
+    r"(?i)(authorization\s*[:=]\s*(?:bearer|oauth|basic)\s+)[^\s,;]+"
+)
 _NAMED_SECRET = re.compile(
-    r"(?i)((?:api[_ -]?key|token|password|oauth)\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+    r"(?i)((?:api[_ -]?key|token|password|oauth|(?:client[_ -]?)?secret)\s*[:=]\s*)"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 )
 _JSON_SECRET = re.compile(
-    r"(?i)(\"(?:api[_ -]?key|token|password|oauth)\"\s*:\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)"
+    r"(?i)(\"(?:api[_ -]?key|token|password|oauth|(?:client[_ -]?)?secret)\"\s*:\s*)"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)"
 )
 _OAUTH_ARGUMENT = re.compile(r"(?i)(--oauth(?:\s+|=))(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)")
-_OAUTH_AUTHORIZATION = re.compile(r"(?i)(authorization\s*[:=]\s*oauth\s+)[^\s,;]+")
 _ENVIRONMENT_VARIABLE = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b")
 _SECRET_ARGUMENT_FLAGS = {"--oauth"}
 
 
 def redact_text(value: str) -> str:
     """Remove common secret-shaped log fragments before they reach UI/export."""
+    value = _BASE_URL_VALUE.sub(r"\1[redacted]", value)
+    value = _URL_USERINFO.sub(r"\1[redacted]@", value)
     value = _OAUTH_ARGUMENT.sub(r"\1[redacted]", value)
-    value = _OAUTH_AUTHORIZATION.sub(r"\1[redacted]", value)
-    value = _BEARER_SECRET.sub(r"\1[redacted]", value)
+    value = _AUTHORIZATION_SECRET.sub(r"\1[redacted]", value)
     value = _JSON_SECRET.sub(r"\1\"[redacted]\"", value)
     value = _NAMED_SECRET.sub(r"\1[redacted]", value)
     return _ENVIRONMENT_VARIABLE.sub("[environment variable]", value)

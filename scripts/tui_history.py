@@ -118,7 +118,12 @@ class TuiHistoryStore:
             elif isinstance(draft, dict):
                 # Sanitize records written by older builds before OAuth was
                 # treated as sensitive and migrate them on the next read.
+                authenticated_download = draft.get("_tui_task_type") == "download" and any(
+                    _is_sensitive_key(key) and bool(value) for key, value in draft.items()
+                )
                 safe_draft = _safe_value(draft)
+                if authenticated_download:
+                    safe_draft["authentication_required"] = True
                 if safe_draft != draft:
                     sanitized_legacy_record = True
                 record["draft"] = safe_draft
@@ -145,7 +150,7 @@ class TuiHistoryStore:
     def _prune_artifacts(self, active_ids: set[str]) -> None:
         """Keep managed manifests/diagnostics aligned with the record limit."""
         root = self.path.parent.resolve()
-        for name, suffix in (("manifests", ".json"), ("diagnostics", ".txt")):
+        for name, suffix in (("manifests", ".json"), ("diagnostics", ".txt"), ("jobs", ".yaml")):
             directory = root / name
             if not directory.is_dir() or directory.resolve().parent != root:
                 continue
@@ -197,8 +202,24 @@ class TuiHistoryStore:
                 "result_path": None,
                 "diagnostic_path": None,
             }
-            records.append(record)
-            self._save(records)
+            snapshot: Path | None = None
+            try:
+                if isinstance(draft, TuiJobDraft):
+                    snapshot = draft.save_job(
+                        self.job_path(record["id"]),
+                        pin_paths=True,
+                        overwrite=True,
+                    )
+                    record["job_path"] = str(snapshot)
+                records.append(record)
+                self._save(records)
+            except (OSError, TypeError, ValueError):
+                if snapshot is not None:
+                    try:
+                        snapshot.unlink()
+                    except OSError:
+                        pass
+                raise
             return record
 
     def mark_running(self, record_id: str, *, pid: int | None, result_path: str | Path | None) -> None:
@@ -215,6 +236,19 @@ class TuiHistoryStore:
 
     def manifest_path(self, record_id: str) -> Path:
         return self.path.parent / "manifests" / f"{record_id}.json"
+
+    def job_path(self, record_id: str) -> Path:
+        return self.path.parent / "jobs" / f"{record_id}.yaml"
+
+    def job_for(self, record: dict[str, Any]) -> Path | None:
+        raw_path = record.get("job_path")
+        if not isinstance(raw_path, str) or not raw_path:
+            return None
+        root = (self.path.parent / "jobs").resolve()
+        candidate = Path(raw_path).resolve()
+        if candidate.parent != root or candidate.suffix.lower() != ".yaml":
+            return None
+        return candidate if candidate.is_file() else None
 
     def result_for(self, record: dict[str, Any]) -> dict[str, Any] | None:
         raw_path = record.get("result_path")
@@ -256,18 +290,18 @@ class TuiHistoryStore:
         with self._history_lock():
             self._save([])
             root = self.path.parent.resolve()
-            for name in ("manifests", "diagnostics"):
+            for name in ("manifests", "diagnostics", "jobs"):
                 managed = (root / name).resolve()
                 if managed.parent == root:
                     shutil.rmtree(managed, ignore_errors=True)
 
-    @staticmethod
-    def draft_for(record: dict[str, Any]) -> TuiJobDraft | None:
+    def draft_for(self, record: dict[str, Any]) -> TuiJobDraft | None:
         draft = record.get("draft")
         if not isinstance(draft, dict):
             return None
         try:
-            return TuiJobDraft.from_fields(draft)
+            snapshot = self.job_for(record)
+            return TuiJobDraft.from_fields(draft, source_job=str(snapshot) if snapshot else "")
         except (TypeError, ValueError):
             return None
 

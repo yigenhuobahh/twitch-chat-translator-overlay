@@ -350,6 +350,33 @@ def test_publish_output_respects_backup_prev(tmp_path: Path):
     assert (tmp_path / "out.mp4.bak").is_file()
 
 
+def test_pipeline_rejects_output_that_replaces_source_video(tmp_path: Path, monkeypatch):
+    import render_cn_chat as pipe
+
+    monkeypatch.setattr(pipe, "DRY_RUN", False)
+    video = tmp_path / "source.mp4"
+    chat = tmp_path / "chat.html"
+    video.write_bytes(b"video")
+    chat.write_text("<html></html>", encoding="utf-8")
+    monkeypatch.setattr(pipe, "validate_source_media", lambda *_args, **_kwargs: pytest.fail("must reject before media check"))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "render_cn_chat.py",
+            str(video),
+            str(chat),
+            "--output",
+            str(video),
+            "--render-original",
+            "--yes",
+        ],
+    )
+
+    with pytest.raises(pipe.PipelineError, match="output"):
+        pipe._main()
+
+
 def test_resume_ignores_json_when_progress_lang_incompatible():
     """Mirror product seed rules: lang/context wipe must not trust filled JSON."""
     progress_compatible = False
