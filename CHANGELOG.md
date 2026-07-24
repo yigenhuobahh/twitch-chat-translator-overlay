@@ -4,9 +4,10 @@ Notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-07-24
+
 ### Changed
 
-- Started the next development cycle as `0.2.4.dev0` after the v0.2.3 release.
 - Added an opt-in TUI Issue summary that runs the existing environment check and writes a reviewable local report with credentials and common absolute paths removed.
 - Added a direct Bug report button next to the TUI Issue summary and percentage progress events for long full-decode media checks.
 
@@ -98,3 +99,4 @@ Notable changes to this project are documented in this file.
 [0.2.1]: https://github.com/yigenhuobahh/twitch-chat-translator-overlay/releases/tag/v0.2.1
 [0.2.2]: https://github.com/yigenhuobahh/twitch-chat-translator-overlay/releases/tag/v0.2.2
 [0.2.3]: https://github.com/yigenhuobahh/twitch-chat-translator-overlay/releases/tag/v0.2.3
+[0.2.4]: https://github.com/yigenhuobahh/twitch-chat-translator-overlay/releases/tag/v0.2.4
