@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 import os
 from pathlib import Path, PurePosixPath
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -449,15 +450,21 @@ def translate_api_config_ok(cfg: dict[str, str | None] | None = None) -> bool:
     return bool(cfg.get("base_url") and cfg.get("api_key") and cfg.get("model"))
 
 
-def probe_translate_api(*, timeout: float = 12.0) -> tuple[bool, str]:
+def probe_translate_api(
+    *,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
+    timeout: float = 12.0,
+) -> tuple[bool, str]:
     """Lightweight connectivity/auth check for the translation API.
 
     Returns (ok, message). Does not translate chat content.
     """
     cfg = get_translate_api_config()
-    base = (cfg.get("base_url") or "").strip()
-    key = (cfg.get("api_key") or "").strip()
-    model = (cfg.get("model") or "").strip()
+    base = (base_url if base_url is not None else (cfg.get("base_url") or "")).strip()
+    key = (api_key if api_key is not None else (cfg.get("api_key") or "")).strip()
+    model = (model if model is not None else (cfg.get("model") or "")).strip()
     missing = []
     if not base:
         missing.append("OPENAI_COMPAT_BASE_URL")
@@ -487,6 +494,96 @@ def probe_translate_api(*, timeout: float = 12.0) -> tuple[bool, str]:
         if len(err) > 240:
             err = err[:240] + "…"
         return False, f"API 不可用: {err}"
+
+
+def save_dotenv_api_config(
+    base_url: str,
+    api_key: str,
+    model: str,
+    env_path: Path | str | None = None,
+) -> tuple[bool, str]:
+    """Safely updates or creates .env with API config, preserving comments and other variables.
+
+    Synchronizes os.environ with the new values.
+    Returns (True, "保存成功") or (False, error_message).
+    """
+    try:
+        if env_path is not None:
+            target = Path(env_path)
+        else:
+            cwd_env = Path.cwd() / ".env"
+            repo_env = _repo_root() / ".env"
+            if cwd_env.is_file():
+                target = cwd_env
+            elif repo_env.is_file():
+                target = repo_env
+            else:
+                target = cwd_env
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        lines: list[str] = []
+        if target.is_file():
+            try:
+                lines = target.read_text(encoding="utf-8").splitlines()
+            except Exception:
+                lines = target.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+
+        updates = {
+            "OPENAI_COMPAT_BASE_URL": str(base_url).strip(),
+            "OPENAI_COMPAT_API_KEY": str(api_key).strip(),
+            "OPENAI_COMPAT_MODEL": str(model).strip(),
+        }
+
+        handled: set[str] = set()
+        new_lines: list[str] = []
+
+        for line in lines:
+            matched_key: str | None = None
+            for key in updates:
+                if re.match(rf"^\s*#?\s*{re.escape(key)}\s*[:=]", line):
+                    matched_key = key
+                    break
+
+            if matched_key:
+                if matched_key not in handled:
+                    new_lines.append(f"{matched_key}={updates[matched_key]}")
+                    handled.add(matched_key)
+                else:
+                    # Duplicate occurrence, omit
+                    pass
+            else:
+                new_lines.append(line)
+
+        for key, value in updates.items():
+            if key not in handled:
+                new_lines.append(f"{key}={value}")
+
+        output_text = "\n".join(new_lines) + "\n"
+
+        # Atomic write
+        temp_target = target.with_name(f".{target.name}.tmp-{uuid.uuid4().hex}")
+        temp_target.write_text(output_text, encoding="utf-8")
+        temp_target.replace(target)
+
+        # Synchronize os.environ
+        for key, value in updates.items():
+            if value:
+                os.environ[key] = value
+            else:
+                os.environ.pop(key, None)
+
+        try:
+            from common_utils import _DOTENV_LOADED_KEYS
+
+            for key in updates:
+                _DOTENV_LOADED_KEYS.add(key)
+        except Exception:
+            pass
+
+        return True, "保存成功"
+    except Exception as exc:
+        return False, f"保存 .env 失败: {exc}"
 
 
 def readiness_levels(items: list[CheckItem]) -> tuple[bool, bool]:

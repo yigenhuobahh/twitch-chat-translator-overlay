@@ -82,7 +82,12 @@ if errorlevel 1 (
   exit /b 1
 )
 if exist "requirements.txt" (
-  "%PY%" -m pip install -r requirements.txt
+  if exist "constraints-windows.txt" (
+    echo      Using tested Windows dependency constraints ...
+    "%PY%" -m pip install -r requirements.txt -c constraints-windows.txt
+  ) else (
+    "%PY%" -m pip install -r requirements.txt
+  )
 ) else (
   "%PY%" -m pip install -e .
 )

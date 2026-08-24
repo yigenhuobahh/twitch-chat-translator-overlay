@@ -3,10 +3,10 @@
 # 命令行参数（如 --crf 16）会覆盖这里的值。
 name: render_default
 label: "Default encode"
-description: "x264 CRF18 + VP9 overlay; static/blank reuse on."
+description: "Auto hardware acceleration (NVENC/AMF/QSV -> x264 fallback) CRF18 + VP9 overlay; static/blank reuse on."
 
 render:
-  encoder: x264          # 编码器：x264 / nvenc / qsv / amf / auto
+  encoder: auto          # 编码器：auto（优先显卡加速 NVENC/AMF/QSV，无显卡自动回退 x264）
   video_preset: fast     # x264 预设：ultrafast(最快) ~ veryslow(最慢最好)
   crf: 18                # 质量：越小越好，18 是甜点，16 更高质量
   audio_codec: aac       # 音频编码：aac（重编码）或 copy（直接拷贝）

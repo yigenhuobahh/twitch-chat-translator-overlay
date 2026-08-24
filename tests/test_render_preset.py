@@ -21,10 +21,27 @@ from render_preset import (  # noqa: E402
 
 def test_load_public_render_fast_preset():
     preset = load_render_preset(ROOT / "profiles" / "render_fast.yaml")
-    assert preset["encoder"] == "x264"
+    assert preset["encoder"] == "auto"
     assert preset["overlay_codec"] == "png"
     assert preset["crf"] == 23
     assert preset["lazy_message_images"] is True
+
+
+def test_load_all_public_render_presets():
+    for name in ("render_default", "render_fast", "render_hq", "render_audio_copy"):
+        p = load_render_preset(ROOT / "profiles" / f"{name}.yaml")
+        assert p["encoder"] == "auto"
+    audio_copy = load_render_preset(ROOT / "profiles" / "render_audio_copy.yaml")
+    assert audio_copy["audio_codec"] == "copy"
+
+
+def test_load_all_public_layout_presets():
+    from layout_preset import load_layout_preset
+
+    for name in ("layout_default", "layout_right", "layout_compact", "layout_mobile", "layout_transparent", "layout_sidebar", "layout_top_right"):
+        p = load_layout_preset(ROOT / "profiles" / f"{name}.yaml")
+        assert "width" in p and "height" in p
+        assert p["width"] > 0 and p["height"] > 0
 
 
 def test_apply_only_defaults_cli_wins():

@@ -38,14 +38,21 @@ _local_archive/
 # Local profiles may contain channel/game-specific terminology.
 profiles/*.yaml
 !profiles/default.yaml
+!profiles/gaming_slang.yaml
+!profiles/acg_anime.yaml
 # Public render layout presets (geometry only, no channel glossary).
 !profiles/layout_default.yaml
+!profiles/layout_right.yaml
 !profiles/layout_compact.yaml
 !profiles/layout_mobile.yaml
+!profiles/layout_transparent.yaml
+!profiles/layout_sidebar.yaml
+!profiles/layout_top_right.yaml
 # Public encode/perf presets (no channel glossary).
 !profiles/render_default.yaml
 !profiles/render_fast.yaml
 !profiles/render_hq.yaml
+!profiles/render_audio_copy.yaml
 
 # Local sample/review data may contain usernames, chat logs, or copyrighted media.
 samples/*.mp4
@@ -62,7 +69,10 @@ samples/emotes/
 ROADMAP.md
 HANDOVER.md
 CLAUDE.md
+PROJECT.md
 .claude/
+.agents/
+*.lock
 scripts/twitch_chat_translator_overlay.egg-info/
 samples/overlay_frames/
 !samples/example.*

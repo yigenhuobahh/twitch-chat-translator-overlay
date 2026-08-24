@@ -116,6 +116,13 @@ from encode_options import (
 )
 from layout_preset import apply_layout_preset_to_namespace, load_layout_preset
 from overlay_config import OverlayConfig
+import overlay_scene as _overlay_scene
+from overlay_scene import (
+    OverlayScenePlan,
+    frame_index_range,
+    line_height_px,
+    resolve_lane_budget,
+)
 from process_util import (
     clean_companion_flags_error,
     clean_temp_artifacts,
@@ -137,6 +144,13 @@ from render_perf import (
 from render_preset import apply_render_preset_to_namespace, load_render_preset
 from run_meta import mark_run_status, write_run_meta
 from translation_support import clean_translation_text as clean_imported_translation
+
+# Compatibility exports for existing scripts and tests.  Scene planning owns
+# their definitions, while this module remains the established render facade.
+AUTO_LAZY_MESSAGE_THRESHOLD = _overlay_scene.AUTO_LAZY_MESSAGE_THRESHOLD
+compute_lane_capacity = _overlay_scene.compute_lane_capacity
+expected_overlay_frame_count = _overlay_scene.expected_overlay_frame_count
+resolve_message_image_cache_policy = _overlay_scene.resolve_message_image_cache_policy
 
 # ============================================================
 # 中文换行辅助函数
@@ -444,31 +458,6 @@ def layout_message_lines(
     return lines, header, num_lines
 
 
-def expected_overlay_frame_count(duration, fps):
-    """How many overlay frames cover [0, duration) at the given fps.
-
-    Samples at t = i/fps for i = 0..n-1 with t < duration, so
-    n = ceil(duration * fps - eps). Must match compose_video's expected count
-    (previously floor here vs ceil there broke fractional VOD durations).
-    """
-    if duration <= 0 or fps <= 0:
-        return 1
-    return max(1, int(math.ceil(float(duration) * float(fps) - 1e-9)))
-
-
-def frame_index_range(start_t, end_t, fps, total_frames):
-    """Map a half-open time range [start_t, end_t) onto global frame indexes."""
-    if total_frames <= 0 or fps <= 0:
-        return 0, 0
-    start_i = int(math.ceil(float(start_t) * float(fps) - 1e-12))
-    end_i = int(math.ceil(float(end_t) * float(fps) - 1e-12))
-    start_i = max(0, min(total_frames, start_i))
-    end_i = max(0, min(total_frames, end_i))
-    if end_i < start_i:
-        end_i = start_i
-    return start_i, end_i
-
-
 def probe_video_duration(video_path):
     """Read media duration via ffprobe. Returns float seconds or raises RuntimeError."""
     try:
@@ -739,51 +728,6 @@ def resolve_output_fps(video_path, explicit=None, fallback=30):
     if probed is not None:
         return _quantize_fps(probed)
     return _quantize_fps(fallback)
-
-
-def line_height_px(font_size: int) -> int:
-    """Single-line pitch used by capacity math and render_overlay (font_size + 14)."""
-    return max(1, int(font_size) + 14)
-
-
-def compute_lane_capacity(height: int, font_size: int, *, bottom_pad: int = 4) -> int:
-    """How many single-line lanes fit in the overlay box.
-
-    max_visible=0 / auto uses this so the box fills by height and type size.
-    """
-    line_h = line_height_px(font_size)
-    usable = max(1, int(height) - int(bottom_pad))
-    return max(1, usable // line_h)
-
-
-def resolve_lane_budget(
-    max_visible: int,
-    height: int,
-    font_size: int,
-    *,
-    bottom_pad: int = 4,
-) -> tuple[int, int, str | None]:
-    """Resolve the effective lane/line budget for the current overlay box.
-
-    Returns ``(budget, capacity, warning_or_none)``.
-
-    - ``max_visible <= 0``: auto-fill by box height / font size (``budget == capacity``).
-    - ``max_visible > capacity``: clamp to capacity. Without this, high lanes paste at
-      ``y=0`` and stack on top of each other (silent-wrong on short/ratio layouts).
-    """
-    capacity = compute_lane_capacity(height, font_size, bottom_pad=bottom_pad)
-    raw = int(max_visible or 0)
-    if raw <= 0:
-        return capacity, capacity, None
-    if raw > capacity:
-        line_h = line_height_px(font_size)
-        warn = (
-            f"max_visible={raw} 超过当前框高可容纳的 {capacity} 行 "
-            f"(height={int(height)}px, font={int(font_size)}px, LINE_H={line_h})，"
-            f"已钳制为 {capacity}，避免弹幕叠在顶部"
-        )
-        return capacity, capacity, warn
-    return raw, capacity, None
 
 
 def layout_bounds_warnings(config, video_path) -> list[str]:
@@ -1436,20 +1380,6 @@ def apply_imported_translations(chat_data, trans_data, strict=False):
 
     return replaced, stripped_placeholders, warnings
 
-AUTO_LAZY_MESSAGE_THRESHOLD = 1000
-
-
-def resolve_message_image_cache_policy(
-    message_count: int,
-    requested_lazy: bool,
-    cache_size: int,
-):
-    count = max(0, int(message_count or 0))
-    cap = max(8, int(cache_size or 256))
-    auto_enabled = count >= AUTO_LAZY_MESSAGE_THRESHOLD
-    return bool(requested_lazy or auto_enabled), cap, auto_enabled
-
-
 def _store_message_image(msg_images, msg_lines, idx, image, nl, *, lazy, cache_cap):
     msg_lines[idx] = nl
     msg_images[idx] = image
@@ -1594,38 +1524,35 @@ def render_overlay(chat_data, out_dir, video_path, config):
     for i, m in enumerate(messages):
         msg_line_count[i] = calc_msg_lines(m)
 
-    # --- 分配 lane ---
-    MSG_LIFETIME = config.msg_lifetime
-    raw_max_visible = int(getattr(config, "max_visible", 0) or 0)
-    auto_capacity = compute_lane_capacity(config.height, config.font_size)
-    stack_mode = str(getattr(config, "stack_mode", "lanes") or "lanes").strip().lower()
-    if stack_mode not in ("float", "lanes"):
-        stack_mode = "lanes"
-    MAX_VISIBLE, auto_capacity, budget_warn = resolve_lane_budget(
-        raw_max_visible,
-        config.height,
-        config.font_size,
+    # Build the immutable scene budget before scheduling or generating frames.
+    scene = OverlayScenePlan.from_config(
+        source_duration=probe_video_duration(video_path),
+        config=config,
+        message_count=len(messages),
     )
+    MSG_LIFETIME = config.msg_lifetime
+    raw_max_visible = scene.raw_max_visible
+    auto_capacity = scene.auto_capacity
+    stack_mode = scene.stack_mode
+    MAX_VISIBLE = scene.max_visible
     if raw_max_visible <= 0:
         print(
             f"  max_visible=auto → {MAX_VISIBLE} lanes "
             f"(height={config.height}px, font={config.font_size}px, LINE_H={line_height_px(config.font_size)})",
             flush=True,
         )
-    elif budget_warn:
-        print(f"  [WARN] {budget_warn}", flush=True)
+    elif scene.budget_warning:
+        print(f"  [WARN] {scene.budget_warning}", flush=True)
     print(f"  stack_mode={stack_mode}", flush=True)
 
-    # 获取视频时长（带防护，避免 float('') 直接崩溃）
-    duration = probe_video_duration(video_path)
-    print(f"  视频时长: {duration:.1f}s", flush=True)
+    duration = scene.duration
+    print(f"  视频时长: {scene.source_duration:.1f}s", flush=True)
     # preview_clip may start mid-video (densest window). Chat timestamps are rebased
     # to 0 in main() when clip_start > 0; compose seeks the source with -ss.
     # Here we only shorten the render duration to the clip length.
-    if getattr(config, "preview_clip", None):
-        clip_len = float(config.preview_clip)
-        duration = min(duration, clip_len)
-        clip_start = float(getattr(config, "preview_clip_start", 0.0) or 0.0)
+    if scene.preview_clip is not None:
+        clip_len = scene.preview_clip
+        clip_start = scene.preview_clip_start
         if clip_start > 1e-6:
             print(
                 f"  预览短片模式: 源窗口 [{clip_start:.1f}s, {clip_start + clip_len:.1f}s] "
@@ -1636,23 +1563,13 @@ def render_overlay(chat_data, out_dir, video_path, config):
             print(f"  预览短片模式: 仅渲染前 {duration:.1f}s", flush=True)
 
     if stack_mode == "float":
-        # Absolute window origin for arrival throttle: rebased dense clips use 0;
-        # float --preview-frame keeps absolute timestamps so throttle from frame t.
-        clip_start_abs = float(getattr(config, "preview_clip_start", 0.0) or 0.0)
-        preview_frame_abs = getattr(config, "preview_frame", None)
-        if clip_start_abs > 1e-6:
-            float_throttle_from = 0.0
-        elif preview_frame_abs is not None:
-            float_throttle_from = max(0.0, float(preview_frame_abs))
-        else:
-            float_throttle_from = 0.0
         msg_schedule = schedule_messages_float(
             messages,
             msg_line_count,
             duration=duration,
             capacity_lines=MAX_VISIBLE,
             arrival_interval=getattr(config, "arrival_interval", 0.0),
-            throttle_from=float_throttle_from,
+            throttle_from=scene.float_throttle_from,
         )
     else:
         msg_schedule = schedule_messages(
@@ -1770,11 +1687,9 @@ def render_overlay(chat_data, out_dir, video_path, config):
     # - --lazy-message-images: only render when a message becomes visible; LRU cap for long VODs
     from collections import OrderedDict
 
-    lazy_images, cache_cap, auto_lazy = resolve_message_image_cache_policy(
-        len(messages),
-        bool(getattr(config, "lazy_message_images", False)),
-        int(getattr(config, "message_image_cache_size", 256) or 256),
-    )
+    lazy_images = scene.lazy_message_images
+    cache_cap = scene.message_image_cache_size
+    auto_lazy = scene.auto_lazy_message_images
     config.lazy_message_images = lazy_images
     cache_peak = 0
     msg_images = OrderedDict()  # idx -> Image
@@ -1822,14 +1737,15 @@ def render_overlay(chat_data, out_dir, video_path, config):
             os.remove(os.path.join(frames_dir, old))
     ensure_render_disk_headroom(frames_dir)
 
-    FPS = config.fps
+    FPS = scene.fps
     W, H = config.width, config.height
     BG_ALPHA = config.bg_alpha
 
     # 找 change points
-    preview_frame_time = getattr(config, "preview_frame", None)
+    preview_frame_time = scene.preview_frame_time
     if preview_frame_time is not None:
-        preview_t = max(0.0, min(float(preview_frame_time), duration))
+        preview_t = scene.preview_time
+        assert preview_t is not None
         change_points = [preview_t, min(duration, preview_t + 1 / max(FPS, 1))]
         if change_points[1] <= change_points[0]:
             change_points[1] = change_points[0] + 1 / max(FPS, 1)
@@ -1845,7 +1761,7 @@ def render_overlay(chat_data, out_dir, video_path, config):
 
     # Use a global frame index so short chat segments do not inflate the total
     # frame count via repeated ceil() rounding.
-    total_frames = 1 if preview_frame_time is not None else expected_overlay_frame_count(duration, FPS)
+    total_frames = scene.total_frames
     frame_num = 0
     render_start_time = time.time()
     last_progress_time = render_start_time

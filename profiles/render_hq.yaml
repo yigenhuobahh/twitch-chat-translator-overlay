@@ -3,10 +3,10 @@
 # 适合：最终成品输出，需要最高画质时。
 name: render_hq
 label: "High quality"
-description: "Slower x264, lower CRF, higher AAC bitrate."
+description: "High quality output with auto GPU hardware acceleration (or x264 slow fallback), lower CRF, higher AAC bitrate."
 
 render:
-  encoder: x264
+  encoder: auto          # 编码器：auto（优先显卡加速 NVENC/AMF/QSV，无显卡自动回退 x264）
   video_preset: slow     # 比 fast 更慢，压缩效率更高
   crf: 16                # 比 default 低 2，质量更高
   audio_codec: aac

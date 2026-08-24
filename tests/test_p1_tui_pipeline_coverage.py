@@ -47,7 +47,6 @@ def test_post_download_noninteractive_stops_without_starting_pipeline(monkeypatc
 
 def test_textual_history_uses_manifest_for_artifacts_rerun_and_diagnostics(tmp_path: Path, monkeypatch):
     pytest.importorskip("textual")
-    from textual.widgets import Input
 
     from tui_history import TuiHistoryStore
     from tui_models import MODE_ORIGINAL_PREVIEW, TuiJobDraft
@@ -78,7 +77,7 @@ def test_textual_history_uses_manifest_for_artifacts_rerun_and_diagnostics(tmp_p
         monkeypatch.setattr(app, "_open_result_dir", lambda: opened.append(app.result_directory))
         monkeypatch.setattr(app, "_start_draft", lambda mode: rerun.append(mode))
         async with app.run_test():
-            app.query_one("#history-id", Input).value = record["id"]
+            app._select_history(record["id"])
             app._open_history_artifacts()
             app._export_history_diagnostic()
             app._rerun_history()
@@ -95,7 +94,6 @@ def test_textual_history_uses_manifest_for_artifacts_rerun_and_diagnostics(tmp_p
 
 def test_textual_history_rerun_starts_from_a_new_advanced_job_snapshot(tmp_path: Path, monkeypatch):
     pytest.importorskip("textual")
-    from textual.widgets import Input
 
     from tui_history import TuiHistoryStore
     from tui_models import MODE_ORIGINAL_PREVIEW, TuiJobDraft
@@ -139,7 +137,7 @@ def test_textual_history_rerun_starts_from_a_new_advanced_job_snapshot(tmp_path:
         app.history = TuiHistoryStore(tmp_path / "history.json")
         original = app.history.start(draft, label="advanced")
         async with app.run_test():
-            app.query_one("#history-id", Input).value = original["id"]
+            app._select_history(original["id"])
             app._rerun_history()
             assert commands
             command = commands[0]
@@ -247,7 +245,7 @@ def test_textual_oauth_download_history_rerun_waits_for_new_credential(tmp_path:
         )
         monkeypatch.setattr(app, "_start_download", lambda _draft=None: pytest.fail("must wait for OAuth"))
         async with app.run_test():
-            app.query_one("#history-id", Input).value = record["id"]
+            app._select_history(record["id"])
             app._rerun_history()
             assert app.query_one(TabbedContent).active == "download"
             assert app.query_one("#download-oauth", Input).value == ""

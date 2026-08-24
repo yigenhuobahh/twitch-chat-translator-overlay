@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -309,7 +310,10 @@ def test_install_bat_propagates_required_step_failures():
         r'"%PY%" -m pip install -U pip\s+if errorlevel 1 \(',
         (
             r'if exist "requirements\.txt" \(\s*'
-            r'"%PY%" -m pip install -r requirements\.txt\s*'
+            r'if exist "constraints-windows\.txt" \(\s*'
+            r'echo\s+Using tested Windows dependency constraints \.\.\.\s*'
+            r'"%PY%" -m pip install -r requirements\.txt -c constraints-windows\.txt\s*'
+            r'\) else \(\s*"%PY%" -m pip install -r requirements\.txt\s*\)\s*'
             r'\) else \(\s*"%PY%" -m pip install -e \.\s*\)\s*'
             r"if errorlevel 1 \("
         ),
@@ -328,6 +332,38 @@ def test_install_bat_propagates_required_step_failures():
     optional_pos = text.index(r'"%PY%" scripts\render_cn_chat.py --install-td-prompt')
     final_success = text.index("exit /b 0", optional_pos)
     assert optional_pos < final_success
+
+
+def test_windows_constraint_file_covers_runtime_requirements_and_is_packaged():
+    requirements = {
+        line.split(">", 1)[0].strip().lower()
+        for line in (ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    }
+    constraints = {
+        line.split("=", 1)[0].strip().lower()
+        for line in (ROOT / "constraints-windows.txt").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    }
+
+    assert constraints == requirements
+    manifest = (ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+    assert "include constraints-windows.txt" in manifest
+
+
+def test_test_runner_help_is_renderable():
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "run_tests.py"), "--help"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--coverage" in result.stdout
 
 
 def test_init_scaffolds_files_and_runs_doctor_summary(tmp_path: Path, monkeypatch):

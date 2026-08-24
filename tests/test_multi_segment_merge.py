@@ -443,6 +443,36 @@ def test_concat_videos_with_cuts_rejects_uncut_fallback(tmp_path: Path, monkeypa
     assert "-filter_complex" in calls[0]
 
 
+def test_concat_single_video_with_cuts_never_uses_copy_fast_path(tmp_path: Path, monkeypatch):
+    """A direct single-input helper call must not silently ignore --cut."""
+    import encode_options
+    import twitch_download as td
+
+    source = tmp_path / "a.mp4"
+    source.write_bytes(b"x")
+    calls = []
+
+    monkeypatch.setattr(td, "probe_media_duration", lambda _path: 10.0)
+    monkeypatch.setattr(td, "get_stream_start_time", lambda _path, _stream: 0.0)
+    monkeypatch.setattr(
+        td,
+        "run_tracked",
+        lambda cmd, **kwargs: calls.append(cmd) or type("Result", (), {"returncode": 1})(),
+    )
+    monkeypatch.setattr(
+        encode_options,
+        "resolve_encode_options",
+        lambda **kwargs: type("Options", (), {"resolved_encoder": "x264"})(),
+    )
+    monkeypatch.setattr(encode_options, "build_video_encode_args", lambda _opts: ["-c:v", "libx264"])
+
+    with pytest.raises(td.TwitchDownloadError, match="--cut"):
+        td.concat_videos([source], tmp_path / "out.mp4", remove_ranges=[(2.0, 4.0)])
+
+    assert len(calls) == 1
+    assert "-filter_complex" in calls[0]
+
+
 def test_download_assets_multi_accepts_cut_and_fps(tmp_path: Path, monkeypatch):
     """download_assets_multi should accept remove_ranges + output_fps + encoder
     and forward them to concat_videos / merge_chat_html."""

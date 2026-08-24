@@ -1,0 +1,9 @@
+# Tested Windows runtime set for install.bat and manual Windows installs.
+# requirements.txt and pyproject.toml intentionally keep compatible minimums
+# for package users and non-Windows environments.
+beautifulsoup4==4.15.0
+openai==2.24.0
+openpyxl==3.1.5
+pillow==12.2.0
+PyYAML==6.0.3
+textual==8.2.8

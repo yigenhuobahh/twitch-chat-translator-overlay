@@ -11,8 +11,8 @@ Release notes: [`CHANGELOG.md`](https://github.com/yigenhuobahh/twitch-chat-tran
 ## Quick Start
 
 ```bash
-# 1. Install dependencies
-pip install -r requirements.txt
+# 1. Install dependencies (Windows uses the tested constraint set)
+pip install -r requirements.txt -c constraints-windows.txt
 
 # 2. Configure translation API (copy .env.example to .env) — skip for --render-original
 
@@ -132,7 +132,7 @@ python scripts/render_cn_chat.py video.mp4 chat.html --reuse-translation --revie
 ## Installation
 
 - **Python 3.10+**, **FFmpeg/ffprobe** on PATH, **CJK font**
-- `pip install -r requirements.txt` or `pip install -e ".[dev]"`
+- Windows: `pip install -r requirements.txt -c constraints-windows.txt` (the same tested set used by `install.bat`); other platforms: `pip install -r requirements.txt` or `pip install -e ".[dev]"`
 - Console scripts: `twitch-chat-overlay` / `twitch-chat-burn` / `twitch-chat-translate`
 - Translation env: `OPENAI_COMPAT_BASE_URL`, `OPENAI_COMPAT_API_KEY`, `OPENAI_COMPAT_MODEL` (or legacy `AGNES_*`)
 

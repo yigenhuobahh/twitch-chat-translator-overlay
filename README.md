@@ -55,7 +55,8 @@ bash run.sh example_job
 **等价命令行**
 
 ```powershell
-pip install -r requirements.txt
+# Windows：使用与 install.bat 相同的已验证依赖组合
+pip install -r requirements.txt -c constraints-windows.txt
 python scripts\render_cn_chat.py --init
 python scripts\render_cn_chat.py --doctor
 # 缺 FFmpeg 时可: python scripts\render_cn_chat.py --doctor --offer-fix
@@ -208,7 +209,8 @@ python scripts/render_cn_chat.py --download <VOD_URL> --download-only `
 ### 方式 A：直接跑仓库脚本（推荐日常开发）
 
 ```powershell
-pip install -r requirements.txt
+# Windows：使用与 install.bat 相同的已验证依赖组合
+pip install -r requirements.txt -c constraints-windows.txt
 python scripts\render_cn_chat.py --doctor
 ```
 

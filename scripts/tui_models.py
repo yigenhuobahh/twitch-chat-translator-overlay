@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -12,11 +13,22 @@ from urllib.parse import urlsplit, urlunsplit
 from common_utils import detect_cjk_font, load_dotenv_if_present, safe_which
 from env_bootstrap import prepend_tools_ffmpeg_to_path
 from job_config import load_job_file, write_job_file
+from pipeline_plan import PipelinePlan
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"}
 CHAT_EXTENSIONS = {".html", ".htm"}
 
 
+# 3 Core Operational Paths (Primary Task Modes)
+MODE_QUICK_PREVIEW_ORIGINAL = "quick_preview_original"
+MODE_QUICK_PREVIEW_TRANSLATED = "quick_preview_translated"
+MODE_FULL_PRODUCTION = "full_production"
+MODE_ORIGINAL_PRODUCTION = "original_production"
+MODE_STEP_EXPORT_MANUAL = "step_export_manual"
+MODE_STEP_API_AND_REVIEW = "step_api_and_review"
+MODE_STEP_RESUME_RENDER = "step_resume_render"
+
+# Legacy Mode Constants (for 100% backward compatibility)
 MODE_ORIGINAL_PREVIEW = "original_preview"
 MODE_TRANSLATED_PREVIEW = "translated_preview"
 MODE_FULL_RENDER = "full_render"
@@ -24,7 +36,19 @@ MODE_REUSE_RENDER = "reuse_render"
 MODE_TRANSLATE_ONLY = "translate_only"
 MODE_RENDER_ONLY = "render_only"
 MODE_AUTO = "auto"
-MODES = (
+MODE_RENDER_ORIGINAL = "render_original"
+
+CORE_MODES = (
+    MODE_QUICK_PREVIEW_ORIGINAL,
+    MODE_QUICK_PREVIEW_TRANSLATED,
+    MODE_FULL_PRODUCTION,
+    MODE_ORIGINAL_PRODUCTION,
+    MODE_STEP_EXPORT_MANUAL,
+    MODE_STEP_API_AND_REVIEW,
+    MODE_STEP_RESUME_RENDER,
+)
+
+LEGACY_MODES = (
     MODE_ORIGINAL_PREVIEW,
     MODE_TRANSLATED_PREVIEW,
     MODE_FULL_RENDER,
@@ -32,11 +56,17 @@ MODES = (
     MODE_TRANSLATE_ONLY,
     MODE_RENDER_ONLY,
     MODE_AUTO,
+    MODE_RENDER_ORIGINAL,
+)
+
+MODES = (
+    *CORE_MODES,
+    *LEGACY_MODES,
 )
 _FORM_FIELDS = {
     "video", "chat_html", "output", "translation_json", "mode", "render_original", "reuse_translation",
     "target_language", "layout_preset", "render_preset", "preview_clip", "profile", "rules", "encoder",
-    "crf", "workers", "source_media_check", "keep_temp", "review", "manual_translation",
+    "crf", "workers", "source_media_check", "keep_temp", "review", "manual_translation", "offset",
 }
 _SENSITIVE_FIELD_PARTS = ("apikey", "token", "password", "authorization", "secret", "oauth")
 
@@ -72,9 +102,27 @@ def sanitize_download_source_for_history(value: object) -> str:
 
 def _mode_from_fields(fields: dict[str, Any]) -> str:
     mode = str(fields.get("mode", "")).lower()
+    # Direct match on core task modes
+    if mode in (MODE_QUICK_PREVIEW_ORIGINAL, "quick_preview_original"):
+        return MODE_QUICK_PREVIEW_ORIGINAL
+    if mode in (MODE_QUICK_PREVIEW_TRANSLATED, "quick_preview_translated"):
+        return MODE_QUICK_PREVIEW_TRANSLATED
+    if mode in (MODE_FULL_PRODUCTION, "full_production"):
+        return MODE_FULL_PRODUCTION
+    if mode in (MODE_ORIGINAL_PRODUCTION, "original_production"):
+        return MODE_ORIGINAL_PRODUCTION
+    if mode in (MODE_STEP_EXPORT_MANUAL, "step_export_manual"):
+        return MODE_STEP_EXPORT_MANUAL
+    if mode in (MODE_STEP_API_AND_REVIEW, "step_api_and_review"):
+        return MODE_STEP_API_AND_REVIEW
+    if mode in (MODE_STEP_RESUME_RENDER, "step_resume_render"):
+        return MODE_STEP_RESUME_RENDER
+
     if mode == "preview":
         return MODE_ORIGINAL_PREVIEW if fields.get("render_original") else MODE_TRANSLATED_PREVIEW
     if mode == "translate":
+        if fields.get("manual_translation"):
+            return MODE_STEP_EXPORT_MANUAL
         return MODE_TRANSLATE_ONLY
     if mode == "render":
         return MODE_REUSE_RENDER if fields.get("reuse_translation") else MODE_RENDER_ONLY
@@ -117,6 +165,7 @@ class TuiJobDraft:
     manual_translation: bool = False
     render_original: bool = False
     reuse_translation: bool = False
+    offset: str = ""
     source_job: str = ""
     extra_fields: dict[str, Any] | None = None
 
@@ -139,6 +188,9 @@ class TuiJobDraft:
         except (TypeError, ValueError) as exc:
             raise ValueError("preview_clip must be a number") from exc
 
+        offset_val = fields.get("offset")
+        offset_str = "" if offset_val is None else str(offset_val)
+
         return cls(
             video=text("video"),
             chat_html=text("chat_html"),
@@ -160,6 +212,7 @@ class TuiJobDraft:
             manual_translation=bool(fields.get("manual_translation", False)),
             render_original=bool(fields.get("render_original", False)),
             reuse_translation=bool(fields.get("reuse_translation", False)),
+            offset=offset_str,
             source_job=source_job or text("_job_path"),
             extra_fields={
                 key: value
@@ -188,11 +241,19 @@ class TuiJobDraft:
             "review": self.review,
             "manual_translation": self.manual_translation,
         })
-        if self.mode == MODE_ORIGINAL_PREVIEW:
+        if self.mode in (MODE_QUICK_PREVIEW_ORIGINAL, MODE_ORIGINAL_PREVIEW):
             fields.update(mode="preview", render_original=True, preview_clip=self.preview_clip)
-        elif self.mode == MODE_TRANSLATED_PREVIEW:
+        elif self.mode in (MODE_QUICK_PREVIEW_TRANSLATED, MODE_TRANSLATED_PREVIEW):
             fields.update(mode="preview", preview_clip=self.preview_clip)
-        elif self.mode == MODE_REUSE_RENDER:
+        elif self.mode in (MODE_FULL_PRODUCTION, MODE_FULL_RENDER):
+            fields.update(mode="full")
+        elif self.mode in (MODE_ORIGINAL_PRODUCTION, MODE_RENDER_ORIGINAL):
+            fields.update(mode="render", render_original=True)
+        elif self.mode == MODE_STEP_EXPORT_MANUAL:
+            fields.update(mode="translate", manual_translation=True)
+        elif self.mode == MODE_STEP_API_AND_REVIEW:
+            fields.update(mode="full", review=True)
+        elif self.mode in (MODE_STEP_RESUME_RENDER, MODE_REUSE_RENDER):
             fields.update(mode="render", reuse_translation=True)
         elif self.mode == MODE_TRANSLATE_ONLY:
             fields.update(mode="translate")
@@ -212,20 +273,35 @@ class TuiJobDraft:
             fields["crf"] = int(self.crf)
         if self.workers.strip():
             fields["workers"] = int(self.workers)
+        if self.offset is not None and str(self.offset).strip():
+            try:
+                fields["offset"] = float(str(self.offset).strip())
+            except (TypeError, ValueError):
+                pass
         return {key: value for key, value in fields.items() if value not in (None, "")}
 
     def requires_translation(self) -> bool:
-        return (
-            not self.manual_translation
-            and not self.render_original
-            and not self.reuse_translation
-            and self.mode != MODE_REUSE_RENDER
-            and self.mode in (
-                MODE_TRANSLATED_PREVIEW,
-                MODE_FULL_RENDER,
-                MODE_TRANSLATE_ONLY,
-                MODE_AUTO,
-            )
+        if self.manual_translation or self.render_original or self.reuse_translation:
+            return False
+        if self.mode in (
+            MODE_QUICK_PREVIEW_ORIGINAL,
+            MODE_ORIGINAL_PREVIEW,
+            MODE_ORIGINAL_PRODUCTION,
+            MODE_RENDER_ORIGINAL,
+            MODE_RENDER_ONLY,
+            MODE_REUSE_RENDER,
+            MODE_STEP_RESUME_RENDER,
+            MODE_STEP_EXPORT_MANUAL,
+        ):
+            return False
+        return self.mode in (
+            MODE_QUICK_PREVIEW_TRANSLATED,
+            MODE_TRANSLATED_PREVIEW,
+            MODE_FULL_PRODUCTION,
+            MODE_FULL_RENDER,
+            MODE_STEP_API_AND_REVIEW,
+            MODE_TRANSLATE_ONLY,
+            MODE_AUTO,
         )
 
     def validate(self, *, check_api: bool = True, check_environment: bool = True) -> list[str]:
@@ -255,6 +331,13 @@ class TuiJobDraft:
                         problems.append(f"{name} 必须是正整数。")
                 except ValueError:
                     problems.append(f"{name} 必须是整数。")
+        if self.offset is not None and str(self.offset).strip():
+            try:
+                val = float(str(self.offset).strip())
+                if not math.isfinite(val) or abs(val) > 604800.0:
+                    problems.append("时间偏移秒数绝对值必须在 7 天以内（<= 604800 秒）。")
+            except (TypeError, ValueError):
+                problems.append("时间偏移必须是数字（支持正负小数与整数）。")
         if self.output.strip():
             output = Path(_clean_path(self.output)).expanduser()
             if output.exists() and output.is_dir():
@@ -263,19 +346,19 @@ class TuiJobDraft:
                 problems.append("输出文件建议使用 .mp4、.mkv 或 .mov 后缀。")
             elif self.video.strip() and output.resolve() == video.resolve():
                 problems.append("输出文件不能与源视频相同；请选择新的文件名，避免覆盖原片。")
-        if (self.mode == MODE_REUSE_RENDER or self.reuse_translation) and not Path(
+        if (self.mode in (MODE_REUSE_RENDER, MODE_STEP_RESUME_RENDER) or self.reuse_translation) and not Path(
             _clean_path(self.translation_json)
         ).expanduser().is_file():
             problems.append("复用翻译渲染需要选择已存在的翻译 JSON。")
-        if self.render_original and self.reuse_translation:
+        if (self.render_original or self.mode in (MODE_ORIGINAL_PREVIEW, MODE_QUICK_PREVIEW_ORIGINAL, MODE_ORIGINAL_PRODUCTION, MODE_RENDER_ORIGINAL)) and (self.reuse_translation or self.mode in (MODE_REUSE_RENDER, MODE_STEP_RESUME_RENDER)):
             problems.append("原文渲染不能同时复用翻译；请只选择一种渲染来源。")
-        if self.review and self.manual_translation:
+        if (self.review or self.mode == MODE_STEP_API_AND_REVIEW) and (self.manual_translation or self.mode == MODE_STEP_EXPORT_MANUAL):
             problems.append("请选择人工复核或手工翻译其中一种，不要同时启用。")
-        if self.mode == MODE_ORIGINAL_PREVIEW and (self.profile.strip() or self.rules.strip() or self.review or self.manual_translation):
+        if self.mode in (MODE_ORIGINAL_PREVIEW, MODE_QUICK_PREVIEW_ORIGINAL) and (self.profile.strip() or self.rules.strip() or self.review or self.manual_translation):
             problems.append("原文预览不能同时使用翻译 profile、规则或人工翻译/复核。")
         if self.source_media_check.strip().lower() not in {"off", "fast", "decode"}:
             problems.append("输入视频检查只能选 off、fast 或 decode。")
-        if self.manual_translation and self.mode in (MODE_ORIGINAL_PREVIEW, MODE_REUSE_RENDER):
+        if self.manual_translation and self.mode in (MODE_ORIGINAL_PREVIEW, MODE_QUICK_PREVIEW_ORIGINAL, MODE_REUSE_RENDER, MODE_STEP_RESUME_RENDER):
             problems.append("手工翻译只能从翻译流程开始，不能与原文或复用翻译渲染一起使用。")
         if check_environment:
             prepend_tools_ffmpeg_to_path()
@@ -306,43 +389,11 @@ class TuiJobDraft:
         job_path: str | Path | None = None,
     ) -> list[str]:
         """Build a pipeline command from the canonical existing CLI options."""
-        fields = self.to_job_fields()
-        command = [python, str(pipeline)]
-        source_value = str(job_path) if job_path is not None else self.source_job
-        source_job = Path(source_value).expanduser() if source_value.strip() else None
-        if source_job and source_job.is_file():
-            # Keep advanced fields from an imported YAML active.  Form fields
-            # below remain explicit CLI overrides, so edits in the TUI win.
-            command.extend(["--job", str(source_job)])
-        command.extend([fields["video"], fields["chat_html"], "--yes"])
-        command.extend(["--mode", str(fields["mode"])])
-        for key, flag in (
-            ("output", "--output"),
-            ("translation_json", "--translation-json"),
-            ("target_language", "--target-language"),
-            ("layout_preset", "--layout-preset"),
-            ("render_preset", "--render-preset"),
-            ("profile", "--profile"),
-            ("rules", "--rules"),
-            ("encoder", "--encoder"),
-            ("crf", "--crf"),
-            ("workers", "--workers"),
-            ("source_media_check", "--source-media-check"),
-        ):
-            if fields.get(key) not in (None, ""):
-                command.extend([flag, str(fields[key])])
-        if fields.get("preview_clip") is not None:
-            command.extend(["--preview-clip", str(fields["preview_clip"])])
-        for key, flag in (
-            ("render_original", "--render-original"),
-            ("reuse_translation", "--reuse-translation"),
-            ("keep_temp", "--keep-temp"),
-            ("review", "--review"),
-            ("manual_translation", "--manual-translation"),
-        ):
-            if fields.get(key):
-                command.append(flag)
-        return command
+        return PipelinePlan(self.to_job_fields(), source_job=self.source_job).build_command(
+            python,
+            pipeline,
+            job_path=job_path,
+        )
 
     def save_job(self, path: str | Path, *, pin_paths: bool = True, overwrite: bool = False) -> Path:
         return write_job_file(path, self.to_job_fields(), title=Path(path).stem, pin_paths=pin_paths, overwrite=overwrite)
@@ -400,9 +451,7 @@ class TuiDownloadDraft:
             problems.append("请选择下载画质，例如 1080p60 或 720p60。")
         if self.media_check.strip().lower() not in {"off", "fast", "decode"}:
             problems.append("下载视频检查只能选 off、fast 或 decode。")
-        if source_kind == "vod" and not self.segments():
-            problems.append("为避免误下载整段 VOD，请至少填写一个裁切段。")
-        elif self.segments():
+        if self.segments():
             try:
                 from twitch_download import parse_segment_line, validate_segments
 

@@ -89,6 +89,19 @@ def test_webm_args_include_cpu_used():
     assert "-crf" in args and "32" in args
 
 
+def test_auto_encoder_priority_nvenc_amf_qsv(monkeypatch):
+    import encode_options
+
+    # Mock detection with both AMF and QSV available, but no NVENC
+    monkeypatch.setattr(encode_options, "detect_hw_encoders", lambda: {"amf": "h264_amf", "qsv": "h264_qsv", "x264": "libx264"})
+    monkeypatch.setattr(encode_options, "_trial_encode", lambda codec: True)
+
+    opts = encode_options.resolve_encode_options(encoder="auto")
+    # AMF should be prioritized before QSV
+    assert opts.resolved_encoder == "amf"
+    assert opts.video_codec == "h264_amf"
+
+
 @pytest.mark.smoke
 def test_smoke_with_static_reuse_and_png_overlay(make_test_video, tmp_path: Path):
     """End-to-end short clip using new perf/encode flags (CPU path)."""

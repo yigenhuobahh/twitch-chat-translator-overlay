@@ -1,0 +1,19 @@
+# 全高侧边栏长条弹幕预设 — 适合大体量聊天回放或录播重现
+# 用法: --layout-preset profiles/layout_sidebar.yaml
+name: layout_sidebar
+label: "Full-height vertical sidebar"
+description: "Tall vertical stream chat sidebar spanning from top to bottom."
+
+layout:
+  x: 20              # 弹幕框左上角 X 坐标
+  y: 40              # 弹幕框左上角 Y 坐标
+  width: 420         # 弹幕框宽度
+  height: 1000       # 弹幕框高度（纵向长条）
+  font_size: 15      # 字体大小
+  font_path: auto
+  font_bold_path: auto
+  fps: 15
+  max_visible: 0     # 自动填满整个纵向侧边栏
+  msg_lifetime: 18.0 # 停留时间稍长
+  bg_alpha: 230      # 接近不透明的深色底
+  emote_height: 22

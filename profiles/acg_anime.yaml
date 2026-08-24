@@ -1,0 +1,45 @@
+# 二次元、抽卡与剧情向游戏直播 Profile
+# 用法: --profile profiles/acg_anime.yaml
+name: acg_anime
+label: "Anime & Gacha Game Livestream"
+context: "Anime-style and Gacha game livestream chat (e.g. Genshin, Honkai, Anime RPGs). Keep ACG and gaming terminology accurate."
+
+glossary:
+  # 剧情与设定
+  "Lore": "剧情设定/背景"
+  "Cutscene": "过场动画"
+  "Boss fight": "Boss战"
+  "Theorycrafting": "考据分析"
+  "Canon": "正史/官方设定"
+  "Headcanon": "脑补设定"
+  "Voice actor": "声优/配音"
+  "VA": "声优"
+  "OST": "原声音乐"
+  "BGM": "背景音乐"
+  
+  # 抽卡与养成
+  "Gacha": "抽卡"
+  "Banner": "卡池"
+  "Pity": "保底"
+  "Hard pity": "硬保底"
+  "Soft pity": "软保底"
+  "Pull": "抽"
+  "10-pull": "十连抽"
+  "Whale": "氪佬/巨氪"
+  "F2P": "零氪玩家"
+  "Reroll": "刷初始"
+  "Build": "配装/配队"
+  "Artifact": "圣遗物/御魂/装备"
+  "Powercreep": "数值膨胀"
+  "Nerf": "削弱"
+  "Buff": "增强"
+
+preserve:
+  - emotes
+  - usernames
+  - urls
+  - numbers
+
+translation_style:
+  tone: "符合国内二次元和游戏玩家社区语言习惯，自然简洁"
+  max_length_hint: "保留常见专有名词，尽量短句呈现"

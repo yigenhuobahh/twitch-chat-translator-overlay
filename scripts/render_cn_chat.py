@@ -73,6 +73,8 @@ from job_config import (
 from job_wizard import run_job_wizard, run_list_jobs
 from layout_preset import apply_layout_preset_to_namespace, load_layout_preset
 from media_health import validate_media_health
+import pipeline_plan as _pipeline_plan
+from pipeline_runner import PipelineRunner, activate_runner, active_runner, emit_task_event
 from process_util import (
     clean_companion_flags_error,
     clean_temp_artifacts,
@@ -81,8 +83,6 @@ from process_util import (
     run_tracked,
 )
 from render_preset import apply_render_preset_to_namespace, load_render_preset
-from task_events import emit_task_event
-from task_results import write_task_result
 from ux_setup import print_setup_next_steps, run_init
 
 ensure_utf8_stdio()
@@ -94,157 +94,25 @@ _TASK_STAGE_BY_PROGRAM = {
 load_dotenv_if_present()
 
 
-# ---------------------------------------------------------------------------
-# Dual-CLI flag forwarding (pipeline → twitch_chat_burn)
-#
-# Shared flags live in the tables below and are applied via append_* helpers.
-# When adding a new shared burn flag: add (attr, flag, kind) to the right
-# table, expose it on the pipeline argparse, and the contract tests in
-# tests/test_cli_flag_forward.py will catch missing forwards.
-#
-# kind:
-#   always      – always emit ``flag value`` (attr must exist)
-#   opt         – emit if attr is present and not None/""
-#   opt_truthy  – emit if attr is truthy
-#   flag        – emit bare flag if attr is truthy
-# ---------------------------------------------------------------------------
-
-# Burn CLI options that are *not* general pipeline flags (path/mode specific).
-# Pipeline may still pass some of these at call sites (e.g. --import-translation
-# on render, --out-dir when --workdir is set) but they are not part of the
-# shared append_* tables.
-BURN_ONLY_FLAGS: tuple[str, ...] = (
-    "export-translation",
-    "import-translation",
-    "force-export",
-    "strict-import",  # pipeline has a thin forward when importing (see append_strict_import_arg)
-    "job-dir",
-    "no-job-dir",
-    "out-dir",
-)
-
-# (attr, flag, kind) — chat-layer / final fps
-FPS_FORWARD_SPECS: tuple[tuple[str, str, str], ...] = (
-    ("fps", "--fps", "always"),
-    ("output_fps", "--output-fps", "opt"),
-)
-
-# (attr, flag, kind) — layout / stack / ratios (layout-preset applied onto args first)
-LAYOUT_FORWARD_SPECS: tuple[tuple[str, str, str], ...] = (
-    ("max_visible", "--max-visible", "opt"),
-    ("msg_lifetime", "--msg-lifetime", "opt"),
-    ("max_message_lines", "--max-message-lines", "opt"),
-    ("min_visible_seconds", "--min-visible-seconds", "opt"),
-    ("arrival_interval", "--arrival-interval", "opt"),
-    ("stack_mode", "--stack-mode", "opt"),
-    ("x_ratio", "--x-ratio", "opt"),
-    ("y_ratio", "--y-ratio", "opt"),
-    ("width_ratio", "--width-ratio", "opt"),
-    ("height_ratio", "--height-ratio", "opt"),
-    ("font_size_ratio", "--font-size-ratio", "opt"),
-    ("emote_height", "--emote-height", "opt"),
-    ("lazy_message_images", "--lazy-message-images", "flag"),
-)
-
-# (attr, flag, kind) — encode / static-frame reuse
-PERF_FORWARD_SPECS: tuple[tuple[str, str, str], ...] = (
-    ("encoder", "--encoder", "always"),
-    ("video_preset", "--video-preset", "opt_truthy"),
-    ("crf", "--crf", "always"),
-    ("video_bitrate", "--video-bitrate", "opt_truthy"),
-    ("maxrate", "--maxrate", "opt_truthy"),
-    ("bufsize", "--bufsize", "opt_truthy"),
-    ("audio_codec", "--audio-codec", "always"),
-    ("audio_bitrate", "--audio-bitrate", "always"),
-    ("overlay_codec", "--overlay-codec", "always"),
-    ("webm_crf", "--webm-crf", "always"),
-    ("webm_cpu_used", "--webm-cpu-used", "always"),
-    ("no_reuse_static_frames", "--no-reuse-static-frames", "flag"),
-    ("no_skip_blank_frames", "--no-skip-blank-frames", "flag"),
-    ("blank_hold_seconds", "--blank-hold-seconds", "always"),
-)
-
-# Flat list of every shared forward flag (for contract tests / docs).
-SHARED_FORWARD_FLAGS: tuple[str, ...] = tuple(
-    flag
-    for _attr, flag, _kind in (
-        *FPS_FORWARD_SPECS,
-        *LAYOUT_FORWARD_SPECS,
-        *PERF_FORWARD_SPECS,
-    )
-) + (
-    # companion of lazy_message_images (emitted only when lazy is on)
-    "--message-image-cache-size",
-)
-
-
-def _append_flag_specs(cmd: list, args, specs: tuple[tuple[str, str, str], ...]) -> list:
-    """Apply a table of (attr, flag, kind) to *cmd* from *args*."""
-    for attr, flag, kind in specs:
-        if kind == "always":
-            cmd.extend([flag, str(getattr(args, attr))])
-            continue
-        if not hasattr(args, attr):
-            continue
-        val = getattr(args, attr)
-        if kind == "opt":
-            if val is not None and val != "":
-                cmd.extend([flag, str(val)])
-        elif kind == "opt_truthy":
-            if val:
-                cmd.extend([flag, str(val)])
-        elif kind == "flag":
-            if val:
-                cmd.append(flag)
-        else:
-            raise ValueError(f"unknown flag-forward kind: {kind!r} for {attr}")
-    return cmd
-
-
-def append_fps_args(cmd, args):
-    """Forward chat-layer fps and optional final output fps."""
-    return _append_flag_specs(cmd, args, FPS_FORWARD_SPECS)
-
-
-def append_layout_burn_args(cmd: list, args) -> list:
-    """Forward layout / lazy-memory flags to twitch_chat_burn.py."""
-    _append_flag_specs(cmd, args, LAYOUT_FORWARD_SPECS)
-    # cache size only meaningful with lazy mode (matches prior behavior)
-    if getattr(args, "lazy_message_images", False):
-        cmd.extend(
-            [
-                "--message-image-cache-size",
-                str(getattr(args, "message_image_cache_size", 256)),
-            ]
-        )
-    # layout-preset already applied onto args; no need to forward YAML path
-    return cmd
-
-
-def append_perf_encode_args(cmd: list, args) -> list:
-    """Forward performance/encode flags to twitch_chat_burn.py."""
-    return _append_flag_specs(cmd, args, PERF_FORWARD_SPECS)
-
-
-def append_strict_import_arg(cmd: list, args) -> list:
-    """Forward --strict-import when pipeline is driving burn --import-translation."""
-    if getattr(args, "strict_import", False):
-        cmd.append("--strict-import")
-    return cmd
-
-
-def append_shared_burn_args(cmd: list, args) -> list:
-    """Forward all shared fps/layout/encode flags (not burn-only path flags)."""
-    _append_flag_specs(cmd, args, FPS_FORWARD_SPECS)
-    append_layout_burn_args(cmd, args)
-    _append_flag_specs(cmd, args, PERF_FORWARD_SPECS)
-    return cmd
+# Compatibility exports for callers that historically imported forwarding
+# helpers from this pipeline module.  The canonical definitions now live in
+# pipeline_plan.py so the TUI and command-line adapters use the same rules.
+BURN_ONLY_FLAGS = _pipeline_plan.BURN_ONLY_FLAGS
+FPS_FORWARD_SPECS = _pipeline_plan.FPS_FORWARD_SPECS
+LAYOUT_FORWARD_SPECS = _pipeline_plan.LAYOUT_FORWARD_SPECS
+PERF_FORWARD_SPECS = _pipeline_plan.PERF_FORWARD_SPECS
+SHARED_FORWARD_FLAGS = _pipeline_plan.SHARED_FORWARD_FLAGS
+_append_flag_specs = _pipeline_plan.append_flag_specs
+append_fps_args = _pipeline_plan.append_fps_args
+append_layout_burn_args = _pipeline_plan.append_layout_burn_args
+append_perf_encode_args = _pipeline_plan.append_perf_encode_args
+append_shared_burn_args = _pipeline_plan.append_shared_burn_args
+append_strict_import_arg = _pipeline_plan.append_strict_import_arg
 
 
 DRY_RUN = False
 VERBOSE = False
 QUIET = False
-_TASK_RESULT_CONTEXT: dict[str, object] = {"mode": "unknown", "artifacts": []}
 
 
 class PipelineError(SystemExit):
@@ -253,7 +121,9 @@ class PipelineError(SystemExit):
 
 def mark_manual_translation_required() -> None:
     """Record that a requested translated task stopped for human input."""
-    _TASK_RESULT_CONTEXT["terminal_state"] = "manual_required"
+    runner = active_runner()
+    if runner is not None:
+        runner.mark_manual_required()
 
 
 def validate_source_media(video: Path, *, mode: str, dry_run: bool = False) -> None:
@@ -635,7 +505,7 @@ def _parse_cli_segments(raw_segments) -> list[tuple[str, str]]:
     return pairs
 
 
-def _run_download_flow(args) -> int:
+def _run_download_flow(args, *, runner: PipelineRunner | None = None) -> int:
     """CLI entry for --download: fetch VOD/clip + HTML via TwitchDownloaderCLI."""
     from twitch_download import TwitchDownloadError, download_assets, download_assets_multi
 
@@ -720,11 +590,12 @@ def _run_download_flow(args) -> int:
         emit_task_event("stage_failed", stage="download", completed=0, total=1)
         print(f"错误: 下载失败: {e}", file=sys.stderr)
         return 1
-    global _TASK_RESULT_CONTEXT
-    _TASK_RESULT_CONTEXT = {
-        "mode": "download",
-        "artifacts": [("video", result.video_path), ("chat_html", result.chat_html_path)],
-    }
+    task_runner = runner or active_runner()
+    if task_runner is not None:
+        task_runner.configure(
+            mode="download",
+            artifacts=[("video", result.video_path), ("chat_html", result.chat_html_path)],
+        )
     emit_task_event("stage_completed", stage="download", completed=1, total=1)
     return _post_download_next_steps(
         result.video_path,
@@ -2261,7 +2132,7 @@ def _main():
         )
         raise SystemExit(0)
     if getattr(args, "download", None):
-        raise SystemExit(_run_download_flow(args))
+        raise SystemExit(_run_download_flow(args, runner=active_runner()))
 
     # --job fills only fields still at CLI default (explicit CLI wins).
     job_applied: list[str] = []
@@ -2494,17 +2365,18 @@ def _main():
             "错误: --output 不能与源视频指向同一文件；请选择新的输出文件名，避免覆盖原片。"
         )
 
-    global _TASK_RESULT_CONTEXT
-    _TASK_RESULT_CONTEXT = {
-        "mode": str(getattr(args, "mode", "auto") or "auto"),
-        "artifacts": [
-            ("video", final_output),
-            ("translation_json", trans_json),
-            ("review_xlsx", review_xlsx),
-            ("review_tsv", review_tsv),
-            ("preview_image", getattr(args, "preview_image", None)),
-        ],
-    }
+    runner = active_runner()
+    if runner is not None:
+        runner.configure(
+            mode=getattr(args, "mode", "auto"),
+            artifacts=[
+                ("video", final_output),
+                ("translation_json", trans_json),
+                ("review_xlsx", review_xlsx),
+                ("review_tsv", review_tsv),
+                ("preview_image", getattr(args, "preview_image", None)),
+            ],
+        )
 
     if args.render_original:
         log("[1/1] 不使用 LLM，直接渲染原始聊天文本和 HTML 中已有 emote")
@@ -2791,32 +2663,22 @@ def _terminal_exit_code(value: object) -> int:
         return 1
 
 
-def _write_terminal_result(state: str, returncode: int) -> None:
-    terminal_state = str(_TASK_RESULT_CONTEXT.get("terminal_state") or state)
-    write_task_result(
-        state=terminal_state,
-        mode=str(_TASK_RESULT_CONTEXT.get("mode", "unknown")),
-        returncode=returncode,
-        artifacts=list(_TASK_RESULT_CONTEXT.get("artifacts", [])),
-    )
-
-
 def main():
     """Run the pipeline and publish an optional narrow terminal result manifest."""
-    global _TASK_RESULT_CONTEXT
-    _TASK_RESULT_CONTEXT = {"mode": "unknown", "artifacts": []}
-    try:
-        result = _main()
-    except SystemExit as exc:
-        code = _terminal_exit_code(exc.code)
-        _write_terminal_result("succeeded" if code == 0 else "failed", code)
-        raise
-    except BaseException:
-        _write_terminal_result("failed", 1)
-        raise
-    code = _terminal_exit_code(result)
-    _write_terminal_result("succeeded" if code == 0 else "failed", code)
-    return result
+    runner = PipelineRunner()
+    with activate_runner(runner):
+        try:
+            result = _main()
+        except SystemExit as exc:
+            code = _terminal_exit_code(exc.code)
+            runner.publish_terminal_result("succeeded" if code == 0 else "failed", code)
+            raise
+        except BaseException:
+            runner.publish_terminal_result("failed", 1)
+            raise
+        code = _terminal_exit_code(result)
+        runner.publish_terminal_result("succeeded" if code == 0 else "failed", code)
+        return result
 
 
 if __name__ == "__main__":

@@ -1,0 +1,19 @@
+# 半透明游戏悬浮弹幕预设 — 适合不想遮挡游戏画面的沉浸式观看
+# 用法: --layout-preset profiles/layout_transparent.yaml
+name: layout_transparent
+label: "Transparent floating overlay"
+description: "Semi-transparent floating text directly over game footage with subtle background."
+
+layout:
+  x: 15              # 弹幕框左上角 X 坐标
+  y: 327             # 弹幕框左上角 Y 坐标
+  width: 497         # 弹幕框宽度
+  height: 363        # 弹幕框高度
+  font_size: 15      # 字体大小
+  font_path: auto
+  font_bold_path: auto
+  fps: 15
+  max_visible: 0
+  msg_lifetime: 14.0
+  bg_alpha: 110      # 半透明暗色背景（0 为全透明，255 为纯黑）
+  emote_height: 22

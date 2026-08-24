@@ -1,0 +1,20 @@
+# 右侧标准弹幕框预设 — 适合游戏左侧有 UI / 角色头像 / 小地图的场景
+# 用法: --layout-preset profiles/layout_right.yaml
+# 1080p 画面下贴近右侧边缘（X=1408, Y=327, W=497, H=363）
+name: layout_right
+label: "Right-side chat box"
+description: "Right-aligned chat overlay (1080p geometry); avoids game UI and character avatars on the left."
+
+layout:
+  x: 1408            # 弹幕框左上角 X 坐标（1920 - 497 - 15 = 1408）
+  y: 327             # 弹幕框左上角 Y 坐标
+  width: 497         # 弹幕框宽度
+  height: 363        # 弹幕框高度
+  font_size: 15      # 字体大小
+  font_path: auto    # 字体文件路径；auto = 自动检测系统 CJK 字体
+  font_bold_path: auto
+  fps: 15            # 弹幕层采样帧率
+  max_visible: 0     # 0=按框高/字号自动填满
+  msg_lifetime: 14.0 # 消息停留秒数
+  bg_alpha: 255      # 纯黑不透明底
+  emote_height: 22   # 表情图片高度

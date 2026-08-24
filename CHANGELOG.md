@@ -4,9 +4,29 @@ Notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Added an in-TUI API configuration editor and asynchronous non-blocking connectivity testing with live health/latency feedback.
+- Added core time offset (`--offset`) support directly in the TUI with bidirectional YAML persistence and range validation.
+- Added new public presets: `layout_right` (right-side UI avoidance), `layout_transparent` (subtle game overlay), `layout_sidebar` (full-height chat column), `layout_top_right`, `render_audio_copy` (lossless audio stream copy), and translation profiles `gaming_slang` and `acg_anime`.
+- Added a tested Windows direct-dependency constraint set that `install.bat` uses automatically while keeping cross-platform package requirements compatible.
+- Added a shared cut timeline so multi-segment video trimming and chat timestamp remapping use the same normalized ranges.
+- Added execution-scoped pipeline results and an immutable overlay-scene plan for safer task lifecycle handling and render planning.
+
 ### Changed
 
 - Started the next development cycle as `0.2.5.dev0` after the v0.2.4 release.
+- Overhauled all TUI interface text across all 6 tabs for significantly improved readability while preserving 100% of technical boundary explanations and safety warnings.
+- Reorganized task modes into three clear paths: Quick Preview, Full Production, and Step-by-Step Manual Review, with seamless resumption guidance and full backward compatibility.
+- Optimized auto hardware encoder detection priority to discrete GPUs first (`NVENC -> AMF -> QSV -> x264 fallback`).
+- Upgraded layout presets, render presets, and video encoders in TUI from free-text inputs to structured `Select` dropdowns with built-in options.
+- Made VOD crop segments optional in the download tab, allowing full VOD downloads without mandatory cropping.
+- Centralized pipeline command projection and shared burn-flag forwarding so TUI and CLI adapters use one canonical parameter contract.
+
+### Fixed
+
+- Prevented local history clearing while queued or running tasks still exist, including tasks owned by another TUI process.
+- Fixed `scripts/run_tests.py --help` crashing when formatting the coverage percentage.
 
 ## [0.2.4] - 2026-07-24
 

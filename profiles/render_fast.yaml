@@ -3,10 +3,10 @@
 # 适合：快速检查弹幕位置/翻译效果，不需要最终画质时。
 name: render_fast
 label: "Fast draft"
-description: "Lower quality, faster x264 + PNG overlay path for quick checks."
+description: "Fast draft via auto GPU acceleration + direct PNG overlay for quick checks."
 
 render:
-  encoder: x264
+  encoder: auto          # 编码器：auto（优先显卡加速 NVENC/AMF/QSV，无显卡自动回退 x264）
   video_preset: veryfast  # 比 fast 更快，质量略低
   crf: 23                 # 比 default 高 5，文件更小但质量略低
   audio_codec: aac

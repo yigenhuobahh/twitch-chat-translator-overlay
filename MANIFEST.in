@@ -7,6 +7,7 @@ include LICENSE
 include CONTRIBUTING.md
 include requirements.txt
 include requirements-dev.txt
+include constraints-windows.txt
 include .env.example
 include .gitattributes
 include .gitignore
@@ -28,12 +29,19 @@ include jobs/example_job.yaml
 
 # Public YAML assets (whitelist; private channel profiles stay local via .gitignore).
 include profiles/default.yaml
+include profiles/gaming_slang.yaml
+include profiles/acg_anime.yaml
 include profiles/layout_default.yaml
+include profiles/layout_right.yaml
 include profiles/layout_compact.yaml
 include profiles/layout_mobile.yaml
+include profiles/layout_transparent.yaml
+include profiles/layout_sidebar.yaml
+include profiles/layout_top_right.yaml
 include profiles/render_default.yaml
 include profiles/render_fast.yaml
 include profiles/render_hq.yaml
+include profiles/render_audio_copy.yaml
 include configs/rules.example.yaml
 
 # Test source for sdist (CI unpacks the sdist and runs pytest).

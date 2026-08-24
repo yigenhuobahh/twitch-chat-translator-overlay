@@ -1,0 +1,18 @@
+# 音频无损复制编码预设 — 音轨直接 Stream Copy，不重采样
+# 用法: --render-preset profiles/render_audio_copy.yaml
+# 适合：保留 100% 原始音质，且音频无需二次编码，加快压制速度。
+name: render_audio_copy
+label: "Audio Passthrough (Copy)"
+description: "Auto GPU acceleration with direct audio stream copy (no lossy re-encoding)."
+
+render:
+  encoder: auto          # 编码器：auto（优先显卡加速 NVENC/AMF/QSV，无显卡自动回退 x264）
+  video_preset: fast
+  crf: 18
+  audio_codec: copy      # 音频直通拷贝，无损保留原始音轨
+  overlay_codec: vp9
+  webm_crf: 30
+  webm_cpu_used: 4
+  reuse_static_frames: true
+  skip_blank_frames: true
+  blank_hold_seconds: 0.5

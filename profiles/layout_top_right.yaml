@@ -1,0 +1,19 @@
+# 右上角小窗预设 — 适合底部有大面积技能/字幕/对话框的游戏
+# 用法: --layout-preset profiles/layout_top_right.yaml
+name: layout_top_right
+label: "Top-right compact window"
+description: "Top-right chat box avoiding bottom skills, dialogue subtitles, and game controls."
+
+layout:
+  x: 1408            # 弹幕框左上角 X 坐标
+  y: 40              # 弹幕框左上角 Y 坐标（顶部）
+  width: 497         # 弹幕框宽度
+  height: 320        # 弹幕框高度
+  font_size: 14      # 字体大小
+  font_path: auto
+  font_bold_path: auto
+  fps: 15
+  max_visible: 0
+  msg_lifetime: 12.0
+  bg_alpha: 255
+  emote_height: 20

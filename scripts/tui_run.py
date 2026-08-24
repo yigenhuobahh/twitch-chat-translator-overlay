@@ -10,22 +10,113 @@ import sys
 import time
 import webbrowser
 
+from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, VerticalScroll
-from textual.widgets import Button, Checkbox, Footer, Header, Input, RichLog, Static, TabbedContent, TabPane
+from textual.widgets import (
+    Button,
+    Checkbox,
+    Footer,
+    Header,
+    Input,
+    Label,
+    OptionList,
+    RichLog,
+    Select,
+    Static,
+    TabbedContent,
+    TabPane,
+)
+from textual.widgets.option_list import Option
 
+from env_bootstrap import (
+    get_translate_api_config,
+    probe_translate_api,
+    save_dotenv_api_config,
+)
 from tui_history import TuiHistoryStore
 from tui_models import (
+    MODE_AUTO,
+    MODE_FULL_PRODUCTION,
     MODE_FULL_RENDER,
     MODE_ORIGINAL_PREVIEW,
+    MODE_ORIGINAL_PRODUCTION,
+    MODE_QUICK_PREVIEW_ORIGINAL,
+    MODE_QUICK_PREVIEW_TRANSLATED,
     MODE_RENDER_ONLY,
+    MODE_RENDER_ORIGINAL,
     MODE_REUSE_RENDER,
+    MODE_STEP_API_AND_REVIEW,
+    MODE_STEP_EXPORT_MANUAL,
+    MODE_STEP_RESUME_RENDER,
     MODE_TRANSLATE_ONLY,
     MODE_TRANSLATED_PREVIEW,
     TuiDownloadDraft,
     TuiJobDraft,
 )
 from tui_task import TaskSession, redact_command, sanitize_diagnostic_file
+
+_UI_MODE_RENDER_ORIGINAL = "render_original"
+
+# 3 Core Operational Paths (Primary UI Options)
+_CORE_TASK_MODE_OPTIONS = (
+    ("【快速预览】1. 原文短片预览（不调用 API，10 秒快速看弹幕与排版）", MODE_QUICK_PREVIEW_ORIGINAL),
+    ("【快速预览】2. 翻译小样预览（调用 API，10 秒快速看翻译效果）", MODE_QUICK_PREVIEW_TRANSLATED),
+    ("【一键出片】1. 全自动翻译压制（提取 + API 翻译 + 规则清洗 + 压制成片）", MODE_FULL_PRODUCTION),
+    ("【一键出片】2. 纯原文弹幕压制（不调用 API，直接压制全片）", MODE_ORIGINAL_PRODUCTION),
+    ("【分步复核】1. 导出待翻译表单（提取弹幕并导出待翻译文件，暂停）", MODE_STEP_EXPORT_MANUAL),
+    ("【分步复核】2. 自动翻译并导出复核表（API 翻译后导出 Excel 供人工核对）", MODE_STEP_API_AND_REVIEW),
+    ("【分步复核】3. 载入复核表并压制（使用已核对的 JSON/Excel 恢复压制成片）", MODE_STEP_RESUME_RENDER),
+)
+
+# Legacy Task Modes (Maintained for full backward compatibility)
+_LEGACY_TASK_MODE_OPTIONS = (
+    ("原文预览 (Legacy)", MODE_ORIGINAL_PREVIEW),
+    ("翻译预览 (Legacy)", MODE_TRANSLATED_PREVIEW),
+    ("正式翻译渲染 (Legacy)", MODE_FULL_RENDER),
+    ("复用已有翻译渲染 (Legacy)", MODE_REUSE_RENDER),
+    ("仅渲染原文 (Legacy)", _UI_MODE_RENDER_ORIGINAL),
+    ("仅翻译并导出 JSON (Legacy)", MODE_TRANSLATE_ONLY),
+    ("自动模式 (Legacy)", MODE_AUTO),
+)
+
+_TASK_MODE_OPTIONS = (
+    *_CORE_TASK_MODE_OPTIONS,
+    *_LEGACY_TASK_MODE_OPTIONS,
+)
+
+_ADVANCED_RENDER_MODE_OPTION = ("仅渲染（导入 YAML 的高级流程）", MODE_RENDER_ONLY)
+
+_LAYOUT_PRESET_OPTIONS = (
+    ("左下标准 (Default - 1080p 标准左下角黑底弹幕框)", "default"),
+    ("右侧避让 (Right - 1080p 右侧弹幕框，避开左侧游戏UI与头像)", "right"),
+    ("紧凑小框 (Compact - 缩小版弹幕框，适合小窗或密集聊天)", "compact"),
+    ("移动上浮 (Mobile - 上浮堆叠模式，自动填满高度，适合手机观看)", "mobile"),
+    ("半透明悬浮 (Transparent - 半透明淡底，弱化黑框不遮挡游戏画面)", "transparent"),
+    ("全高侧边栏 (Sidebar - 纵向通顶长条侧边栏，适合大体量弹幕)", "sidebar"),
+    ("右上小窗 (Top-Right - 右上角小窗，避开底部技能与剧情字幕)", "top_right"),
+)
+
+_RENDER_PRESET_OPTIONS = (
+    ("自动智能 (Default - 优先显卡加速，CRF 18 平衡出片)", "default"),
+    ("极速草稿 (Fast - 优先显卡加速 + PNG 直接叠加，秒级出样)", "fast"),
+    ("母带高清 (HQ - 优先显卡高质量模式/CRF 16 + 256k 音频)", "hq"),
+    ("无损音轨 (Audio Copy - 音轨直通不重采样，保留100%音质)", "audio_copy"),
+)
+
+_ENCODER_OPTIONS = (
+    ("智能识别 (Auto - 优先独显 NVENC/AMF -> QSV -> 回退 x264)", "auto"),
+    ("NVIDIA 硬件加速 (NVENC - 适用于 GeForce/RTX/Quadro 显卡)", "nvenc"),
+    ("AMD 硬件加速 (AMF - 适用于 Radeon RX 独显与 Ryzen APU)", "amf"),
+    ("Intel 硬件加速 (QSV - 适用于 Core 核显与 Arc 独显)", "qsv"),
+    ("CPU 软件编码 (x264 - 通用稳定无显卡依赖)", "x264"),
+)
+
+_MEDIA_CHECK_OPTIONS = (
+    ("完整检查：逐帧解码验证，推荐正式任务使用", "decode"),
+    ("快速检查：仅检查封装结构、时间戳与流信息", "fast"),
+    ("关闭检查：跳过检查（仅供排障调试）", "off"),
+)
 
 
 class OverlayTui(App[None]):
@@ -36,12 +127,23 @@ class OverlayTui(App[None]):
     #status { height: 3; padding: 1; }
     TabbedContent { height: 1fr; }
     VerticalScroll { padding: 0 1; }
-    Input { margin: 1 0; }
+    Input { margin: 0 0 1 0; }
+    Select { margin: 0 0 1 0; }
     Checkbox { margin: 1 0; }
     RichLog { height: 1fr; min-height: 12; border: round $accent; }
+    OptionList { height: 1fr; min-height: 12; border: round $accent; }
     Horizontal { height: auto; margin: 1 0; }
     Button { margin-right: 1; }
     .hint { color: $text-muted; margin: 1 0; }
+    .section-title { text-style: bold; color: $accent; margin: 1 0 0 0; }
+    .field-row { height: 3; margin: 1 0 0 0; }
+    .field-row .field-label { width: 26; color: $text-muted; margin: 1 1 0 0; }
+    .field-row Input { width: 1fr; margin: 0; }
+    .field-row Select { width: 1fr; margin: 0; }
+    #form-validation { height: auto; min-height: 2; max-height: 6; margin: 0 0 1 0; }
+    #form-validation.ready { color: $success; }
+    #form-validation.invalid { color: $warning; }
+    #api-status-feedback { margin: 1 0; }
     """
     TITLE = "Twitch Chat Overlay"
     ISSUE_TEMPLATE_URL = "https://github.com/yigenhuobahh/twitch-chat-translator-overlay/issues/new?template=bug_report.yml"
@@ -52,7 +154,7 @@ class OverlayTui(App[None]):
         self.last_draft: TuiJobDraft | None = None
         self.imported_draft: TuiJobDraft | None = None
         self.result_directory: Path | None = None
-        self.completion_message = "任务完成。"
+        self.completion_message = "任务已顺利完成。"
         self.history = TuiHistoryStore(Path(__file__).resolve().parent.parent / "outputs" / ".tui-history" / "history.json")
         self.active_history_id: str | None = None
         self._handled_session: TaskSession | None = None
@@ -60,78 +162,169 @@ class OverlayTui(App[None]):
         self.require_result_manifest = False
         self.download_requested_duration_s: float | None = None
         self.download_duration_note = ""
+        self.selected_history_id: str | None = None
+        self._history_clear_confirmation_until = 0.0
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Static("选择本地视频和 Twitch 聊天 HTML，然后开始预览或正式渲染。", id="status")
+        yield Static("请选择工作模式并载入素材，随后即可开始快速预览、一键出片或分步人工复核。", id="status")
         with TabbedContent(initial="new-task"):
             with TabPane("下载素材", id="download"):
                 with VerticalScroll():
-                    yield Static("下载使用已安装的 TwitchDownloaderCLI。VOD 为避免误下载整段内容，必须填写至少一个裁切段；Clip 本身可直接下载。多个 VOD 片段用分号分隔。短时间窗可能按 Twitch 的 HLS 分片边界扩展，完成后会提示实际时长。", classes="hint")
-                    yield Input(placeholder="公开 Twitch VOD/Clip 链接或数字 ID", id="download-url")
-                    yield Input(value="1080p60", placeholder="画质，例如 1080p60 / 720p60", id="download-quality")
-                    yield Input(value="decode", placeholder="下载视频检查：decode / fast / off", id="download-media-check")
-                    yield Static("默认完整解码每个片段和合并结果；这会花额外时间，但能在开始翻译前拦住损坏视频。", classes="hint")
-                    yield Input(placeholder="下载目录（可选；留空自动创建）", id="download-dir")
-                    yield Input(placeholder="裁切段：1:00:00-1:00:08; 1:00:20-1:00:28", id="download-segments")
-                    yield Input(placeholder="OAuth（订阅限定 VOD；仅本次下载使用）", password=True, id="download-oauth")
+                    yield Static(
+                        "支持从 Twitch 下载公开或订阅 VOD 与精彩 Clip。\n"
+                        "• 留空不填：直接下载整段完整 VOD 或 Clip 内容。\n"
+                        "• 多段裁切拼接：用分号或换行分隔多个时间段（如 1:00:00-1:00:08; 1:00:20-1:00:28），下载后将自动按时间顺序裁剪并拼接为一个完整视频与弹幕文件。\n"
+                        "提示：Twitch 视频可能按 HLS 分片边界对齐扩展切片时长，下载完成后会自动核对实际时长。",
+                        classes="hint",
+                    )
+                    with Horizontal(classes="field-row"):
+                        yield Label("VOD / Clip", classes="field-label")
+                        yield Input(placeholder="公开 Twitch VOD/Clip 链接或数字 ID", id="download-url")
+                    with Horizontal(classes="field-row"):
+                        yield Label("下载画质", classes="field-label")
+                        yield Input(value="1080p60", placeholder="画质，例如 1080p60 / 720p60", id="download-quality")
+                    with Horizontal(classes="field-row"):
+                        yield Label("下载媒体检查", classes="field-label")
+                        yield Select(
+                            _MEDIA_CHECK_OPTIONS,
+                            value="decode",
+                            allow_blank=False,
+                            prompt="下载媒体检查",
+                            id="download-media-check",
+                        )
+                    yield Static("完整检查会顺序解码每个分片与合并后的文件，适合正式出片；快速检查耗时极短，适合快速确认素材范围。", classes="hint")
+                    with Horizontal(classes="field-row"):
+                        yield Label("下载目录（可选）", classes="field-label")
+                        yield Input(placeholder="下载目录（可选；留空自动创建）", id="download-dir")
+                    with Horizontal(classes="field-row"):
+                        yield Label("VOD 裁切段（可选）", classes="field-label")
+                        yield Input(placeholder="可选：留空下载整段；多段拼接用分号分隔：1:00:00-1:00:08; 1:00:20-1:00:28", id="download-segments")
+                    with Horizontal(classes="field-row"):
+                        yield Label("OAuth（可选，不会保存）", classes="field-label")
+                        yield Input(placeholder="OAuth（订阅限定 VOD；仅本次下载使用）", password=True, id="download-oauth")
                     yield Button("下载并载入新任务", id="download-start", variant="primary")
             with TabPane("新任务", id="new-task"):
                 with VerticalScroll():
-                    yield Static("选择一个操作。正式渲染可直接启动；首次使用建议先做原文预览。", classes="hint")
-                    with Horizontal():
-                        yield Button("原文预览", id="original-preview", variant="primary")
-                        yield Button("翻译预览", id="translated-preview")
-                    with Horizontal():
-                        yield Button("正式翻译渲染", id="full-render", variant="success")
-                        yield Button("复用翻译渲染", id="reuse-render")
+                    yield Static(
+                        "请选择工作模式并指定素材路径。初次使用建议先跑【快速预览】确认弹幕位置；日常使用推荐【一键出片】或【分步人工复核】。",
+                        classes="hint",
+                    )
+                    with Horizontal(classes="field-row"):
+                        yield Label("任务模式", classes="field-label")
+                        yield Select(
+                            _TASK_MODE_OPTIONS,
+                            value=MODE_QUICK_PREVIEW_ORIGINAL,
+                            allow_blank=False,
+                            prompt="任务模式",
+                            id="task-mode",
+                        )
                     yield Static("输入素材", classes="hint")
-                    yield Input(placeholder="源视频路径 (.mp4/.mkv/...)", id="video")
-                    yield Input(placeholder="TwitchDownloader 聊天 HTML 路径", id="chat")
-                    yield Input(placeholder="输出视频路径（可选，默认源视频同目录）", id="output")
-                    yield Input(value="10", placeholder="预览时长（秒）", id="preview-clip")
+                    with Horizontal(classes="field-row"):
+                        yield Label("源视频", classes="field-label")
+                        yield Input(placeholder="源视频路径 (.mp4/.mkv/...)", id="video")
+                    with Horizontal(classes="field-row"):
+                        yield Label("Twitch 聊天 HTML", classes="field-label")
+                        yield Input(placeholder="TwitchDownloader 聊天 HTML 路径", id="chat")
+                    with Horizontal(classes="field-row"):
+                        yield Label("输出视频（可选）", classes="field-label")
+                        yield Input(placeholder="输出视频路径（可选，默认源视频同目录）", id="output")
+                    with Horizontal(classes="field-row"):
+                        yield Label("预览时长（秒）", classes="field-label")
+                        yield Input(value="10", placeholder="预览时长（秒）", id="preview-clip")
+                    with Horizontal(classes="field-row"):
+                        yield Label("时间偏移（秒）", classes="field-label")
+                        yield Input(value="0.0", placeholder="0.0", id="offset")
+                    yield Static("时间偏移用于微调弹幕与视频的时间轴对齐（正数延后，负数提前；例如 0.0、12.5、-3.0；留空或 0 则自动按直播流时间戳对齐）。", classes="hint")
+                    yield Static("", id="form-validation", classes="invalid")
+                    yield Button("开始所选任务", id="run-mode", variant="primary")
             with TabPane("任务与结果", id="task"):
                 with VerticalScroll():
-                    yield Static("结构化阶段事件和子进程输出会显示在这里。失败后可导出脱敏诊断。", classes="hint")
+                    yield Static("实时显示任务执行进度、结构化阶段事件与子进程日志。若任务遇到异常，可导出脱敏诊断报告以便排障。", classes="hint")
                     yield RichLog(id="log", wrap=True, highlight=False, markup=False)
                     with Horizontal():
-                        yield Button("环境检查", id="doctor")
-                        yield Button("生成 Issue 摘要", id="support-summary")
-                        yield Button("打开 Bug 模板", id="open-issue")
-                        yield Button("离线演示", id="demo")
-                        yield Button("取消任务", id="cancel", variant="warning")
-                        yield Button("打开结果目录", id="open-result")
-                        yield Button("导出诊断", id="export-diagnostics")
+                        yield Button("运行环境检查", id="doctor")
+                        yield Button("生成 Issue 自检摘要", id="support-summary")
+                        yield Button("打开 Bug 反馈模板", id="open-issue")
+                        yield Button("生成离线演示小样", id="demo")
+                        yield Button("取消当前任务", id="cancel", variant="warning")
+                        yield Button("打开结果输出目录", id="open-result")
+                        yield Button("导出脱敏诊断日志", id="export-diagnostics")
             with TabPane("保存与导入", id="jobs"):
                 with VerticalScroll():
-                    yield Static("YAML 是可复现任务的高级格式。导入后可在表单中调整并重新保存。", classes="hint")
-                    yield Input(placeholder="现有 job.yaml 路径", id="job-path")
+                    yield Static("任务配置管理：可将当前界面的全部参数保存为 YAML 配置文件，或导入已有的配置文件实现一键复现。", classes="hint")
+                    with Horizontal(classes="field-row"):
+                        yield Label("Job YAML", classes="field-label")
+                        yield Input(placeholder="现有 job.yaml 路径", id="job-path")
                     with Horizontal():
                         yield Button("导入 YAML", id="load-job")
                         yield Button("保存为新 YAML", id="save-job")
                     yield Checkbox("保存时固定本次视频、聊天和输出路径", value=True, id="pin-paths")
-                    yield Input(placeholder="翻译 JSON（复用翻译渲染时必填）", id="translation-json")
+                    with Horizontal(classes="field-row"):
+                        yield Label("翻译 JSON", classes="field-label")
+                        yield Input(placeholder="翻译 JSON（复用翻译渲染时必填）", id="translation-json")
             with TabPane("高级设置", id="advanced"):
                 with VerticalScroll():
                     yield Static("这些选项会映射到现有 YAML/命令行参数；留空即使用项目默认值。", classes="hint")
-                    yield Input(value="zh", placeholder="目标语言，例如 zh / ja / ko", id="target-language")
-                    yield Input(value="default", placeholder="布局预设：default / compact / mobile", id="layout-preset")
-                    yield Input(value="default", placeholder="编码预设：default / fast / hq", id="render-preset")
-                    yield Input(placeholder="翻译 profile YAML（可选）", id="profile")
-                    yield Input(placeholder="翻译后替换规则 YAML（可选）", id="rules")
-                    yield Input(placeholder="编码器：x264 / auto / nvenc / qsv / amf", id="encoder")
-                    yield Input(value="decode", placeholder="输入视频检查：decode / fast / off", id="source-media-check")
-                    yield Static("默认在翻译和渲染前完整解码源视频。长视频会多花一次读取时间，但能更早发现坏片段。", classes="hint")
-                    yield Input(placeholder="CRF/CQ（可选正整数）", id="crf")
-                    yield Input(placeholder="翻译并发数（可选正整数）", id="workers")
+
+                    yield Static("API 配置与连通性", classes="section-title")
+                    yield Static("配置 OpenAI 兼容的翻译服务（如 OpenAI、DeepSeek、Ollama 等）。密钥使用密码掩码输入，保存后将安全写入本地 .env 文件。", classes="hint")
+                    with Horizontal(classes="field-row"):
+                        yield Label("API 接口地址", classes="field-label")
+                        yield Input(placeholder="https://api.openai.com/v1", id="api-base-url")
+                    with Horizontal(classes="field-row"):
+                        yield Label("API 密钥", classes="field-label")
+                        yield Input(placeholder="sk-...", password=True, id="api-key")
+                    with Horizontal(classes="field-row"):
+                        yield Label("翻译模型", classes="field-label")
+                        yield Input(placeholder="gpt-4o-mini / deepseek-chat", id="api-model")
+                    with Horizontal():
+                        yield Button("测试 API 连通性", id="btn-test-api")
+                        yield Button("保存配置到 .env", id="btn-save-api")
+                    yield Static("点击【测试 API 连通性】以验证当前接口配置与鉴权状态。", id="api-status-feedback", classes="hint")
+
+                    yield Static("翻译、编码与排版参数", classes="section-title")
+                    with Horizontal(classes="field-row"):
+                        yield Label("目标语言", classes="field-label")
+                        yield Input(value="zh", placeholder="目标语言，例如 zh / ja / ko", id="target-language")
+                    with Horizontal(classes="field-row"):
+                        yield Label("布局预设", classes="field-label")
+                        yield Select(_LAYOUT_PRESET_OPTIONS, value="default", allow_blank=False, id="layout-preset")
+                    with Horizontal(classes="field-row"):
+                        yield Label("编码预设", classes="field-label")
+                        yield Select(_RENDER_PRESET_OPTIONS, value="default", allow_blank=False, id="render-preset")
+                    with Horizontal(classes="field-row"):
+                        yield Label("视频编码器（可选）", classes="field-label")
+                        yield Select(_ENCODER_OPTIONS, value="auto", allow_blank=False, id="encoder")
+                    with Horizontal(classes="field-row"):
+                        yield Label("输入视频检查", classes="field-label")
+                        yield Select(
+                            _MEDIA_CHECK_OPTIONS,
+                            value="decode",
+                            allow_blank=False,
+                            prompt="输入视频检查",
+                            id="source-media-check",
+                        )
+                    yield Static("完整检查会在翻译和压制前对源视频执行顺序解码校验；快速检查仅校验元数据与时间戳。", classes="hint")
+                    with Horizontal(classes="field-row"):
+                        yield Label("CRF / CQ（可选）", classes="field-label")
+                        yield Input(placeholder="CRF/CQ（可选正整数）", id="crf")
+                    with Horizontal(classes="field-row"):
+                        yield Label("翻译并发数（可选）", classes="field-label")
+                        yield Input(placeholder="翻译并发数（可选正整数）", id="workers")
+                    with Horizontal(classes="field-row"):
+                        yield Label("翻译 Profile（可选）", classes="field-label")
+                        yield Input(placeholder="翻译 profile YAML（可选）", id="profile")
+                    with Horizontal(classes="field-row"):
+                        yield Label("替换规则（可选）", classes="field-label")
+                        yield Input(placeholder="翻译后替换规则 YAML（可选）", id="rules")
                     yield Checkbox("保留中间文件，便于排障或续跑", id="keep-temp")
                     yield Checkbox("翻译后导出人工复核表并停止", id="review")
                     yield Checkbox("只导出待翻译内容，供手工翻译", id="manual-translation")
             with TabPane("历史与产物", id="history"):
                 with VerticalScroll():
-                    yield Static("输入任务短 ID 后可载入、重跑、打开产物或导出诊断。", classes="hint")
-                    yield Input(placeholder="任务短 ID", id="history-id")
-                    yield RichLog(id="history-log", wrap=True, highlight=False, markup=False)
+                    yield Static("选择一条任务后可载入、重跑、打开产物或导出诊断。", classes="hint")
+                    yield OptionList(id="history-list")
                     with Horizontal():
                         yield Button("刷新历史", id="history-refresh")
                         yield Button("载入任务", id="history-load")
@@ -147,7 +340,36 @@ class OverlayTui(App[None]):
         if interrupted:
             self._set_status(f"已标记 {len(interrupted)} 个上次中断的任务。")
         self._refresh_history()
+        self._load_api_config_into_ui()
+        self._refresh_form_validation()
         self.set_interval(0.15, self._poll_session)
+
+    def _load_api_config_into_ui(self) -> None:
+        try:
+            cfg = get_translate_api_config()
+            if cfg.get("base_url"):
+                self._set_input("#api-base-url", str(cfg["base_url"]))
+            if cfg.get("api_key"):
+                self._set_input("#api-key", str(cfg["api_key"]))
+            if cfg.get("model"):
+                self._set_input("#api-model", str(cfg["model"]))
+        except Exception:
+            pass
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id in {
+            "video", "chat", "output", "preview-clip", "offset", "translation-json",
+            "profile", "rules", "crf", "workers",
+        }:
+            self._refresh_form_validation()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id in {"task-mode", "source-media-check", "layout-preset", "render-preset", "encoder"}:
+            self._refresh_form_validation()
+
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        if event.checkbox.id in {"review", "manual-translation"}:
+            self._refresh_form_validation()
 
     def on_unmount(self) -> None:
         if self.session:
@@ -158,20 +380,18 @@ class OverlayTui(App[None]):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         action = event.button.id
-        if action == "original-preview":
-            self._start_draft(MODE_ORIGINAL_PREVIEW)
-        elif action == "translated-preview":
-            self._start_draft(MODE_TRANSLATED_PREVIEW)
-        elif action == "full-render":
-            self._start_draft(MODE_FULL_RENDER)
-        elif action == "reuse-render":
-            self._start_draft(MODE_REUSE_RENDER)
+        if action == "run-mode":
+            self._start_selected_mode()
         elif action == "download-start":
             self._start_download()
         elif action == "load-job":
             self._load_job()
         elif action == "save-job":
             self._save_job()
+        elif action == "btn-save-api":
+            self._save_api_config()
+        elif action == "btn-test-api":
+            self._test_api_connectivity()
         elif action == "doctor":
             self._start_command("环境检查", [sys.executable, str(self._pipeline()), "--doctor"], completion_message="环境检查完成。")
         elif action == "support-summary":
@@ -203,10 +423,11 @@ class OverlayTui(App[None]):
         elif action == "history-diagnostic":
             self._export_history_diagnostic()
         elif action == "history-clear":
-            self.history.clear()
-            self.active_history_id = None
-            self._refresh_history()
-            self._set_status("本机任务历史已清空。")
+            self._clear_history()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.id == "history-list" and event.option.id:
+            self._select_history(str(event.option.id))
 
     def _input(self, selector: str) -> str:
         return self.query_one(selector, Input).value
@@ -214,12 +435,68 @@ class OverlayTui(App[None]):
     def _set_input(self, selector: str, value: str) -> None:
         self.query_one(selector, Input).value = value
 
-    def _draft(self, mode: str | None = None) -> TuiJobDraft:
+    def _select_value(self, selector: str) -> str:
+        value = self.query_one(selector, Select).value
+        return value if isinstance(value, str) else ""
+
+    def _set_select(self, selector: str, value: str) -> None:
+        self.query_one(selector, Select).value = value
+
+    def _set_select_with_custom(self, selector: str, standard_options: tuple[tuple[str, str], ...], value: str) -> None:
+        val = value.strip() if value else ""
+        select_widget = self.query_one(selector, Select)
+        known_values = {opt_val for _label, opt_val in standard_options}
+        if val and val not in known_values:
+            custom_option = (f"自定义 ({val})", val)
+            select_widget.set_options((*standard_options, custom_option))
+            select_widget.value = val
+        else:
+            select_widget.set_options(standard_options)
+            target = val if val in known_values else (standard_options[0][1] if standard_options else "")
+            select_widget.value = target
+
+    def _set_task_mode_options(self, *, include_advanced_render: bool = False, value: str | None = None) -> None:
+        options = list(_TASK_MODE_OPTIONS)
+        if include_advanced_render:
+            options.append(_ADVANCED_RENDER_MODE_OPTION)
+        allowed = {item_value for _label, item_value in options}
+
+        if value and value not in allowed:
+            if value == MODE_RENDER_ONLY:
+                options.append(_ADVANCED_RENDER_MODE_OPTION)
+            else:
+                options.append((f"自定义模式 ({value})", value))
+            allowed.add(value)
+
+        target = value if (value and value in allowed) else MODE_QUICK_PREVIEW_ORIGINAL
+        task_mode = self.query_one("#task-mode", Select)
+        task_mode.set_options(options)
+        task_mode.value = target
+
+    def _draft(
+        self,
+        mode: str | None = None,
+        *,
+        render_original: bool | None = None,
+        reuse_translation: bool | None = None,
+    ) -> TuiJobDraft:
         try:
             preview_clip = float(self._input("#preview-clip") or 10)
         except ValueError:
-            preview_clip = 0
-        selected_mode = mode or (self.imported_draft.mode if self.imported_draft else MODE_ORIGINAL_PREVIEW)
+            preview_clip = 0.0
+        selected_mode = mode or self._select_value("#task-mode") or (
+            self.imported_draft.mode if self.imported_draft else MODE_QUICK_PREVIEW_ORIGINAL
+        )
+        inherited_render_original = bool(
+            self.imported_draft
+            and selected_mode == self.imported_draft.mode
+            and self.imported_draft.render_original
+        )
+        inherited_reuse_translation = bool(
+            self.imported_draft
+            and selected_mode == self.imported_draft.mode
+            and self.imported_draft.reuse_translation
+        )
         return TuiJobDraft(
             video=self._input("#video"),
             chat_html=self._input("#chat"),
@@ -227,37 +504,33 @@ class OverlayTui(App[None]):
             translation_json=self._input("#translation-json"),
             mode=selected_mode,
             target_language=self._input("#target-language"),
-            layout_preset=self._input("#layout-preset"),
-            render_preset=self._input("#render-preset"),
+            layout_preset=self._select_value("#layout-preset") or "default",
+            render_preset=self._select_value("#render-preset") or "default",
             preview_clip=preview_clip,
             profile=self._input("#profile"),
             rules=self._input("#rules"),
-            encoder=self._input("#encoder"),
-            source_media_check=self._input("#source-media-check"),
+            encoder=self._select_value("#encoder") or "auto",
+            source_media_check=self._select_value("#source-media-check") or "decode",
             crf=self._input("#crf"),
             workers=self._input("#workers"),
             keep_temp=self.query_one("#keep-temp", Checkbox).value,
             review=self.query_one("#review", Checkbox).value,
             manual_translation=self.query_one("#manual-translation", Checkbox).value,
-            render_original=bool(
-                self.imported_draft
-                and selected_mode == self.imported_draft.mode
-                and self.imported_draft.render_original
-            ),
-            reuse_translation=bool(
-                self.imported_draft
-                and selected_mode == self.imported_draft.mode
-                and self.imported_draft.reuse_translation
-            ),
+            render_original=inherited_render_original if render_original is None else render_original,
+            reuse_translation=inherited_reuse_translation if reuse_translation is None else reuse_translation,
+            offset=self._input("#offset").strip(),
             source_job=self._input("#job-path"),
             extra_fields=dict(self.imported_draft.extra_fields or {}) if self.imported_draft else None,
         )
+
+    def _read_form_draft(self, mode: str | None = None, **kwargs) -> TuiJobDraft:
+        return self._draft(mode, **kwargs)
 
     def _download_draft(self) -> TuiDownloadDraft:
         return TuiDownloadDraft(
             source=self._input("#download-url"),
             quality=self._input("#download-quality"),
-            media_check=self._input("#download-media-check"),
+            media_check=self._select_value("#download-media-check") or "decode",
             download_dir=self._input("#download-dir"),
             segments_text=self._input("#download-segments"),
             oauth=self._input("#download-oauth"),
@@ -266,7 +539,7 @@ class OverlayTui(App[None]):
     def _apply_download_draft(self, draft: TuiDownloadDraft) -> None:
         self._set_input("#download-url", draft.source)
         self._set_input("#download-quality", draft.quality)
-        self._set_input("#download-media-check", draft.media_check)
+        self._set_select("#download-media-check", draft.media_check)
         self._set_input("#download-dir", draft.download_dir)
         self._set_input("#download-segments", draft.segments_text)
         self._set_input("#download-oauth", "")
@@ -279,6 +552,7 @@ class OverlayTui(App[None]):
             return
         self.download_requested_duration_s = draft.requested_duration_s()
         self.download_duration_note = ""
+        self._log("[检查] " + self._media_check_summary(draft.media_check, subject="下载素材"))
         self._start_command(
             "正在下载素材",
             draft.build_command(sys.executable, self._pipeline()),
@@ -289,20 +563,40 @@ class OverlayTui(App[None]):
         )
 
     def _apply_draft(self, draft: TuiJobDraft) -> None:
+        offset_val = draft.offset if draft.offset is not None and str(draft.offset).strip() != "" else (draft.extra_fields or {}).get("offset", "")
         values = {
-            "#video": draft.video, "#chat": draft.chat_html, "#output": draft.output,
-            "#translation-json": draft.translation_json, "#target-language": draft.target_language,
-            "#layout-preset": draft.layout_preset, "#render-preset": draft.render_preset,
-            "#preview-clip": str(draft.preview_clip), "#profile": draft.profile, "#rules": draft.rules,
-            "#encoder": draft.encoder, "#crf": draft.crf, "#workers": draft.workers,
-            "#source-media-check": draft.source_media_check,
+            "#video": draft.video,
+            "#chat": draft.chat_html,
+            "#output": draft.output,
+            "#translation-json": draft.translation_json,
+            "#target-language": draft.target_language,
+            "#preview-clip": str(draft.preview_clip),
+            "#profile": draft.profile,
+            "#rules": draft.rules,
+            "#crf": draft.crf,
+            "#workers": draft.workers,
+            "#offset": "" if offset_val is None else str(offset_val),
             "#job-path": draft.source_job,
         }
         for selector, value in values.items():
             self._set_input(selector, value)
+
+        self._set_select_with_custom("#layout-preset", _LAYOUT_PRESET_OPTIONS, draft.layout_preset or "default")
+        self._set_select_with_custom("#render-preset", _RENDER_PRESET_OPTIONS, draft.render_preset or "default")
+        self._set_select_with_custom("#encoder", _ENCODER_OPTIONS, draft.encoder or "auto")
+        self._set_select("#source-media-check", draft.source_media_check or "decode")
+
+        mode_value = _UI_MODE_RENDER_ORIGINAL if draft.mode == MODE_RENDER_ONLY and draft.render_original else draft.mode
+        self._set_task_mode_options(
+            include_advanced_render=draft.mode == MODE_RENDER_ONLY and not draft.render_original,
+            value=mode_value,
+        )
         self.query_one("#keep-temp", Checkbox).value = draft.keep_temp
         self.query_one("#review", Checkbox).value = draft.review
         self.query_one("#manual-translation", Checkbox).value = draft.manual_translation
+
+    def _populate_form_from_draft(self, draft: TuiJobDraft) -> None:
+        self._apply_draft(draft)
 
     @staticmethod
     def _pipeline() -> Path:
@@ -311,16 +605,111 @@ class OverlayTui(App[None]):
     def _set_status(self, message: str) -> None:
         self.query_one("#status", Static).update(message)
 
+    def _refresh_form_validation(self) -> None:
+        validation = self.query_one("#form-validation", Static)
+        problems = self._draft().validate(check_api=False, check_environment=False)
+        if problems:
+            validation.remove_class("ready")
+            validation.add_class("invalid")
+            validation.update("待处理：" + " ".join(problems))
+            return
+        validation.remove_class("invalid")
+        validation.add_class("ready")
+        validation.update("表单检查通过。")
+
     def _log(self, message: str) -> None:
         self.query_one("#log", RichLog).write(message)
 
-    def _start_draft(self, mode: str) -> None:
-        draft = self._draft(mode)
+    def _save_api_config(self) -> None:
+        base_url = self._input("#api-base-url").strip()
+        api_key = self._input("#api-key").strip()
+        model = self._input("#api-model").strip()
+        ok, msg = save_dotenv_api_config(base_url, api_key, model)
+        feedback = self.query_one("#api-status-feedback", Static)
+        if ok:
+            feedback.update(f"✅ 配置已成功保存至本地 .env 文件（模型: {model or '默认'}）。")
+            self._set_status("API 配置已保存至 .env。")
+            self._log(f"[提示] 翻译 API 配置已更新并保存至 .env（{base_url or '默认地址'}, {model or '默认模型'}）。")
+        else:
+            feedback.update(f"❌ 保存 .env 失败：{msg}")
+            self._set_status(f"保存 .env 失败：{msg}")
+
+    def _test_api_connectivity(self) -> None:
+        base_url = self._input("#api-base-url").strip()
+        api_key = self._input("#api-key").strip()
+        model = self._input("#api-model").strip()
+        self._run_api_probe(base_url, api_key, model)
+
+    @work(thread=True)
+    def _run_api_probe(self, base_url: str, api_key: str, model: str) -> None:
+        self.app.call_from_thread(
+            self._update_api_feedback,
+            "⏳ 正在连接翻译 API 接口进行鉴权与连通性测试，请稍候…",
+            status="正在测试 API 连通性…",
+        )
+        start_time = time.perf_counter()
+        ok, msg = probe_translate_api(
+            base_url=base_url or None,
+            api_key=api_key or None,
+            model=model or None,
+            timeout=12.0,
+        )
+        latency_ms = int((time.perf_counter() - start_time) * 1000)
+        if ok:
+            feedback_text = f"✅ API 连通性测试成功！模型: {model or '默认'}，响应延迟: {latency_ms}ms。接口正常可用。"
+            status_text = f"API 连通性测试成功（耗时 {latency_ms}ms）。"
+        else:
+            feedback_text = f"❌ API 连通性测试失败：{msg}（耗时 {latency_ms}ms）"
+            status_text = f"API 测试失败：{msg}"
+        self.app.call_from_thread(self._update_api_feedback, feedback_text, status=status_text)
+
+    def _update_api_feedback(self, text: str, status: str | None = None) -> None:
+        try:
+            feedback = self.query_one("#api-status-feedback", Static)
+            feedback.update(text)
+            if status:
+                self._set_status(status)
+        except Exception:
+            pass
+
+    def _start_selected_mode(self) -> None:
+        selected = self._select_value("#task-mode")
+        if selected == _UI_MODE_RENDER_ORIGINAL:
+            self._start_draft(MODE_RENDER_ONLY, render_original=True, reuse_translation=False)
+            return
+        if selected == MODE_ORIGINAL_PRODUCTION:
+            self._start_draft(MODE_ORIGINAL_PRODUCTION, render_original=True, reuse_translation=False)
+            return
+        if selected == MODE_RENDER_ONLY and (
+            not self.imported_draft or self.imported_draft.mode != MODE_RENDER_ONLY
+        ):
+            self._set_status("仅渲染高级流程需要先导入包含 render 模式的 YAML。")
+            return
+        self._start_draft(selected or MODE_QUICK_PREVIEW_ORIGINAL)
+
+    @staticmethod
+    def _media_check_summary(mode: str, *, subject: str) -> str:
+        normalized = mode.strip().lower()
+        if normalized == "decode":
+            return f"{subject}将做完整解码检查，会额外顺序读取一次媒体。"
+        if normalized == "fast":
+            return f"{subject}将做快速结构检查；正式验收仍建议使用完整检查。"
+        return f"{subject}已关闭媒体检查，仅建议用于排障。"
+
+    def _start_draft(
+        self,
+        mode: str,
+        *,
+        render_original: bool | None = None,
+        reuse_translation: bool | None = None,
+    ) -> None:
+        draft = self._draft(mode, render_original=render_original, reuse_translation=reuse_translation)
         problems = draft.validate()
         if problems:
             self._set_status("无法开始：" + " ".join(problems))
             return
         self.last_draft = draft
+        self._log("[检查] " + self._media_check_summary(draft.source_media_check, subject="源视频"))
         for warning in draft.warnings():
             self._log("[提示] " + warning)
         result_directory, completion_message = self._result_context(draft)
@@ -337,19 +726,27 @@ class OverlayTui(App[None]):
     def _result_context(draft: TuiJobDraft) -> tuple[Path, str]:
         output = Path(draft.output.strip().strip('"')).expanduser() if draft.output.strip() else None
         directory = output.parent if output else Path(draft.video.strip().strip('"')).expanduser().parent
-        if draft.manual_translation:
+        if draft.manual_translation or draft.mode == MODE_STEP_EXPORT_MANUAL:
             review_directory = OverlayTui._review_directory(draft)
             return review_directory, "待人工翻译文件已生成。可打开复核目录查看 JSON、XLSX/TSV。"
-        if draft.review:
+        if draft.review or draft.mode == MODE_STEP_API_AND_REVIEW:
             review_directory = OverlayTui._review_directory(draft)
             return review_directory, "翻译与人工复核文件已生成。可打开复核目录继续复核。"
-        if draft.mode in (MODE_ORIGINAL_PREVIEW, MODE_TRANSLATED_PREVIEW):
+        if draft.mode in (
+            MODE_ORIGINAL_PREVIEW,
+            MODE_TRANSLATED_PREVIEW,
+            MODE_QUICK_PREVIEW_ORIGINAL,
+            MODE_QUICK_PREVIEW_TRANSLATED,
+        ):
             return directory.resolve(), "预览任务完成。可打开结果目录检查生成的预览文件。"
-        if draft.render_original and draft.mode != MODE_ORIGINAL_PREVIEW:
+        if (draft.render_original or draft.mode == MODE_ORIGINAL_PRODUCTION) and draft.mode not in (
+            MODE_ORIGINAL_PREVIEW,
+            MODE_QUICK_PREVIEW_ORIGINAL,
+        ):
             return directory.resolve(), "原文渲染完成。可打开结果目录查看成片。"
         if draft.mode == MODE_TRANSLATE_ONLY:
             return directory.resolve(), "翻译任务完成。可打开结果目录查看翻译 JSON。"
-        if draft.mode == MODE_REUSE_RENDER or draft.reuse_translation:
+        if draft.mode in (MODE_REUSE_RENDER, MODE_STEP_RESUME_RENDER) or draft.reuse_translation:
             return directory.resolve(), "复用翻译渲染完成。可打开结果目录查看成片。"
         if draft.mode == MODE_RENDER_ONLY:
             return directory.resolve(), "仅渲染任务完成。可打开结果目录查看成片。"
@@ -415,6 +812,7 @@ class OverlayTui(App[None]):
             result_path=None,
         )
         self._refresh_history()
+        self._set_history_clear_enabled(False)
         self._set_status(label)
         self._log("$ " + " ".join(redact_command(command)))
 
@@ -474,7 +872,13 @@ class OverlayTui(App[None]):
                     self.session.cleanup(keep_failure=False)
                 elif terminal_state == "manual_required":
                     self._apply_result_directory()
-                    self._set_status("翻译未完成：已导出人工复核文件，请填写后载入任务并复用翻译渲染。")
+                    review_dir = self.result_directory or OverlayTui._review_directory(self.last_draft or self._draft())
+                    guidance = (
+                        f"【人工复核已就绪】已导出待校对表单至 {review_dir}。"
+                        "请在 Excel/TSV 中完成翻译与核对后，将任务模式切换为【分步复核：载入复核表并压制】继续出片。"
+                    )
+                    self._set_status(guidance)
+                    self._log("[提示] " + guidance)
                     self._finish_history("manual_required", returncode)
                     self.session.cleanup()
                 elif self.current_task_kind == "download":
@@ -504,6 +908,7 @@ class OverlayTui(App[None]):
                 self._persist_diagnostics()
                 self.session.cleanup(keep_failure=False)
             self._handled_session = self.session
+            self._set_history_clear_enabled(True)
 
     def _cancel_task(self) -> None:
         if self.session and self.session.cancel():
@@ -559,7 +964,8 @@ class OverlayTui(App[None]):
         self._set_input("#video", video)
         self._set_input("#chat", chat_html)
         self.imported_draft = None
-        self.last_draft = TuiJobDraft(video=video, chat_html=chat_html, mode=MODE_ORIGINAL_PREVIEW)
+        self._set_task_mode_options(include_advanced_render=False, value=MODE_QUICK_PREVIEW_ORIGINAL)
+        self.last_draft = TuiJobDraft(video=video, chat_html=chat_html, mode=MODE_QUICK_PREVIEW_ORIGINAL)
         self.download_duration_note = self._download_duration_note(video)
         self.query_one(TabbedContent).active = "new-task"
         return True
@@ -584,36 +990,80 @@ class OverlayTui(App[None]):
             "Twitch 短片段可能按 HLS 分片边界扩展，请在开始翻译前确认素材范围。"
         )
 
+    def _set_history_clear_enabled(self, enabled: bool) -> None:
+        self.query_one("#history-clear", Button).disabled = not enabled
+
+    def _has_unfinished_task(self) -> bool:
+        """Keep history intact until a completed child has been recorded."""
+        return bool(
+            self.session
+            and (
+                self.session.running
+                or (self.session.returncode is not None and self._handled_session is not self.session)
+            )
+        )
+
     def _refresh_history(self) -> None:
-        log = self.query_one("#history-log", RichLog)
-        log.clear()
+        history_list = self.query_one("#history-list", OptionList)
+        history_list.clear_options()
         records = self.history.list_records()
         if not records:
-            log.write("暂无本机任务历史。")
+            self.selected_history_id = None
+            history_list.add_option(Option("暂无本机任务历史。", disabled=True))
             return
-        for record in records:
+        selected_index: int | None = None
+        for index, record in enumerate(records):
             stamp = time.strftime("%m-%d %H:%M", time.localtime(float(record.get("started_at") or 0)))
             result = self.history.result_for(record) or {}
             artifacts = result.get("artifacts") if isinstance(result, dict) else []
             count = len(artifacts) if isinstance(artifacts, list) else 0
-            log.write(
-                f"{record.get('id')}  {record.get('state')}  {stamp}  "
-                f"{record.get('label', 'task')}  产物 {count}"
+            record_id = str(record.get("id") or "")
+            diagnostic = "  有诊断" if record.get("diagnostic_path") else ""
+            history_list.add_option(
+                Option(
+                    f"{record.get('state')}  {stamp}  {record.get('label', 'task')}  产物 {count}{diagnostic}",
+                    id=record_id,
+                )
             )
+            if record_id == self.selected_history_id:
+                selected_index = index
+        if selected_index is not None:
+            history_list.highlighted = selected_index
+
+    def _select_history(self, record_id: str) -> None:
+        self.selected_history_id = record_id
+        record = self.history.get(record_id)
+        if record is not None:
+            self._set_status(f"已选择历史任务 {record_id}：{record.get('state', 'unknown')}。")
 
     def _history_record(self) -> dict | None:
-        raw_id = self._input("#history-id").strip()
-        if not raw_id and self.active_history_id:
-            raw_id = self.active_history_id
+        raw_id = self.selected_history_id
         if not raw_id:
-            self._set_status("请先输入历史任务短 ID。")
+            self._set_status("请先从历史列表选择一个任务。")
             return None
-        matches = [record for record in self.history.list_records() if str(record.get("id", "")).startswith(raw_id)]
-        if len(matches) != 1:
-            self._set_status("未找到唯一的历史任务；请使用列表中的完整短 ID。")
+        record = self.history.get(raw_id)
+        if record is None:
+            self._set_status("所选历史任务已不存在；请刷新列表。")
             return None
-        self._set_input("#history-id", str(matches[0]["id"]))
-        return matches[0]
+        return record
+
+    def _clear_history(self) -> None:
+        if self._has_unfinished_task() or self.history.has_unfinished_records():
+            self._set_status("存在正在运行或收尾中的任务，不能清空历史。")
+            return
+        if time.monotonic() > self._history_clear_confirmation_until:
+            self._history_clear_confirmation_until = time.monotonic() + 10.0
+            self._set_status("清空会删除本机任务快照和诊断；请在 10 秒内再次点击确认。")
+            return
+        self._history_clear_confirmation_until = 0.0
+        if not self.history.clear():
+            self._history_clear_confirmation_until = 0.0
+            self._set_status("存在其他窗口正在运行的任务，历史未清空。")
+            return
+        self.active_history_id = None
+        self.selected_history_id = None
+        self._refresh_history()
+        self._set_status("本机任务历史已清空。")
 
     def _load_history_draft(self) -> None:
         record = self._history_record()
@@ -698,7 +1148,7 @@ class OverlayTui(App[None]):
         path = self._input("#job-path").strip().strip('"')
         try:
             draft = TuiJobDraft.from_job_file(path)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, Exception) as exc:
             self._set_status(f"无法导入 YAML：{exc}")
             return
         self._apply_draft(draft)

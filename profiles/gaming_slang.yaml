@@ -1,0 +1,67 @@
+# Twitch / YouTube 游戏与直播高频弹幕黑话翻译 Profile
+# 用法: --profile profiles/gaming_slang.yaml
+name: gaming_slang
+label: "Twitch Gaming & Streamer Slang"
+context: "Twitch livestream gaming chat. Keep gamer slang natural, concise, and culture-appropriate. Preserve emote names, @usernames, and URLs."
+
+glossary:
+  # 情绪与大笑
+  LMAO: "笑死"
+  LMFAO: "笑死我了"
+  LUL: "哈哈"
+  LULW: "哈哈哈哈"
+  KEKW: "笑死"
+  OMEGALUL: "大笑"
+  POG: "太强了"
+  PogChamp: "封神"
+  POGGERS: "哇塞"
+  EZ: "太轻松了"
+  GG: "打得好"
+  GGWP: "精彩对决"
+  
+  # 胜负与操作
+  "W": "赢"
+  "Massive W": "大胜"
+  "Big W": "好耶"
+  "L": "翻车"
+  "Huge L": "大败"
+  "Clutch": "极限反杀"
+  "Choke": "关键时刻掉链子"
+  "Choking": "犯病失误"
+  "Throwing": "送人头/瞎玩"
+  "Carry": "带飞全场"
+  "Diff": "差距太大了"
+  
+  # 直播交互与网络俚语
+  "Based": "硬核真实"
+  "Cringe": "太尴尬了"
+  "Cap": "扯淡/假话"
+  "No Cap": "真的没骗你"
+  "Fr": "确实/真的"
+  "Hype": "燃起来了"
+  "Backseating": "指点江山/指挥"
+  "Backseat": "瞎指挥"
+  "Spoiler": "剧透"
+  "Spoilers": "剧透警告"
+  "Copium": "自我安慰"
+  "Hopium": "心存幻想"
+  "Raid": "查房"
+  "Sub": "订阅"
+  "Gift Sub": "送订阅"
+  "Dono": "打赏"
+  "Donation": "赞助"
+  "TTS": "语音打赏"
+  "Clip it": "快剪下来"
+  "AFK": "暂离"
+  "BRB": "马上回来"
+  "RIP": "寄"
+
+preserve:
+  - emotes
+  - usernames
+  - urls
+  - numbers
+
+translation_style:
+  tone: "口语化、接地气、符合中文弹幕与熟肉阅读习惯"
+  max_length_hint: "尽量简明短小，不要解释性扩写，单条弹幕控制在简练短句"

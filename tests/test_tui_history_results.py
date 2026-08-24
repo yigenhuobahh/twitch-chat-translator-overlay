@@ -195,7 +195,9 @@ def test_history_job_snapshot_preserves_advanced_fields_for_rerun(tmp_path: Path
     restored = store.draft_for(record)
 
     assert restored is not None
-    assert restored.extra_fields == {"offset": 12.5, "overlay_codec": "qtrle", "max_visible": 7}
+    assert restored.offset == "12.5"
+    assert restored.extra_fields == {"overlay_codec": "qtrle", "max_visible": 7}
+    assert "max_visible" in restored.extra_fields
     assert restored.source_job
     snapshot = Path(restored.source_job)
     assert snapshot.is_file()
@@ -283,8 +285,25 @@ def test_history_clear_removes_managed_artifacts(tmp_path: Path):
     manifest.write_text("{}", encoding="utf-8")
     diagnostic.write_text("diagnostic", encoding="utf-8")
     job.write_text("mode: preview", encoding="utf-8")
-    store.clear()
+    assert store.clear() is True
     assert not manifest.exists() and not diagnostic.exists() and not job.exists()
+
+
+@pytest.mark.parametrize("state", ["queued", "running"])
+def test_history_clear_refuses_to_delete_another_active_task(tmp_path: Path, state: str):
+    first = TuiHistoryStore(tmp_path / "history.json")
+    second = TuiHistoryStore(tmp_path / "history.json")
+    record = first.start(None, label="active")
+    if state == "running":
+        first.mark_running(record["id"], pid=None, result_path=None)
+
+    assert second.has_unfinished_records() is True
+    assert second.clear() is False
+    assert first.get(record["id"]) is not None
+
+    first.finish(record["id"], state="succeeded", returncode=0, result_path=None)
+    assert second.has_unfinished_records() is False
+    assert second.clear() is True
 
 
 def test_textual_history_write_failure_does_not_start_task(tmp_path: Path, monkeypatch):
@@ -345,7 +364,9 @@ def test_pipeline_wrapper_writes_terminal_result(tmp_path: Path, monkeypatch):
     monkeypatch.setenv(RESULT_FILE_ENV, str(manifest_path))
 
     def fake_main():
-        pipeline._TASK_RESULT_CONTEXT = {"mode": "full", "artifacts": [("video", artifact)]}
+        runner = pipeline.active_runner()
+        assert runner is not None
+        runner.configure(mode="full", artifacts=[("video", artifact)])
         return 0
 
     monkeypatch.setattr(pipeline, "_main", fake_main)
@@ -363,7 +384,10 @@ def test_pipeline_wrapper_preserves_manual_required_terminal_state(tmp_path: Pat
     monkeypatch.setenv(RESULT_FILE_ENV, str(manifest_path))
 
     def fake_main():
-        pipeline._TASK_RESULT_CONTEXT = {"mode": "full", "artifacts": [], "terminal_state": "manual_required"}
+        runner = pipeline.active_runner()
+        assert runner is not None
+        runner.configure(mode="full", artifacts=[])
+        runner.mark_manual_required()
         return 0
 
     monkeypatch.setattr(pipeline, "_main", fake_main)
@@ -386,7 +410,7 @@ def test_download_flow_publishes_video_and_chat_result_manifest(tmp_path: Path, 
         lambda *args, **kwargs: SimpleNamespace(video_path=video, chat_html_path=chat),
     )
     monkeypatch.setattr(pipeline, "_post_download_next_steps", lambda *args, **kwargs: 0)
-    pipeline._TASK_RESULT_CONTEXT = {"mode": "unknown", "artifacts": []}
+    runner = pipeline.PipelineRunner()
     args = SimpleNamespace(
         download="2819850140",
         download_dir=str(tmp_path),
@@ -405,10 +429,10 @@ def test_download_flow_publishes_video_and_chat_result_manifest(tmp_path: Path, 
         download_only=True,
         yes=True,
     )
-    assert pipeline._run_download_flow(args) == 0
-    assert pipeline._TASK_RESULT_CONTEXT["mode"] == "download"
-    assert ("video", video) in pipeline._TASK_RESULT_CONTEXT["artifacts"]
-    assert ("chat_html", chat) in pipeline._TASK_RESULT_CONTEXT["artifacts"]
+    assert pipeline._run_download_flow(args, runner=runner) == 0
+    assert runner.mode == "download"
+    assert ("video", video) in runner.artifacts
+    assert ("chat_html", chat) in runner.artifacts
 
 
 def test_textual_history_loads_saved_draft(tmp_path: Path):
@@ -425,10 +449,68 @@ def test_textual_history_loads_saved_draft(tmp_path: Path):
         record = app.history.start(draft, label="saved")
         async with app.run_test():
             app._refresh_history()
-            app.query_one("#history-id", Input).value = record["id"]
+            app._select_history(record["id"])
             app._load_history_draft()
             assert app.query_one("#video", Input).value == "saved.mp4"
             assert "已载入" in str(app.query_one("#status").render())
+
+    import asyncio
+
+    asyncio.run(exercise())
+
+
+def test_textual_history_clear_requires_confirmation_and_preserves_running_task(tmp_path: Path):
+    pytest.importorskip("textual")
+
+    from tui_history import TuiHistoryStore
+    from tui_run import OverlayTui
+
+    async def exercise() -> None:
+        app = OverlayTui()
+        app.history = TuiHistoryStore(tmp_path / "history.json")
+        record = app.history.start(None, label="running")
+        async with app.run_test():
+            app.session = type("Session", (), {"running": True})()
+            app._set_history_clear_enabled(False)
+            assert app.query_one("#history-clear").disabled is True
+            app._clear_history()
+            assert app.history.get(record["id"]) is not None
+            assert "不能清空历史" in str(app.query_one("#status").render())
+
+            app.session = type("Session", (), {"running": False, "returncode": 0})()
+            app._handled_session = None
+            app._clear_history()
+            assert app.history.get(record["id"]) is not None
+
+            app.session = None
+            app._handled_session = None
+            app.history.finish(record["id"], state="succeeded", returncode=0, result_path=None)
+            app._set_history_clear_enabled(True)
+            app._clear_history()
+            assert app.history.get(record["id"]) is not None
+            assert "再次点击" in str(app.query_one("#status").render())
+            app._clear_history()
+            assert app.history.list_records() == []
+
+    import asyncio
+
+    asyncio.run(exercise())
+
+
+def test_textual_history_actions_require_explicit_selection(tmp_path: Path):
+    pytest.importorskip("textual")
+
+    from tui_history import TuiHistoryStore
+    from tui_run import OverlayTui
+
+    async def exercise() -> None:
+        app = OverlayTui()
+        app.history = TuiHistoryStore(tmp_path / "history.json")
+        record = app.history.start(None, label="active")
+        app.active_history_id = record["id"]
+        async with app.run_test():
+            assert app._history_record() is None
+            assert "选择一个任务" in str(app.query_one("#status").render())
 
     import asyncio
 
@@ -486,7 +568,8 @@ def test_textual_manual_required_is_not_reported_as_render_success(tmp_path: Pat
                 if app.session and not app.session.running and app._handled_session is app.session:
                     break
             assert app.history.list_records()[0]["state"] == "manual_required"
-            assert "翻译未完成" in str(app.query_one("#status").render())
+            status_text = str(app.query_one("#status").render())
+            assert "【人工复核已就绪】" in status_text or "载入复核表并压制" in status_text
 
     import asyncio
 

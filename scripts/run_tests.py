@@ -29,6 +29,7 @@ COMPILE_SCRIPTS = [
     "chat_parser.py",
     "chat_window.py",
     "common_utils.py",
+    "cut_timeline.py",
     "encode_options.py",
     "env_bootstrap.py",
     "job_config.py",
@@ -39,6 +40,9 @@ COMPILE_SCRIPTS = [
     "layout_preset.py",
     "media_health.py",
     "overlay_config.py",
+    "overlay_scene.py",
+    "pipeline_plan.py",
+    "pipeline_runner.py",
     "process_util.py",
     "render_cn_chat.py",
     "render_perf.py",
@@ -253,7 +257,7 @@ def main() -> int:
     parser.add_argument(
         "--coverage",
         action="store_true",
-        help=f"with --max, require core scripts coverage >= {COVERAGE_FAIL_UNDER}%",
+        help=f"with --max, require core scripts coverage >= {COVERAGE_FAIL_UNDER}%%",
     )
     parser.add_argument("-k", dest="keyword", default=None, help="pytest -k expression")
     parser.add_argument("-q", "--quiet", action="store_true")

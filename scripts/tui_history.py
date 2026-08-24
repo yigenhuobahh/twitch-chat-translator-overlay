@@ -286,14 +286,24 @@ class TuiHistoryStore:
                     self._save(records)
                     return
 
-    def clear(self) -> None:
+    def has_unfinished_records(self) -> bool:
+        """Report whether another task still owns durable history state."""
         with self._history_lock():
+            return any(record.get("state") in {"queued", "running"} for record in self._load())
+
+    def clear(self) -> bool:
+        """Delete managed history only when no queued or running record exists."""
+        with self._history_lock():
+            records = self._load()
+            if any(record.get("state") in {"queued", "running"} for record in records):
+                return False
             self._save([])
             root = self.path.parent.resolve()
             for name in ("manifests", "diagnostics", "jobs"):
                 managed = (root / name).resolve()
                 if managed.parent == root:
                     shutil.rmtree(managed, ignore_errors=True)
+            return True
 
     def draft_for(self, record: dict[str, Any]) -> TuiJobDraft | None:
         draft = record.get("draft")

@@ -33,6 +33,7 @@ from common_utils import (
     safe_which,
     trusted_tools_root,
 )
+from cut_timeline import CutTimeline, CutTimelineError
 from process_util import run_tracked
 from twitch_download_transaction import (
     preserved_staged_paths,
@@ -674,33 +675,11 @@ def normalize_cut_ranges(
     total_duration: float,
 ) -> list[tuple[float, float]]:
     """Clamp, sort, and merge cuts on one original merged-video timeline."""
-    total = float(total_duration)
-    if not math.isfinite(total):
-        raise TwitchDownloadError(f"总时长必须是有限数值: {total_duration!r}")
-    total = max(0.0, total)
-    clipped: list[tuple[float, float]] = []
-    for raw_start, raw_end in ranges or []:
-        start = float(raw_start)
-        end = float(raw_end)
-        if not math.isfinite(start) or not math.isfinite(end):
-            raise TwitchDownloadError(
-                f"裁切范围必须是有限数值: {(raw_start, raw_end)!r}"
-            )
-        if end <= start:
-            raise TwitchDownloadError(f"无效切除范围: {start:g}-{end:g}")
-        start = min(total, max(0.0, start))
-        end = min(total, max(0.0, end))
-        if end > start:
-            clipped.append((start, end))
-    clipped.sort()
-
-    merged: list[tuple[float, float]] = []
-    for start, end in clipped:
-        if not merged or start > merged[-1][1]:
-            merged.append((start, end))
-        else:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-    return merged
+    try:
+        timeline = CutTimeline.from_ranges(ranges, total_duration)
+    except CutTimelineError as exc:
+        raise TwitchDownloadError(str(exc)) from exc
+    return list(timeline.cuts)
 
 
 _FFPROBE_TIMEOUT_SECONDS = 45.0
@@ -829,6 +808,7 @@ def concat_videos(
     *,
     list_path: Path | None = None,
     remove_ranges: list[tuple[float, float]] | None = None,
+    cut_timeline: CutTimeline | None = None,
     output_fps: float | None = None,
     encoder: str = "auto",
 ) -> str:
@@ -849,7 +829,7 @@ def concat_videos(
     """
     if not paths:
         raise TwitchDownloadError("没有可拼接的视频段")
-    if len(paths) == 1:
+    if len(paths) == 1 and not remove_ranges and cut_timeline is None:
         import shutil as _shutil
 
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -889,7 +869,20 @@ def concat_videos(
             durations.append(probe_media_duration(p))
         except TwitchDownloadError:
             durations.append(0.0)
-    cut_ranges = normalize_cut_ranges(remove_ranges, sum(durations))
+    try:
+        timeline = cut_timeline or CutTimeline.from_ranges(remove_ranges, sum(durations))
+    except CutTimelineError as exc:
+        raise TwitchDownloadError(str(exc)) from exc
+    if abs(timeline.original_duration - sum(durations)) > 1e-6:
+        raise TwitchDownloadError("裁切时间轴与待拼接视频总时长不一致")
+    cut_ranges = timeline.cuts
+    if len(paths) == 1 and not cut_ranges:
+        import shutil as _shutil
+
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if paths[0].resolve() != out.resolve():
+            _shutil.copy2(paths[0], out)
+        return "copy"
     chains: list[str] = []
     concat_inputs: list[str] = []
     for i, duration in enumerate(durations):
@@ -898,19 +891,7 @@ def concat_videos(
         lead_in = max(0.0, float(video_start) - float(audio_start))
         trim = max(0.001, float(duration or 0.0))
         segment_start = sum(durations[:i])
-        keep_ranges = [(0.0, trim)]
-        for cut_start, cut_end in cut_ranges:
-            local_start = max(0.0, float(cut_start) - segment_start)
-            local_end = min(trim, float(cut_end) - segment_start)
-            if local_end <= local_start:
-                continue
-            next_ranges: list[tuple[float, float]] = []
-            for keep_start, keep_end in keep_ranges:
-                if local_start > keep_start:
-                    next_ranges.append((keep_start, min(keep_end, local_start)))
-                if local_end < keep_end:
-                    next_ranges.append((max(keep_start, local_end), keep_end))
-            keep_ranges = [(a, b) for a, b in next_ranges if b - a > 1e-6]
+        keep_ranges = timeline.local_keep_ranges(segment_start, trim)
         if not keep_ranges:
             continue
         v_base = f"[{i}:v:0]setpts=PTS-STARTPTS"
@@ -1118,15 +1099,19 @@ def merge_chat_html(
     source_id: str,
     out_path: Path,
     remove_ranges: list[tuple[float, float]] | None = None,
+    cut_timeline: CutTimeline | None = None,
 ) -> Path:
     """Merge segment chat HTMLs with remapped continuous timestamps → out_path."""
     if not segments:
         raise TwitchDownloadError("没有可合并的聊天段")
 
-    cut_ranges = normalize_cut_ranges(
-        remove_ranges,
-        sum(float(seg.duration_s) for seg in segments),
-    )
+    timeline_duration = sum(float(seg.duration_s) for seg in segments)
+    try:
+        timeline = cut_timeline or CutTimeline.from_ranges(remove_ranges, timeline_duration)
+    except CutTimelineError as exc:
+        raise TwitchDownloadError(str(exc)) from exc
+    if abs(timeline.original_duration - timeline_duration) > 1e-6:
+        raise TwitchDownloadError("裁切时间轴与聊天片段总时长不一致")
 
     emote_rules: dict[str, str] = {}
     collected: list[tuple[float, int, int, str]] = []  # merged_ts, seg_i, order, block
@@ -1156,15 +1141,8 @@ def merge_chat_html(
                 dropped += 1
                 continue
             new_block, merged_ts = remapped
-            adjusted_ts = merged_ts
-            dropped_for_cut = False
-            for cut_start, cut_end in cut_ranges:
-                if float(cut_start) <= merged_ts < float(cut_end):
-                    dropped_for_cut = True
-                    break
-                if merged_ts >= float(cut_end):
-                    adjusted_ts -= float(cut_end) - float(cut_start)
-            if dropped_for_cut:
+            adjusted_ts = timeline.map_time(merged_ts)
+            if adjusted_ts is None:
                 dropped += 1
                 continue
             t_query, t_disp = format_td_t_seconds(adjusted_ts)
@@ -1342,7 +1320,11 @@ def download_assets_multi(
         )
 
     timeline_duration = sum(s.duration_s for s in seg_downloads)
-    cut_ranges = normalize_cut_ranges(remove_ranges, timeline_duration)
+    try:
+        timeline = CutTimeline.from_ranges(remove_ranges, timeline_duration)
+    except CutTimelineError as exc:
+        raise TwitchDownloadError(str(exc)) from exc
+    cut_ranges = list(timeline.cuts)
     staged_video = _new_download_staging_path(final_video)
     staged_chat = _new_download_staging_path(final_chat)
     repaired_video: Path | None = None
@@ -1354,11 +1336,12 @@ def download_assets_multi(
             staged_video,
             list_path=base / "concat_list.txt",
             remove_ranges=cut_ranges,
+            cut_timeline=timeline,
             output_fps=output_fps,
             encoder=encoder,
         )
 
-        expected = timeline_duration - sum(cut_end - cut_start for cut_start, cut_end in cut_ranges)
+        expected = timeline.remaining_duration
         from media_health import repair_media, validate_media_health
         health = validate_media_health(
             staged_video, mode=media_check, require_audio=True, expected_duration=expected
@@ -1385,6 +1368,7 @@ def download_assets_multi(
             source_id=source_id,
             out_path=staged_chat,
             remove_ranges=cut_ranges,
+            cut_timeline=timeline,
         )
         _publish_download_pair(
             video_to_publish,

@@ -147,15 +147,15 @@ def test_download_flow_multi_segment_publishes_result_and_events(tmp_path: Path,
     )
     monkeypatch.setattr(pipeline, "emit_task_event", lambda event, **_kwargs: events.append(event) or True)
     monkeypatch.setattr(pipeline, "_post_download_next_steps", lambda *_args, **_kwargs: 0)
-    monkeypatch.setattr(pipeline, "_TASK_RESULT_CONTEXT", {"mode": "unknown", "artifacts": []})
+    runner = pipeline.PipelineRunner()
 
-    assert pipeline._run_download_flow(args) == 0
+    assert pipeline._run_download_flow(args, runner=runner) == 0
 
     assert seen["segments"] == [("0:00:00", "0:00:05"), ("0:00:10", "0:00:15")]
     assert seen["kwargs"]["remove_ranges"] == [(1.0, 2.0)]
     assert seen["kwargs"]["media_check"] == "decode"
     assert events == ["stage_started", "stage_completed"]
-    assert pipeline._TASK_RESULT_CONTEXT["artifacts"] == [("video", video), ("chat_html", chat)]
+    assert runner.artifacts == [("video", video), ("chat_html", chat)]
 
 
 def test_download_flow_records_failure_event(tmp_path: Path, monkeypatch):

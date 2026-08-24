@@ -111,7 +111,7 @@ def test_tui_history_opens_a_persisted_support_summary(tmp_path: Path, monkeypat
         opened: list[Path] = []
         monkeypatch.setattr(app, "_open_result_dir", lambda: opened.append(app.result_directory))
         async with app.run_test():
-            app._set_input("#history-id", record["id"])
+            app._select_history(record["id"])
             app._open_history_artifacts()
             assert opened == [report.parent.resolve()]
 

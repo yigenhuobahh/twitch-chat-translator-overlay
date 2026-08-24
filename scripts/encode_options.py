@@ -170,7 +170,7 @@ def resolve_encode_options(
 
     if encoder == "auto":
         if prefer_hw:
-            for key in ("nvenc", "qsv", "amf"):
+            for key in ("nvenc", "amf", "qsv"):
                 if key in available:
                     candidate_concrete = available[key]
                     if _trial_encode(candidate_concrete):

@@ -276,8 +276,8 @@ def test_download_draft_requires_bounded_segments_and_builds_multi_segment_comma
     assert command.count("--segment") == 2
     assert "1:00:20-1:00:28" in command
     assert "--media-check" in command and "decode" in command
-    assert draft.requested_duration_s() == 16.0
-    assert TuiDownloadDraft(source="2819850140").validate()
+    assert TuiDownloadDraft(source="2819850140").validate() == []
+    assert TuiDownloadDraft(source="2819850140").requested_duration_s() is None
     assert TuiDownloadDraft(source="https://clips.twitch.tv/ExampleClip").validate() == []
     assert TuiDownloadDraft(source="https://clips.twitch.tv/ExampleClip").requested_duration_s() is None
     protected = TuiDownloadDraft(source="2819850140", segments_text="1:00:00-1:00:08", oauth="secret-token")
@@ -448,8 +448,148 @@ def test_textual_invalid_form_stays_open():
     async def exercise() -> None:
         app = OverlayTui()
         async with app.run_test(size=(140, 45)) as pilot:
-            await pilot.click("#original-preview")
+            await pilot.click("#run-mode")
             assert "无法开始" in str(app.query_one("#status").render())
+
+    import asyncio
+
+    asyncio.run(exercise())
+
+
+def test_textual_form_labels_and_action_follow_input_order():
+    pytest.importorskip("textual")
+    from textual.widgets import Label
+
+    from tui_run import OverlayTui
+
+    async def exercise() -> None:
+        app = OverlayTui()
+        async with app.run_test(size=(140, 45)):
+            labels = {str(label.render()) for label in app.query(Label)}
+            assert {"任务模式", "源视频", "Twitch 聊天 HTML", "输出视频（可选）", "预览时长（秒）"} <= labels
+
+            source = (ROOT / "scripts" / "tui_run.py").read_text(encoding="utf-8")
+            assert source.index('id="preview-clip"') < source.index('id="run-mode"')
+
+    import asyncio
+
+    asyncio.run(exercise())
+
+
+def test_textual_form_validation_updates_while_editing(tmp_path: Path):
+    pytest.importorskip("textual")
+
+    from tui_run import OverlayTui
+
+    video = tmp_path / "source.mp4"
+    chat = tmp_path / "chat.html"
+    video.write_bytes(b"video")
+    chat.write_text("<html></html>", encoding="utf-8")
+
+    async def exercise() -> None:
+        app = OverlayTui()
+        async with app.run_test(size=(140, 45)) as pilot:
+            validation = app.query_one("#form-validation")
+            assert "待处理" in str(validation.render())
+
+            app.query_one("#video").value = str(video)
+            app.query_one("#chat").value = str(chat)
+            await pilot.pause(0.05)
+            assert "表单检查通过" in str(validation.render())
+            assert validation.has_class("ready")
+
+            app.query_one("#output").value = str(video)
+            await pilot.pause(0.05)
+            assert "输出文件不能与源视频相同" in str(validation.render())
+            assert validation.has_class("invalid")
+
+            app.query_one("#output").value = ""
+            app.query_one("#preview-clip").value = "0"
+            await pilot.pause(0.05)
+            assert "预览时长必须大于 0" in str(validation.render())
+
+    import asyncio
+
+    asyncio.run(exercise())
+
+
+def test_textual_task_mode_selector_routes_all_supported_tui_modes(monkeypatch):
+    pytest.importorskip("textual")
+    from textual.widgets import Select
+
+    from tui_models import MODE_RENDER_ONLY, MODE_TRANSLATE_ONLY
+    from tui_run import OverlayTui
+
+    calls: list[tuple[str, dict]] = []
+
+    async def exercise() -> None:
+        app = OverlayTui()
+        monkeypatch.setattr(app, "_start_draft", lambda mode, **kwargs: calls.append((mode, kwargs)))
+        async with app.run_test(size=(140, 45)) as pilot:
+            mode_select = app.query_one("#task-mode", Select)
+            mode_select.value = MODE_TRANSLATE_ONLY
+            await pilot.click("#run-mode")
+            mode_select.value = "render_original"
+            app._start_selected_mode()
+
+    import asyncio
+
+    asyncio.run(exercise())
+    assert calls == [
+        (MODE_TRANSLATE_ONLY, {}),
+        (MODE_RENDER_ONLY, {"render_original": True, "reuse_translation": False}),
+    ]
+
+
+def test_textual_advanced_render_mode_requires_an_imported_job(tmp_path: Path, monkeypatch):
+    pytest.importorskip("textual")
+    from textual.widgets import Select
+
+    from tui_models import MODE_RENDER_ONLY
+    from tui_run import _TASK_MODE_OPTIONS, OverlayTui
+
+    video = tmp_path / "video.mp4"
+    chat = tmp_path / "chat.html"
+    source = tmp_path / "advanced-render.yaml"
+    video.write_bytes(b"video")
+    chat.write_text("<html></html>", encoding="utf-8")
+    source.write_text(
+        f"video: {video}\nchat_html: {chat}\nmode: render\nskip_translate: true\n",
+        encoding="utf-8",
+    )
+
+    async def exercise() -> None:
+        app = OverlayTui()
+        calls: list[str] = []
+        monkeypatch.setattr(app, "_start_draft", lambda mode, **_kwargs: calls.append(mode))
+        async with app.run_test(size=(140, 45)):
+            assert MODE_RENDER_ONLY not in {value for _label, value in _TASK_MODE_OPTIONS}
+
+            app._set_input("#job-path", str(source))
+            app._load_job()
+            assert app.query_one("#task-mode", Select).value == MODE_RENDER_ONLY
+            app._start_selected_mode()
+            assert calls == [MODE_RENDER_ONLY]
+
+    import asyncio
+
+    asyncio.run(exercise())
+
+
+def test_textual_media_check_selects_round_trip_from_drafts():
+    pytest.importorskip("textual")
+    from textual.widgets import Select
+
+    from tui_models import TuiDownloadDraft
+    from tui_run import OverlayTui
+
+    async def exercise() -> None:
+        app = OverlayTui()
+        async with app.run_test(size=(140, 45)):
+            app._apply_download_draft(TuiDownloadDraft(media_check="fast"))
+            assert app.query_one("#download-media-check", Select).value == "fast"
+            app.query_one("#source-media-check", Select).value = "off"
+            assert app._draft().source_media_check == "off"
 
     import asyncio
 
