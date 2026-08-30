@@ -70,6 +70,7 @@ ROADMAP.md
 HANDOVER.md
 CLAUDE.md
 PROJECT.md
+CODE_REVIEW_REPORT_*.md
 .claude/
 .agents/
 *.lock
@@ -112,3 +113,4 @@ configs/launcher.local.yaml
 
 # Stray local artifacts
 repo
+.zcode/
