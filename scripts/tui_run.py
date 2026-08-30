@@ -13,6 +13,7 @@ import webbrowser
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, VerticalScroll
+from textual.css.query import NoMatches
 from textual.widgets import (
     Button,
     Checkbox,
@@ -601,8 +602,18 @@ class OverlayTui(App[None]):
     def _pipeline() -> Path:
         return Path(__file__).with_name("render_cn_chat.py")
 
+    def _query_optional(self, selector: str, expect_type: type):
+        # 懒挂载的 TabPane 内容和应用关闭阶段都可能让控件短暂不存在；
+        # 定时器驱动的刷新必须跳过而不是抛 NoMatches 打崩整个应用。
+        try:
+            return self.query_one(selector, expect_type)
+        except NoMatches:
+            return None
+
     def _set_status(self, message: str) -> None:
-        self.query_one("#status", Static).update(message)
+        status = self._query_optional("#status", Static)
+        if status is not None:
+            status.update(message)
 
     def _refresh_form_validation(self) -> None:
         validation = self.query_one("#form-validation", Static)
@@ -617,7 +628,9 @@ class OverlayTui(App[None]):
         validation.update("表单检查通过。")
 
     def _log(self, message: str) -> None:
-        self.query_one("#log", RichLog).write(message)
+        log = self._query_optional("#log", RichLog)
+        if log is not None:
+            log.write(message)
 
     def _save_api_config(self) -> None:
         base_url = self._input("#api-base-url").strip()
@@ -1003,7 +1016,9 @@ class OverlayTui(App[None]):
         )
 
     def _refresh_history(self) -> None:
-        history_list = self.query_one("#history-list", OptionList)
+        history_list = self._query_optional("#history-list", OptionList)
+        if history_list is None:
+            return
         history_list.clear_options()
         records = self.history.list_records()
         if not records:

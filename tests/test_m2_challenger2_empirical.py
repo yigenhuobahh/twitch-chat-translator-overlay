@@ -434,10 +434,21 @@ def test_invalid_and_out_of_range_offset_validation(invalid_input: str, tmp_path
             app.query_one("#offset", Input).value = invalid_input
             await pilot.pause(0.1)
 
-            val_widget = app.query_one("#form-validation", Static)
+            # #form-validation lives in a lazily mounted tab and refreshes via
+            # async Input.Changed events; poll so loaded CI runners converge.
+            val_widget = None
+            for _ in range(120):
+                matches = app.query("#form-validation")
+                if matches:
+                    candidate = matches.first()
+                    if "invalid" in candidate.classes and "时间偏移" in str(candidate.render()):
+                        val_widget = candidate
+                        break
+                await pilot.pause(0.05)
+
+            assert val_widget is not None, "form validation never surfaced the offset error"
             assert "invalid" in val_widget.classes
-            rendered = str(val_widget.render())
-            assert "时间偏移" in rendered
+            assert "时间偏移" in str(val_widget.render())
 
     asyncio.run(run())
 
