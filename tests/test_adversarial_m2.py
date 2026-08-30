@@ -1,43 +1,33 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from pathlib import Path
 import sys
 import time
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from textual.widgets import Button, Checkbox, Input, OptionList, RichLog, Select, Static, TabbedContent
+from textual.widgets import Checkbox, Input, OptionList, RichLog, Select, Static, TabbedContent
+
 from tui_history import TuiHistoryStore
 from tui_models import (
-    MODE_AUTO,
     MODE_FULL_PRODUCTION,
-    MODE_FULL_RENDER,
-    MODE_ORIGINAL_PREVIEW,
     MODE_ORIGINAL_PRODUCTION,
     MODE_QUICK_PREVIEW_ORIGINAL,
     MODE_QUICK_PREVIEW_TRANSLATED,
-    MODE_RENDER_ONLY,
-    MODE_REUSE_RENDER,
     MODE_STEP_API_AND_REVIEW,
     MODE_STEP_EXPORT_MANUAL,
     MODE_STEP_RESUME_RENDER,
-    MODE_TRANSLATE_ONLY,
-    MODE_TRANSLATED_PREVIEW,
     TuiJobDraft,
 )
 from tui_run import (
     _ENCODER_OPTIONS,
     _LAYOUT_PRESET_OPTIONS,
     _RENDER_PRESET_OPTIONS,
-    _TASK_MODE_OPTIONS,
     OverlayTui,
 )
 

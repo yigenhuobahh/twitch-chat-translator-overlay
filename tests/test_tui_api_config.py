@@ -329,6 +329,7 @@ def test_tui_api_tab_prefills_and_renders_ui(monkeypatch: pytest.MonkeyPatch):
     """Verify API configuration inputs in Tab 5 prefill accurately from environment variables."""
     pytest.importorskip("textual")
     from textual.widgets import Input, TabbedContent
+
     from tui_run import OverlayTui
 
     monkeypatch.setenv("OPENAI_COMPAT_BASE_URL", "https://api.prefill.com/v1")
@@ -356,6 +357,7 @@ def test_tui_api_tab_save_button_success():
     """Verify #btn-save-api saves configuration to .env and updates UI success feedback."""
     pytest.importorskip("textual")
     from textual.widgets import Button, Static, TabbedContent
+
     from tui_run import OverlayTui
 
     async def exercise():
@@ -391,6 +393,7 @@ def test_tui_api_tab_save_button_failure():
     """Verify #btn-save-api handles save errors and updates UI error feedback."""
     pytest.importorskip("textual")
     from textual.widgets import Button, Static, TabbedContent
+
     from tui_run import OverlayTui
 
     async def exercise():
@@ -420,6 +423,7 @@ def test_tui_api_tab_test_button_success():
     """Verify #btn-test-api handles successful API probe and renders live feedback."""
     pytest.importorskip("textual")
     from textual.widgets import Button, Static, TabbedContent
+
     from tui_run import OverlayTui
 
     async def exercise():
@@ -464,6 +468,7 @@ def test_tui_api_tab_test_button_failure():
     """Verify #btn-test-api handles failed API probe and renders error feedback."""
     pytest.importorskip("textual")
     from textual.widgets import Button, Static, TabbedContent
+
     from tui_run import OverlayTui
 
     async def exercise():
@@ -506,6 +511,7 @@ def test_tui_api_tab_nonblocking_ui_responsiveness():
     """Verify that during a long-running API probe, the UI remains responsive and tabs can be switched."""
     pytest.importorskip("textual")
     from textual.widgets import Button, Static, TabbedContent
+
     from tui_run import OverlayTui
 
     def slow_probe(*args, **kwargs):

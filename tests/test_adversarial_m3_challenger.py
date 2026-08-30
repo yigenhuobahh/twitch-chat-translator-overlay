@@ -16,7 +16,6 @@ import asyncio
 import os
 from pathlib import Path
 import sys
-import tempfile
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -29,20 +28,12 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from env_bootstrap import (
-    get_translate_api_config,
     probe_translate_api,
     save_dotenv_api_config,
-    translate_api_config_ok,
 )
 from pipeline_plan import PipelinePlan
 from tui_models import (
     MODE_FULL_PRODUCTION,
-    MODE_ORIGINAL_PRODUCTION,
-    MODE_QUICK_PREVIEW_ORIGINAL,
-    MODE_QUICK_PREVIEW_TRANSLATED,
-    MODE_STEP_API_AND_REVIEW,
-    MODE_STEP_EXPORT_MANUAL,
-    MODE_STEP_RESUME_RENDER,
     TuiJobDraft,
 )
 
@@ -252,6 +243,7 @@ def test_tui_rapid_offset_input_and_validation():
     """Verify rapid offset input changes do not crash Textual app."""
     pytest.importorskip("textual")
     from textual.widgets import Input, Static
+
     from tui_run import OverlayTui
 
     async def exercise():
@@ -272,6 +264,7 @@ def test_tui_app_unmount_while_probe_thread_active():
     """Verify unmounting the app while an API probe is sleeping in background thread does not crash."""
     pytest.importorskip("textual")
     from textual.widgets import Button, TabbedContent
+
     from tui_run import OverlayTui
 
     probe_started = threading.Event()

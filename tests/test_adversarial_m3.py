@@ -17,8 +17,7 @@ import math
 import os
 from pathlib import Path
 import sys
-import tempfile
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -28,16 +27,11 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from env_bootstrap import (
-    get_translate_api_config,
     probe_translate_api,
     save_dotenv_api_config,
-    translate_api_config_ok,
 )
-from pipeline_plan import PIPELINE_VALUE_FLAGS, PipelinePlan
 from tui_models import (
     CORE_MODES,
-    LEGACY_MODES,
-    MODES,
     MODE_AUTO,
     MODE_FULL_PRODUCTION,
     MODE_FULL_RENDER,
@@ -57,14 +51,6 @@ from tui_models import (
     _mode_from_fields,
 )
 from tui_run import (
-    _ADVANCED_RENDER_MODE_OPTION,
-    _CORE_TASK_MODE_OPTIONS,
-    _ENCODER_OPTIONS,
-    _LAYOUT_PRESET_OPTIONS,
-    _LEGACY_TASK_MODE_OPTIONS,
-    _MEDIA_CHECK_OPTIONS,
-    _RENDER_PRESET_OPTIONS,
-    _TASK_MODE_OPTIONS,
     OverlayTui,
 )
 
@@ -302,9 +288,9 @@ def test_adversarial_save_dotenv_multiline_and_comment_chaos(tmp_path: Path):
     assert ok is True
     content = env_file.read_text(encoding="utf-8")
     lines = content.splitlines()
-    base_url_lines = [l for l in lines if "OPENAI_COMPAT_BASE_URL=" in l]
-    api_key_lines = [l for l in lines if "OPENAI_COMPAT_API_KEY=" in l]
-    model_lines = [l for l in lines if "OPENAI_COMPAT_MODEL=" in l]
+    base_url_lines = [line for line in lines if "OPENAI_COMPAT_BASE_URL=" in line]
+    api_key_lines = [line for line in lines if "OPENAI_COMPAT_API_KEY=" in line]
+    model_lines = [line for line in lines if "OPENAI_COMPAT_MODEL=" in line]
     assert len(base_url_lines) == 1
     assert base_url_lines[0] == "OPENAI_COMPAT_BASE_URL=https://api.new.com/v1"
     assert len(api_key_lines) == 1

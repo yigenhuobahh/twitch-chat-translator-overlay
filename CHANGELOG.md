@@ -27,6 +27,7 @@ Notable changes to this project are documented in this file.
 
 - Prevented local history clearing while queued or running tasks still exist, including tasks owned by another TUI process.
 - Fixed `scripts/run_tests.py --help` crashing when formatting the coverage percentage.
+- Kept the scheduled CI lint gate green under ruff 0.16 by removing newly flagged unused imports, fixing import order, renaming ambiguous loop variables, and pinning ruff to `0.16.5` in dev requirements.
 
 ## [0.2.4] - 2026-07-24
 
