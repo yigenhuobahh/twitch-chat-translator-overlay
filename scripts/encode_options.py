@@ -97,6 +97,10 @@ def detect_hw_encoders(available: set[str] | None = None) -> dict[str, str]:
 def _trial_encode(codec: str) -> bool:
     """Encode a single blank frame with the given codec to verify it works.
 
+    Probes at 256x256: NVENC/QSV drivers reject tiny frames (2x2) at the
+    resolution level, which made working encoders look broken and silently
+    pushed ``--encoder auto`` down to x264.
+
     Returns True if the encoder produces a valid output, False otherwise.
     """
     import os
@@ -107,7 +111,7 @@ def _trial_encode(codec: str) -> bool:
         r = subprocess.run(
             [
                 require_executable("ffmpeg"), "-y", "-f", "lavfi", "-i",
-                "color=c=black:s=2x2:d=0.04",
+                "color=c=black:s=256x256:d=0.04",
                 "-frames:v", "1", "-c:v", codec,
                 "-pix_fmt", "yuv420p", tmp_path,
             ],

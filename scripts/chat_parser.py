@@ -242,6 +242,12 @@ def parse_chat_html(html_path, out_dir):
     messages = []
     # Message markup lives in body; avoid re-scanning multi-MB CSS.
     msg_html = body_region
+    # Strip HTML comments before any body splitting: exports may embed
+    # commented-out sample messages (a full <pre class="comment-root"> block
+    # inside <!-- -->) that would otherwise be parsed as real chat lines.
+    # The lazy DOTALL form has no nested/ambiguous quantifiers, so the scan
+    # stays linear on multi-MB bodies.
+    msg_html = re.sub(r"<!--.*?-->", "", msg_html, flags=re.DOTALL)
     print("  开始提取消息…", flush=True)
 
     # 检测 HTML 格式
@@ -262,8 +268,12 @@ def parse_chat_html(html_path, out_dir):
             re.IGNORECASE,
         )
         # color: may appear anywhere inside style= (with other CSS props / !important).
+        # The lookbehind (not a letter/hyphen before "color") keeps hyphenated
+        # properties like "background-color" / "border-color" from being
+        # captured as the author color; \b alone fails there ("-" is a
+        # non-word char, so \bcolor matches "background-color").
         author_color_pattern = re.compile(
-            r"""\bstyle\s*=\s*["'][^"']*?\bcolor\s*:\s*([^;"'!]+)""",
+            r"""\bstyle\s*=\s*["'][^"']*?(?<![a-z-])color\s*:\s*([^;"'!]+)""",
             re.IGNORECASE,
         )
         # Badge: class token badge-image (not not-badge-image); title any-quoted; attr order free.

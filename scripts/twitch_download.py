@@ -207,6 +207,16 @@ def _new_download_staging_path(destination: Path) -> Path:
     )
 
 
+def _reject_option_like(value: str | None, label: str) -> str:
+    """Reject slot values that a .NET CLI would parse as its own options."""
+    text = "" if value is None else str(value).strip()
+    if text.startswith("-"):
+        raise TwitchDownloadError(
+            f"无效{label}: 不能以 '-' 开头（会被 TwitchDownloaderCLI 当作选项）: {text!r}"
+        )
+    return text
+
+
 def build_video_cmd(
     cli: Path,
     *,
@@ -221,21 +231,22 @@ def build_video_cmd(
     trim_mode: str = "Safe",
 ) -> list[str]:
     mode = "videodownload" if kind == "vod" else "clipdownload"
+    source_id = _reject_option_like(source_id, "Twitch VOD/Clip ID")
     cmd = [str(cli), mode, "--id", source_id, "-o", str(output), "--collision", "Overwrite"]
     if quality:
-        cmd.extend(["-q", quality])
+        cmd.extend(["-q", _reject_option_like(quality, "下载画质")])
     if kind == "vod":
         if begin:
-            cmd.extend(["-b", begin])
+            cmd.extend(["-b", _reject_option_like(begin, "裁切开始时间")])
         if end:
-            cmd.extend(["-e", end])
+            cmd.extend(["-e", _reject_option_like(end, "裁切结束时间")])
         trim = str(trim_mode or "Safe").strip().capitalize()
         if trim not in ("Safe", "Exact"):
             raise TwitchDownloadError(f"无效 trim mode: {trim_mode!r}（Safe|Exact）")
         # Safe avoids the known ~1s A/V desync from Exact crop + stream copy.
         cmd.extend(["--trim-mode", trim])
     if oauth:
-        cmd.extend(["--oauth", oauth])
+        cmd.extend(["--oauth", _reject_option_like(oauth, "OAuth 令牌")])
     if ffmpeg_path:
         cmd.extend(["--ffmpeg-path", ffmpeg_path])
     return cmd
@@ -257,7 +268,7 @@ def build_chat_cmd(
         str(cli),
         "chatdownload",
         "--id",
-        source_id,
+        _reject_option_like(source_id, "Twitch VOD/Clip ID"),
         "-o",
         str(output),
         "--collision",
@@ -270,9 +281,9 @@ def build_chat_cmd(
     cmd.append(f"--ffz={'true' if ffz else 'false'}")
     cmd.append(f"--stv={'true' if stv else 'false'}")
     if begin:
-        cmd.extend(["-b", begin])
+        cmd.extend(["-b", _reject_option_like(begin, "裁切开始时间")])
     if end:
-        cmd.extend(["-e", end])
+        cmd.extend(["-e", _reject_option_like(end, "裁切结束时间")])
     return cmd
 
 
@@ -1604,6 +1615,7 @@ def try_portable_td_cli(
         return False
 
     print(f"  版本: {tag}")
+    print("  注意: 发布包不做哈希校验，仅校验 GitHub 官方 release 路径与压缩包结构。")
     print(f"  资源: {asset_name}")
     print(f"  URL: {url}")
 

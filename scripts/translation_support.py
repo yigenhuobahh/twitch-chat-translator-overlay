@@ -227,7 +227,10 @@ def summarize_errors(error_counts: dict[str, int]) -> str:
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _WIN_DRIVE_IN_TEXT_RE = re.compile(r"[A-Za-z]:\\")
 _SCHEME_PREFIX_RE = re.compile(r"(?i)^\s*(https?|ftp):")
-_DRIVE_PREFIX_RE = re.compile(r"^\s*[A-Za-z]:[\\/]")
+# A Windows drive reference may carry a space between the colon and the
+# separator when a human types it ("C: \Games", "C: /path"); such text must
+# never be re-read as a "username: 译文" prefix.
+_DRIVE_PREFIX_RE = re.compile(r"^\s*[A-Za-z]:\s*[\\/]")
 _INDEX_PREFIX_RE = re.compile(r"^\s*\[\d+\]\s*")
 _ANGLE_PREFIX_RE = re.compile(r"^\s*<[^>\s]+>\s*")
 _USERNAME_PREFIX_RE = re.compile(
@@ -242,7 +245,15 @@ _ALT_TRANSLATION_RE = re.compile(
 
 
 def _has_cjk(s: str) -> bool:
-    return any("一" <= ch <= "鿿" for ch in s)
+    # Cover the scripts translation targets actually use: kana (ja), hangul
+    # syllables (ko), CJK Extension A, and the unified ideographs (zh).
+    return any(
+        ("\u3040" <= ch <= "\u30ff")  # Hiragana + Katakana
+        or ("\u3400" <= ch <= "\u4dbf")  # CJK Unified Ideographs Extension A
+        or ("\u4e00" <= ch <= "\u9fff")  # CJK Unified Ideographs
+        or ("\uac00" <= ch <= "\ud7af")  # Hangul syllables
+        for ch in s
+    )
 
 
 def looks_like_path_or_url(text) -> bool:

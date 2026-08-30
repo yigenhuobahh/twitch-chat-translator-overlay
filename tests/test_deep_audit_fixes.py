@@ -15,7 +15,7 @@ from helpers import load_module
 def test_import_before_window_filter_in_main_source():
     """Guard: import-translation must run before filter_chat_for_time_window."""
     burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
-    src = inspect.getsource(burn.main)
+    src = inspect.getsource(burn._main)
     import_pos = src.find("if args.import_translation:")
     filter_pos = src.find("filter_chat_for_time_window")
     export_pos = src.find("if args.export_translation:")
@@ -27,7 +27,7 @@ def test_import_before_window_filter_in_main_source():
 def test_confirm_preview_operator_precedence():
     """Auto-offset tip should not fire for every preview without auto mode."""
     burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
-    src = inspect.getsource(burn.main)
+    src = inspect.getsource(burn._main)
     assert "(args.preview_frame is not None or args.preview_clip is not None)" in src
     assert 'and offset_info["mode"] == "auto"' in src
 

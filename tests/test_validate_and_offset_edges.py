@@ -95,11 +95,16 @@ def test_manual_offset_overrides_auto():
     assert diag["auto_detected"] is False
 
 
-def test_apply_time_offset_clamps_negative():
+def test_apply_time_offset_keeps_negative():
+    """REND-O4: pre-show carry-in keeps negative video-relative timestamps.
+
+    Clamping to 0 used to burst every pre-show message into the lanes at t=0;
+    schedulers drop a row only when its whole lifetime ended before 0.
+    """
     cw = load_module("chat_window", "chat_window.py")
     messages = [{"timestamp": 5.0}, {"timestamp": 20.0}]
     out = cw.apply_time_offset(messages, offset=10.0)
-    assert out[0]["timestamp"] == 0.0
+    assert out[0]["timestamp"] == -5.0
     assert out[1]["timestamp"] == 10.0
 
 

@@ -1,0 +1,522 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Hardening regressions for the translate/parser stack (review wave 2).
+
+Covers: CJK range coverage for ja/ko, string-index model responses, author
+color vs background-color, HTML-comment message stripping, extract_json
+chatter tolerance, drive-prefix guard, progress value type validation, and
+dotenv export-prefix / inline-comment parsing plus the cwd .env notice.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from helpers import load_module
+
+_TRANSLATION_ENV_KEYS = (
+    "OPENAI_COMPAT_BASE_URL",
+    "OPENAI_COMPAT_MODEL",
+    "OPENAI_COMPAT_API_KEY",
+    "AGNES_BASE_URL",
+    "AGNES_MODEL",
+    "AGNES_API_KEY",
+)
+
+
+def _clear_translation_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in _TRANSLATION_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+
+def _client_returning(payloads: list[str], record: dict):
+    """Stub OpenAI client whose completions.create returns payloads in order."""
+
+    class Completions:
+        def create(self, **_kwargs):
+            payload = payloads[min(record["calls"], len(payloads) - 1)]
+            record["calls"] += 1
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=payload))]
+            )
+
+    class Client:
+        def __init__(self, **_kwargs):
+            self.chat = SimpleNamespace(completions=Completions())
+
+    return Client
+
+
+def _parse_html(tmp_path: Path, body: str) -> dict:
+    parser = load_module("chat_parser", "chat_parser.py")
+    html = (
+        "<!DOCTYPE html><html><head><title>t</title></head><body>"
+        + body
+        + "</body></html>"
+    )
+    html_path = tmp_path / "chat.html"
+    html_path.write_text(html, encoding="utf-8")
+    return parser.parse_chat_html(str(html_path), str(tmp_path / "out"))
+
+
+def _td_message(
+    timestamp: int,
+    author: str,
+    style_attr: str,
+    text: str,
+) -> str:
+    style = f' style="{style_attr}"' if style_attr else ""
+    return (
+        f'<pre class="comment-root">'
+        f'[<a href="https://www.twitch.tv/videos/1?t=0h0m{timestamp}s">0:00:{timestamp:02d}</a>] '
+        f'<span class="comment-author"{style}>{author}</span>'
+        f'<span class="comment-message">: {text}</span></pre>'
+    )
+
+
+# ---------------------------------------------------------------------------
+# PARSE-O1: CJK range coverage (kana / hangul / Extension A)
+# ---------------------------------------------------------------------------
+
+
+def test_username_echo_stripped_for_kana_hangul_and_extension_a():
+    import translation_support as support
+
+    assert support.clean_translation_text("Tanaka: マジで") == "マジで"
+    assert support.clean_translation_text("Kim: 안녕하세요") == "안녕하세요"
+    assert support.clean_translation_text("alice: 㐀㐁は拡張A") == "㐀㐁は拡張A"
+
+
+def test_dual_candidate_folding_accepts_kana_and_hangul():
+    import translation_support as support
+
+    assert support.clean_translation_text("マジで/本当だよ") == "マジで"
+    assert support.clean_translation_text("안녕하세요/반갑습니다") == "안녕하세요"
+
+
+def test_clean_translation_guards_survive_cjk_expansion():
+    import translation_support as support
+
+    # Non-CJK remainders, times, labels, URLs and paths stay intact.
+    assert support.clean_translation_text("alice: hello") == "alice: hello"
+    assert support.clean_translation_text("12:30") == "12:30"
+    assert support.clean_translation_text("Score: 5-0") == "Score: 5-0"
+    assert (
+        support.clean_translation_text("看这里 https://twitch.tv/foo")
+        == "看这里 https://twitch.tv/foo"
+    )
+    assert support.clean_translation_text("and/or") == "and/or"
+    assert support.clean_translation_text("A/B测试") == "A/B测试"
+
+
+# ---------------------------------------------------------------------------
+# PARSE-N2: drive prefix with a space after the colon
+# ---------------------------------------------------------------------------
+
+
+def test_drive_prefix_guard_accepts_space_after_colon():
+    import translation_support as support
+
+    assert support._DRIVE_PREFIX_RE.match("C: /盘里/x")
+    assert support._DRIVE_PREFIX_RE.match("C:\\path")
+    assert support._DRIVE_PREFIX_RE.match("D: \\\\srv\\share")
+
+
+def test_drive_prefixed_text_is_never_username_stripped():
+    import translation_support as support
+
+    assert support.clean_translation_text("C: 盘里") == "C: 盘里"
+    assert support.clean_translation_text("C: /盘里/字幕.ass") == "C: /盘里/字幕.ass"
+    assert support.clean_translation_text("C:\\盘里\\file") == "C:\\盘里\\file"
+    assert support.clean_translation_text("C:\\Users\\foo/bar") == "C:\\Users\\foo/bar"
+
+
+# ---------------------------------------------------------------------------
+# PARSE-O3: author color must not capture background-color
+# ---------------------------------------------------------------------------
+
+
+def test_author_color_ignores_background_color(tmp_path: Path):
+    chat = _parse_html(
+        tmp_path,
+        _td_message(1, "Alice", "background-color: #FF0000; color: #00FF00", "hi"),
+    )
+    assert chat["messages"][0]["color"] == "#00FF00"
+
+
+def test_author_color_empty_when_only_background_color(tmp_path: Path):
+    chat = _parse_html(
+        tmp_path,
+        _td_message(1, "Bob", "background-color: #FF0000", "yo"),
+    )
+    assert chat["messages"][0]["color"] == ""
+
+
+# ---------------------------------------------------------------------------
+# PARSE-O4: HTML comments never produce messages
+# ---------------------------------------------------------------------------
+
+
+def test_commented_out_message_is_not_parsed(tmp_path: Path):
+    real = _td_message(1, "Alice", "color: #FF0000", "hi")
+    fake = _td_message(9, "FakeGuy", "color: #00FF00", "fake msg")
+    chat = _parse_html(tmp_path, f"<!-- {fake} -->" + real)
+
+    assert len(chat["messages"]) == 1
+    assert chat["messages"][0]["author"] == "Alice"
+    assert chat["messages"][0]["timestamp"] == 1.0
+
+
+def test_fully_commented_body_yields_no_messages(tmp_path: Path):
+    fake = _td_message(9, "FakeGuy", "color: #00FF00", "fake msg")
+    chat = _parse_html(tmp_path, f"<!-- {fake} -->")
+
+    assert chat["messages"] == []
+
+
+def test_comments_between_messages_keep_surrounding_messages(tmp_path: Path):
+    first = _td_message(1, "Alice", "color: #FF0000", "hi")
+    fake = _td_message(5, "FakeGuy", "color: #00FF00", "fake msg")
+    second = _td_message(2, "Carol", "color: #0000FF", "yo")
+    chat = _parse_html(tmp_path, first + f"<!-- {fake} -->" + second)
+
+    assert [m["author"] for m in chat["messages"]] == ["Alice", "Carol"]
+    assert [m["timestamp"] for m in chat["messages"]] == [1.0, 2.0]
+
+
+# ---------------------------------------------------------------------------
+# PARSE-O6: extract_json fence / chatter tolerance
+# ---------------------------------------------------------------------------
+
+
+def test_extract_json_strips_leading_code_fence():
+    import translate_chat_openai as tr
+
+    assert tr.extract_json('```json\n{"a": 1}\n```') == '{"a": 1}'
+    assert tr.extract_json('```\n{"a": 1}\n```') == '{"a": 1}'
+
+
+def test_extract_json_slices_bare_json_with_leading_chatter():
+    import translate_chat_openai as tr
+
+    assert tr.extract_json('Here you go: {"a": 1}') == '{"a": 1}'
+    assert tr.extract_json('{"a": 1} hope this helps') == '{"a": 1}'
+    assert (
+        tr.extract_json('Sure!\n```json\n{"a": 1}\n```')
+        == '{"a": 1}'
+    )
+
+
+def test_extract_json_keeps_json_string_containing_fence_markers():
+    import translate_chat_openai as tr
+
+    text = '{"a": "has ``` inside"}'
+    assert tr.extract_json(text) == text
+
+
+def test_extract_json_without_json_keeps_bad_json_failure_path():
+    import translate_chat_openai as tr
+
+    junk = "抱歉，无法翻译"
+    assert tr.extract_json(junk) == junk
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(tr.extract_json(junk))
+
+
+# ---------------------------------------------------------------------------
+# PARSE-O2: string indexes from the model must not fail the batch
+# ---------------------------------------------------------------------------
+
+
+def test_translate_batch_remaps_string_batch_local_indexes(monkeypatch):
+    import translate_chat_openai as tr
+
+    monkeypatch.setattr(tr.time, "sleep", lambda _s: None)
+    payload = json.dumps(
+        {"translations": [
+            {"index": "0", "translation": "译A"},
+            {"index": "1", "translation": "译B"},
+        ]},
+        ensure_ascii=False,
+    )
+    record = {"calls": 0}
+    client = _client_returning([payload], record)()
+
+    result = tr.translate_batch(
+        client,
+        [{"index": 5, "original": "a"}, {"index": 9, "original": "b"}],
+        1,
+        "ctx",
+        "zh",
+    )
+
+    assert record["calls"] == 1
+    assert result == [
+        {"index": 5, "translation": "译A"},
+        {"index": 9, "translation": "译B"},
+    ]
+
+
+def test_translate_batch_accepts_string_global_indexes(monkeypatch):
+    import translate_chat_openai as tr
+
+    monkeypatch.setattr(tr.time, "sleep", lambda _s: None)
+    payload = json.dumps(
+        {"translations": [
+            {"index": "5", "translation": "译A"},
+            {"index": "9", "translation": "译B"},
+        ]},
+        ensure_ascii=False,
+    )
+    record = {"calls": 0}
+    client = _client_returning([payload], record)()
+
+    result = tr.translate_batch(
+        client,
+        [{"index": 5, "original": "a"}, {"index": 9, "original": "b"}],
+        1,
+        "ctx",
+        "zh",
+    )
+
+    assert record["calls"] == 1
+    assert result == [
+        {"index": 5, "translation": "译A"},
+        {"index": 9, "translation": "译B"},
+    ]
+
+
+def test_translate_batch_drops_row_with_non_numeric_index(monkeypatch):
+    import translate_chat_openai as tr
+
+    monkeypatch.setattr(tr.time, "sleep", lambda _s: None)
+    payload = json.dumps(
+        {"translations": [
+            {"index": "5", "translation": "译A"},
+            {"index": "oops", "translation": "译B"},
+        ]},
+        ensure_ascii=False,
+    )
+    record = {"calls": 0}
+    client = _client_returning([payload], record)()
+    error_counts: dict[str, int] = {}
+
+    result = tr.translate_batch(
+        client,
+        [{"index": 5, "original": "a"}, {"index": 9, "original": "b"}],
+        1,
+        "ctx",
+        "zh",
+        error_counts=error_counts,
+    )
+
+    # One invalid row is dropped without failing/retrying the whole batch.
+    assert record["calls"] == 1
+    assert result == [{"index": 5, "translation": "译A"}]
+    assert error_counts.get("bad_json") == 1
+
+
+def test_translate_batch_still_rejects_duplicate_string_indexes(monkeypatch):
+    import translate_chat_openai as tr
+
+    monkeypatch.setattr(tr.time, "sleep", lambda _s: None)
+    payload = json.dumps(
+        {"translations": [
+            {"index": "0", "translation": "译A"},
+            {"index": "0", "translation": "译B"},
+        ]},
+        ensure_ascii=False,
+    )
+    record = {"calls": 0}
+    client = _client_returning([payload], record)()
+
+    result = tr.translate_batch(
+        client,
+        [{"index": 5, "original": "a"}, {"index": 9, "original": "b"}],
+        1,
+        "ctx",
+        "zh",
+    )
+
+    # Duplicates (even coerced from strings) must keep the retry + failure path.
+    assert record["calls"] == 3
+    assert result is None
+
+
+def test_translate_batch_still_retries_when_model_omits_a_row(monkeypatch):
+    import translate_chat_openai as tr
+
+    monkeypatch.setattr(tr.time, "sleep", lambda _s: None)
+    payload = json.dumps(
+        {"translations": [{"index": "5", "translation": "译A"}]},
+        ensure_ascii=False,
+    )
+    record = {"calls": 0}
+    client = _client_returning([payload], record)()
+
+    result = tr.translate_batch(
+        client,
+        [{"index": 5, "original": "a"}, {"index": 9, "original": "b"}],
+        1,
+        "ctx",
+        "zh",
+    )
+
+    assert record["calls"] == 3
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# PARSE-N4: non-string progress translation values must not be reused
+# ---------------------------------------------------------------------------
+
+
+def test_progress_translation_with_dict_value_is_retranslated(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import translate_chat_openai as tr
+
+    message = {"index": 0, "author": "alice", "original": "hello", "translation": ""}
+    json_path = tmp_path / "poison.json"
+    json_path.write_text(
+        json.dumps({"messages": [message]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    tr.save_progress(
+        tr.progress_path_for(json_path),
+        {
+            "schema_version": tr.PROGRESS_SCHEMA_VERSION,
+            "provider": tr.TRANSLATION_PROVIDER,
+            "base_url_fingerprint": tr.base_url_fingerprint(
+                "https://provider.invalid/v1"
+            ),
+            "model": "stub-model",
+            "prompt_version": tr.PROMPT_VERSION,
+            "target_language": "zh",
+            "context": "livestream chat",
+            "translations": {"0": {"nested": "poison"}},
+            "fingerprints": {"0": tr.fingerprint_message(message)},
+            "json_translation_fingerprints": {"0": tr.fingerprint_translation("")},
+            "failed": [],
+        },
+    )
+
+    payload = json.dumps(
+        {"translations": [{"index": 0, "translation": "新译文"}]},
+        ensure_ascii=False,
+    )
+    record = {"calls": 0}
+    monkeypatch.setattr(tr, "OpenAI", _client_returning([payload], record))
+    monkeypatch.setattr(tr, "BASE_URL", "https://provider.invalid/v1")
+    monkeypatch.setattr(tr, "API_KEY", "stub-key")
+    monkeypatch.setattr(tr, "MODEL", "stub-model")
+    monkeypatch.setattr(
+        tr.sys,
+        "argv",
+        ["translate_chat_openai.py", str(json_path), "--workers", "1"],
+    )
+
+    tr.main()
+
+    updated = json.loads(json_path.read_text(encoding="utf-8"))
+    # The dict "translation" must not be str()-ed into a reused value.
+    assert record["calls"] == 1
+    assert updated["messages"][0]["translation"] == "新译文"
+
+
+# ---------------------------------------------------------------------------
+# PARSE-N5: dotenv export prefix + inline comments
+# ---------------------------------------------------------------------------
+
+
+def test_dotenv_parses_export_prefix_and_inline_comments(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import common_utils as cu
+
+    _clear_translation_env(monkeypatch)
+    monkeypatch.delenv("_TWITCH_TRANSPARENT_TEST_MODE", raising=False)
+    monkeypatch.setattr(cu, "_DOTENV_LOADED_KEYS", set())
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "# full line comment",
+                "OPENAI_COMPAT_API_KEY=abc # inline comment",
+                'OPENAI_COMPAT_BASE_URL="https://provider.invalid/v1" # trailing',
+                "AGNES_MODEL=m#del",
+                "export AGNES_API_KEY=exp-key",
+                "OPENAI_COMPAT_MODEL=#FF0000",
+                "AGNES_BASE_URL='quo#ted'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    cu.load_dotenv_if_present()
+
+    assert os.environ["OPENAI_COMPAT_API_KEY"] == "abc"
+    assert os.environ["OPENAI_COMPAT_BASE_URL"] == "https://provider.invalid/v1"
+    assert os.environ["AGNES_MODEL"] == "m#del"
+    assert os.environ["AGNES_API_KEY"] == "exp-key"
+    assert os.environ["OPENAI_COMPAT_MODEL"] == "#FF0000"
+    assert os.environ["AGNES_BASE_URL"] == "quo#ted"
+
+    # load_dotenv_if_present writes os.environ directly, outside monkeypatch undo.
+    for key in _TRANSLATION_ENV_KEYS:
+        os.environ.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# SEC-O2: foreign cwd .env load is announced
+# ---------------------------------------------------------------------------
+
+
+def test_foreign_cwd_dotenv_load_prints_notice(tmp_path: Path, monkeypatch, capsys):
+    import common_utils as cu
+
+    _clear_translation_env(monkeypatch)
+    monkeypatch.delenv("_TWITCH_TRANSPARENT_TEST_MODE", raising=False)
+    monkeypatch.setattr(cu, "_DOTENV_LOADED_KEYS", set())
+    (tmp_path / ".env").write_text("OPENAI_COMPAT_API_KEY=foreign-key\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    cu.load_dotenv_if_present()
+
+    out = capsys.readouterr().out
+    assert "已从当前目录加载 .env" in out
+    assert str(tmp_path) in out
+    assert os.environ["OPENAI_COMPAT_API_KEY"] == "foreign-key"
+
+    for key in _TRANSLATION_ENV_KEYS:
+        os.environ.pop(key, None)
+
+
+def test_repo_root_dotenv_load_prints_no_notice(tmp_path: Path, monkeypatch, capsys):
+    import common_utils as cu
+
+    _clear_translation_env(monkeypatch)
+    monkeypatch.delenv("_TWITCH_TRANSPARENT_TEST_MODE", raising=False)
+    monkeypatch.setattr(cu, "_DOTENV_LOADED_KEYS", set())
+    # Fake a source-checkout layout; cwd .env is the repo root .env itself.
+    fake_repo = tmp_path / "repo"
+    (fake_repo / "scripts").mkdir(parents=True)
+    (fake_repo / "scripts" / "common_utils.py").write_text("", encoding="utf-8")
+    (fake_repo / ".env").write_text("OPENAI_COMPAT_API_KEY=repo-key\n", encoding="utf-8")
+    monkeypatch.setattr(cu, "__file__", str(fake_repo / "scripts" / "common_utils.py"))
+    monkeypatch.chdir(fake_repo)
+
+    cu.load_dotenv_if_present()
+
+    assert "已从当前目录加载" not in capsys.readouterr().out
+    assert os.environ["OPENAI_COMPAT_API_KEY"] == "repo-key"
+
+    for key in _TRANSLATION_ENV_KEYS:
+        os.environ.pop(key, None)

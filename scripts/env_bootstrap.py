@@ -561,10 +561,21 @@ def save_dotenv_api_config(
 
         output_text = "\n".join(new_lines) + "\n"
 
-        # Atomic write
+        # Atomic write with a durable flush; the temp file is removed even
+        # when the write or replace fails (mirrors the download-transaction
+        # journal pattern).
         temp_target = target.with_name(f".{target.name}.tmp-{uuid.uuid4().hex}")
-        temp_target.write_text(output_text, encoding="utf-8")
-        temp_target.replace(target)
+        try:
+            temp_target.write_text(output_text, encoding="utf-8")
+            with temp_target.open("ab") as handle:
+                handle.flush()
+                os.fsync(handle.fileno())
+            temp_target.replace(target)
+        finally:
+            try:
+                temp_target.unlink(missing_ok=True)
+            except OSError:
+                pass
 
         # Synchronize os.environ
         for key, value in updates.items():
@@ -789,6 +800,9 @@ def try_portable_ffmpeg(*, assume_yes: bool = False, root: Path | None = None) -
         assume_yes=assume_yes,
     ):
         return False
+
+    print("  版本: ffmpeg-release-essentials（gyan.dev 滚动最新版）")
+    print("  注意: 该下载不做哈希校验，请仅通过本项目固定的 HTTPS 来源获取。")
 
     dest_root = root / "tools" / "ffmpeg"
     dest_root.parent.mkdir(parents=True, exist_ok=True)

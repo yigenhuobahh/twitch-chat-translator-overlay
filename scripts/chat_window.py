@@ -84,6 +84,12 @@ def apply_time_offset(messages: list[dict], offset: float) -> list[dict]:
     HTML timestamps are stream-absolute (seconds from broadcast start). After offset,
     ``timestamp`` is video-relative. ``stream_timestamp`` keeps the pre-offset value so
     translation JSON can identity-match across different --offset choices.
+
+    Negative results are kept on purpose: messages before the video start are
+    pre-show carry-in. Both schedulers drop a message only when its whole
+    lifetime already ended (``(source_t + msg_lifetime) <= 0``), so clamping to
+    0 here would burst every pre-show message into the lanes simultaneously at
+    t=0 instead of showing them mid-life.
     """
     if not offset:
         # Still stamp stream_timestamp when missing so export/import share one field.
@@ -107,7 +113,7 @@ def apply_time_offset(messages: list[dict], offset: float) -> list[dict]:
         except (TypeError, ValueError):
             stream = current
             m["stream_timestamp"] = stream
-        m["timestamp"] = max(0.0, stream - off)
+        m["timestamp"] = stream - off
     return messages
 
 
@@ -365,6 +371,22 @@ def message_visible_in_window(timestamp: float, window_start: float, window_end:
     return (t <= window_end) and (msg_end > window_start)
 
 
+def _newest_pre_window_rows(pre_rows: list, capacity: int) -> tuple[list, int, int]:
+    """Keep only the newest ``capacity`` pre-window rows, sorted ascending by timestamp.
+
+    Single shared implementation for the float preview prefilter (before deepcopy,
+    to avoid materializing the whole VOD) and trim_float_carry_in_messages (after
+    filtering). Rows are ``(timestamp, msg)`` tuples.
+
+    Returns (kept_rows, rows_before, rows_after). Per-message line cost is not
+    modeled here: active_float_stack enforces the real multi-line line budget at
+    draw time.
+    """
+    rows = sorted(pre_rows, key=lambda row: row[0])
+    keep_n = min(len(rows), max(1, int(capacity)))
+    return rows[-keep_n:] if keep_n else [], len(rows), keep_n
+
+
 def filter_chat_for_time_window(
     chat_data: dict,
     window_start: float | None,
@@ -389,7 +411,9 @@ def filter_chat_for_time_window(
     float_capacity_lines: when set, only the newest pre-window rows that fit this
     *line* budget (plus all in-window arrivals) are deep-copied — avoids materializing
     the full VOD chat for float mid-clip previews.
-    max_message_lines: conservative per-message line cost for that prefilter/trim.
+    max_message_lines: accepted for backward compatibility; the prefilter keeps the
+    newest ``float_capacity_lines`` *messages* (1 line each) and the real multi-line
+    line budget is enforced later by active_float_stack.
     """
     if window_start is None or window_end is None:
         return chat_data
@@ -414,26 +438,16 @@ def filter_chat_for_time_window(
     prefilter_meta = None
     if float_capacity_lines is not None and selected:
         cap = max(1, int(float_capacity_lines))
-        # Prefer slight over-fetch (1 line/msg) so single-line mobile stacks open
-        # full; active_float_stack enforces the real line budget at render time.
-        # max_message_lines is only a soft upper bound when counting pre-window rows.
-        soft_max = max(1, int(max_message_lines or 0) or 1)
-        per_msg_lines = 1
+        # Prefilter counts messages, not lines (1 line/msg) so single-line mobile
+        # stacks open full; active_float_stack enforces the real line budget later.
         win0 = float(window_start)
         pre = [(ts, m) for ts, m in selected if ts < win0]
         in_win = [(ts, m) for ts, m in selected if ts >= win0]
-        pre.sort(key=lambda row: row[0])
-        # Keep up to `cap` messages (line≈1); soft_max only limits pathological
-        # multi-line storms by allowing at most cap*soft_max message slots? No:
-        # keep min(cap, len) newest so capacity-full single-line stacks survive.
-        keep_n = min(len(pre), cap)
-        keep_pre = pre[-keep_n:] if keep_n else []
+        keep_pre, pre_before, pre_after = _newest_pre_window_rows(pre, cap)
         prefilter_meta = {
             "float_capacity_lines": cap,
-            "per_msg_lines": per_msg_lines,
-            "soft_max_message_lines": soft_max,
-            "pre_window_before": len(pre),
-            "pre_window_after": len(keep_pre),
+            "pre_window_before": pre_before,
+            "pre_window_after": pre_after,
         }
         selected = keep_pre + in_win
 
@@ -479,8 +493,10 @@ def trim_float_carry_in_messages(
     ``capacity_lines`` (line budget) can still be on-screen at window_start.
     In-window arrivals (timestamp >= window_start) are always kept.
 
-    Line cost without font metrics: each message costs max(1, max_message_lines)
-    when max_message_lines > 0, else 1 (single-line assumption).
+    Shares the newest-rows selection with the prefilter via
+    ``_newest_pre_window_rows``. ``max_message_lines`` is accepted for backward
+    compatibility; per-message line cost is enforced by active_float_stack at
+    draw time, not here.
     """
     capacity = max(1, int(capacity_lines or 1))
     messages = list(chat_data.get("messages") or [])
@@ -488,25 +504,22 @@ def trim_float_carry_in_messages(
         return chat_data
 
     # Match prefilter: keep newest `capacity` pre-window messages (1 line each).
-    # Real multi-line budget is enforced by active_float_stack at draw time.
-    per_msg_lines = 1
-    pre: list[dict] = []
-    in_window: list[dict] = []
     start = float(window_start)
+    pre: list[tuple[float, dict]] = []
+    in_window: list[dict] = []
     for msg in messages:
         ts = float(msg.get("timestamp", 0) or 0)
         if ts >= start:
             in_window.append(msg)
         else:
-            pre.append(msg)
+            pre.append((ts, msg))
 
     # Fast path: all pre fit under line≈1 capacity.
     if len(pre) <= capacity:
         return chat_data
 
-    pre.sort(key=lambda m: (float(m.get("timestamp", 0) or 0),))
-    keep_pre = pre[-capacity:]
-    kept = keep_pre + in_window
+    keep_pre, pre_before, pre_after = _newest_pre_window_rows(pre, capacity)
+    kept = [msg for _ts, msg in keep_pre] + in_window
 
     used_classes: set[str] = set()
     for msg in kept:
@@ -527,7 +540,6 @@ def trim_float_carry_in_messages(
         data["_window"]["float_carry_trim"] = True
         data["_window"]["kept_messages"] = len(kept)
         data["_window"]["kept_emotes"] = len(data["emote_map"])
-        data["_window"]["pre_window_before_trim"] = len(pre)
-        data["_window"]["pre_window_after_trim"] = len(keep_pre)
-        data["_window"]["trim_per_msg_lines"] = per_msg_lines
+        data["_window"]["pre_window_before_trim"] = pre_before
+        data["_window"]["pre_window_after_trim"] = pre_after
     return data

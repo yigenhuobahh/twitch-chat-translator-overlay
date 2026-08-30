@@ -176,6 +176,31 @@ def test_save_dotenv_api_config_failure_handling(tmp_path: Path):
         assert "Access denied" in msg
 
 
+def test_save_dotenv_api_config_leaves_no_temp_files_behind(tmp_path: Path):
+    """The atomic-write temp file must be cleaned up on success and on failure."""
+    env_file = tmp_path / ".env"
+    ok, _ = save_dotenv_api_config(
+        base_url="https://api.openai.com/v1",
+        api_key="sk-clean",
+        model="gpt-4o",
+        env_path=env_file,
+    )
+    assert ok is True
+    assert not list(tmp_path.glob(".*tmp-*"))
+
+    # Replace fails after the durable temp write; the temp file must not linger.
+    with patch("pathlib.Path.replace", side_effect=PermissionError("Access denied")):
+        ok_failure, msg = save_dotenv_api_config(
+            base_url="https://api.openai.com/v1",
+            api_key="sk-clean-2",
+            model="gpt-4o",
+            env_path=env_file,
+        )
+    assert ok_failure is False
+    assert "保存 .env 失败" in msg
+    assert not list(tmp_path.glob(".*tmp-*"))
+
+
 # ============================================================================
 # Unit Tests: probe_translate_api
 # ============================================================================

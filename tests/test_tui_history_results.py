@@ -252,6 +252,34 @@ def test_history_write_waits_for_another_instance_lock(tmp_path: Path):
     assert {record["label"] for record in first.list_records()} == {"first", "second"}
 
 
+def test_history_lock_raises_after_bounded_retry_window(tmp_path: Path, monkeypatch):
+    """A wedged holder must surface an OSError instead of freezing the UI thread."""
+    path = tmp_path / "history.json"
+    first = TuiHistoryStore(path)
+    second = TuiHistoryStore(path)
+    first.start(None, label="first")
+    locked = threading.Event()
+    release = threading.Event()
+
+    def hold_lock() -> None:
+        with first._history_lock():
+            locked.set()
+            assert release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    assert locked.wait(timeout=5)
+    monkeypatch.setattr(tui_history_module, "LOCK_RETRY_INTERVAL_S", 0.01)
+    monkeypatch.setattr(tui_history_module, "LOCK_TIMEOUT_S", 0.2)
+    try:
+        with pytest.raises(OSError, match="任务历史"):
+            second.list_records()
+    finally:
+        release.set()
+        holder.join(timeout=5)
+    assert [record["label"] for record in second.list_records()] == ["first"]
+
+
 def test_history_skips_malformed_records_and_handles_bad_draft(tmp_path: Path):
     path = tmp_path / "history.json"
     path.write_text(

@@ -28,6 +28,7 @@ from textual.widgets import (
     TabbedContent,
     TabPane,
 )
+from textual.widgets._select import InvalidSelectValueError
 from textual.widgets.option_list import Option
 
 from env_bootstrap import (
@@ -45,6 +46,7 @@ from tui_models import (
     MODE_QUICK_PREVIEW_ORIGINAL,
     MODE_QUICK_PREVIEW_TRANSLATED,
     MODE_RENDER_ONLY,
+    MODE_RENDER_ORIGINAL,
     MODE_REUSE_RENDER,
     MODE_STEP_API_AND_REVIEW,
     MODE_STEP_EXPORT_MANUAL,
@@ -54,9 +56,10 @@ from tui_models import (
     TuiDownloadDraft,
     TuiJobDraft,
 )
-from tui_task import TaskSession, redact_command, sanitize_diagnostic_file
+from tui_task import TaskSession, redact_command, redact_text, sanitize_diagnostic_file
 
-_UI_MODE_RENDER_ORIGINAL = "render_original"
+# 兼容旧引用（部分测试/外部代码直接导入该名字）；单一真值来源在 tui_models。
+_UI_MODE_RENDER_ORIGINAL = MODE_RENDER_ORIGINAL
 
 # 3 Core Operational Paths (Primary UI Options)
 _CORE_TASK_MODE_OPTIONS = (
@@ -241,7 +244,7 @@ class OverlayTui(App[None]):
             with TabPane("任务与结果", id="task"):
                 with VerticalScroll():
                     yield Static("实时显示任务执行进度、结构化阶段事件与子进程日志。若任务遇到异常，可导出脱敏诊断报告以便排障。", classes="hint")
-                    yield RichLog(id="log", wrap=True, highlight=False, markup=False)
+                    yield RichLog(id="log", wrap=True, highlight=False, markup=False, max_lines=2000)
                     with Horizontal():
                         yield Button("运行环境检查", id="doctor")
                         yield Button("生成 Issue 自检摘要", id="support-summary")
@@ -376,6 +379,13 @@ class OverlayTui(App[None]):
             if self.session.running:
                 self.session.cancel()
                 self._finish_history("interrupted", None, refresh=False)
+            elif self.session.returncode is not None and self._handled_session is not self.session:
+                # 进程刚结束但 0.15s 轮询还没跑到：先补一次收尾，
+                # 避免刚成功的任务在关窗瞬间被记成中断。
+                try:
+                    self._poll_session_once()
+                except NoMatches:
+                    pass
             self.session.close()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -440,7 +450,22 @@ class OverlayTui(App[None]):
         return value if isinstance(value, str) else ""
 
     def _set_select(self, selector: str, value: str) -> None:
-        self.query_one(selector, Select).value = value
+        select_widget = self.query_one(selector, Select)
+        try:
+            select_widget.value = value
+        except InvalidSelectValueError:
+            # 历史/导入数据可能携带已下线的选项值；镜像 _set_select_with_custom
+            # 的模式回退默认（首个非空选项），而不是抛异常打崩 UI。
+            fallback = next(
+                (
+                    option_value
+                    for _prompt, option_value in select_widget._options
+                    if option_value is not Select.NULL
+                ),
+                None,
+            )
+            if fallback is not None:
+                select_widget.value = fallback
 
     def _set_select_with_custom(self, selector: str, standard_options: tuple[tuple[str, str], ...], value: str) -> None:
         val = value.strip() if value else ""
@@ -616,7 +641,11 @@ class OverlayTui(App[None]):
             status.update(message)
 
     def _refresh_form_validation(self) -> None:
-        validation = self.query_one("#form-validation", Static)
+        validation = self._query_optional("#form-validation", Static)
+        if validation is None:
+            # Input.value 的程序化赋值也会异步 post Changed；该消息可能延迟到
+            # 应用关闭期才派发，此时控件已不存在，必须跳过而不是抛 NoMatches。
+            return
         problems = self._draft().validate(check_api=False, check_environment=False)
         if problems:
             validation.remove_class("ready")
@@ -654,11 +683,16 @@ class OverlayTui(App[None]):
 
     @work(thread=True)
     def _run_api_probe(self, base_url: str, api_key: str, model: str) -> None:
-        self.app.call_from_thread(
-            self._update_api_feedback,
-            "⏳ 正在连接翻译 API 接口进行鉴权与连通性测试，请稍候…",
-            status="正在测试 API 连通性…",
-        )
+        try:
+            self.app.call_from_thread(
+                self._update_api_feedback,
+                "⏳ 正在连接翻译 API 接口进行鉴权与连通性测试，请稍候…",
+                status="正在测试 API 连通性…",
+            )
+        except RuntimeError:
+            # textual 8.2.8 在窗口关闭期 _loop 仍非 None 但消息循环已停止，
+            # call_from_thread 此时可能阻塞或抛 RuntimeError；探测线程放弃回写即可。
+            return
         start_time = time.perf_counter()
         ok, msg = probe_translate_api(
             base_url=base_url or None,
@@ -671,9 +705,15 @@ class OverlayTui(App[None]):
             feedback_text = f"✅ API 连通性测试成功！模型: {model or '默认'}，响应延迟: {latency_ms}ms。接口正常可用。"
             status_text = f"API 连通性测试成功（耗时 {latency_ms}ms）。"
         else:
-            feedback_text = f"❌ API 连通性测试失败：{msg}（耗时 {latency_ms}ms）"
-            status_text = f"API 测试失败：{msg}"
-        self.app.call_from_thread(self._update_api_feedback, feedback_text, status=status_text)
+            # 服务端错误文本可能回显请求头/URL 凭据，进 UI 前先过脱敏规则。
+            safe_msg = redact_text(msg)
+            feedback_text = f"❌ API 连通性测试失败：{safe_msg}（耗时 {latency_ms}ms）"
+            status_text = f"API 测试失败：{safe_msg}"
+        try:
+            self.app.call_from_thread(self._update_api_feedback, feedback_text, status=status_text)
+        except RuntimeError:
+            # 同上：应用已进入关闭期，无法回写 UI，安全丢弃本次结果。
+            return
 
     def _update_api_feedback(self, text: str, status: str | None = None) -> None:
         try:
@@ -790,6 +830,11 @@ class OverlayTui(App[None]):
         if self.session and self.session.running:
             self._set_status("已有任务正在运行；请等待完成或先取消。")
             return
+        if self.session is not None:
+            # 0.15s 轮询窗口内刚退出的旧任务还挂着临时 events/result 文件；
+            # 覆盖引用前先收尾，避免这些文件永久泄漏。
+            self.session.drain_after_exit()
+            self.session.cleanup(keep_failure=False)
         try:
             queued = self.history.start(draft, label=label)
         except (OSError, ValueError) as exc:
@@ -941,12 +986,18 @@ class OverlayTui(App[None]):
             result_path = None
             if self.session:
                 result_path = self.session.retain_result(self.history.manifest_path(self.active_history_id))
-            self.history.finish(
-                self.active_history_id,
-                state=state,
-                returncode=returncode,
-                result_path=result_path,
-            )
+            try:
+                self.history.finish(
+                    self.active_history_id,
+                    state=state,
+                    returncode=returncode,
+                    result_path=result_path,
+                )
+            except OSError:
+                # 另一个僵死 TUI 实例可能长期持有历史锁；收尾失败只提示，
+                # 不能让异常沿 UI 线程打崩本实例。
+                self._set_status("任务历史暂时无法写入（可能被其他 TUI 实例占用）；任务本身已按上述状态处理。")
+                return
             if refresh:
                 self._refresh_history()
 
@@ -1172,7 +1223,7 @@ class OverlayTui(App[None]):
         path = self._input("#job-path").strip().strip('"')
         try:
             draft = TuiJobDraft.from_job_file(path)
-        except (OSError, ValueError, Exception) as exc:
+        except Exception as exc:  # OSError/ValueError/YAML 解析错误都按导入失败提示
             self._set_status(f"无法导入 YAML：{exc}")
             return
         self._apply_draft(draft)
@@ -1229,7 +1280,8 @@ class OverlayTui(App[None]):
         if self.active_history_id:
             target = self.history.path.parent / "diagnostics" / f"{self.active_history_id}.txt"
         else:
-            target = Path("outputs") / "tui_diagnostic.txt"
+            # 与 history/manifest 一致锚定项目根，避免随启动目录漂移。
+            target = Path(__file__).resolve().parent.parent / "outputs" / "tui_diagnostic.txt"
         try:
             path = self.session.export_diagnostics(target)
         except OSError:

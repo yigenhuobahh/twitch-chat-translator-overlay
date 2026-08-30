@@ -22,12 +22,15 @@ EVENT_DIRECTORY = Path("outputs") / ".tui-events"
 _BASE_URL_VALUE = re.compile(
     r"(?im)([^\r\n]*(?:(?:OPENAI_COMPAT|AGNES)_BASE_URL|翻译 Base URL|Translation Base URL)\s*[:=]\s*)[^\r\n]*"
 )
-_URL_USERINFO = re.compile(r"(?i)(https?://)[^\s/@:]+:[^\s/@]+@")
+_URL_USERINFO = re.compile(r"(?i)(https?://)[^\s/@]+@")
 _AUTHORIZATION_SECRET = re.compile(
     r"(?i)(authorization\s*[:=]\s*(?:bearer|oauth|basic)\s+)[^\s,;]+"
 )
+# ``authorization`` is handled after _AUTHORIZATION_SECRET so scheme-prefixed
+# values keep their dedicated rule; the named-secret rule catches the bare
+# ``authorization: <value>`` form.
 _NAMED_SECRET = re.compile(
-    r"(?i)((?:api[_ -]?key|token|password|oauth|(?:client[_ -]?)?secret)\s*[:=]\s*)"
+    r"(?i)((?:api[_ -]?key|token|password|oauth|authorization|(?:client[_ -]?)?secret)\s*[:=]\s*)"
     r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 )
 _JSON_SECRET = re.compile(
@@ -35,7 +38,11 @@ _JSON_SECRET = re.compile(
     r"(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)"
 )
 _OAUTH_ARGUMENT = re.compile(r"(?i)(--oauth(?:\s+|=))(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)")
-_ENVIRONMENT_VARIABLE = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b")
+# 只脱敏密钥形态的变量名（后缀白名单）；BASE_URL 等普通名称交给值侧规则，
+# 避免“抹名不抹值”式过度脱敏。
+_ENVIRONMENT_VARIABLE = re.compile(
+    r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_(?:KEY|TOKEN|SECRET|PASSWORD)\b"
+)
 _SECRET_ARGUMENT_FLAGS = {"--oauth"}
 
 
@@ -187,6 +194,8 @@ class TaskSession:
                         self._output.put_nowait(clean)
                     except queue.Full:
                         pass
+                # 读取线程与 UI 线程并发 +=；最坏情况是并发窗口内丢失一次
+                # 计数（界面少提示一行“已省略 N 行”），可接受且无需加锁。
                 self.dropped_output += 1
         self.process.stdout.close()
 

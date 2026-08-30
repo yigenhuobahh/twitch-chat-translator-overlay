@@ -417,7 +417,7 @@ class TestTimingAndLeadIn:
 
         source_duration = float(summary["duration"])
         # Correct policy: expected == render/source length
-        expected = burn.expected_compose_duration(source_duration, video_lead_in=1.0)
+        expected = burn.expected_compose_duration(source_duration)
         assert expected == pytest.approx(source_duration)
         ok, _, reason = burn.validate_rendered_output(
             str(src), expected_duration=expected, require_audio=True

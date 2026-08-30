@@ -800,16 +800,28 @@ def load_dotenv_if_present() -> None:
         return
 
     candidates: list[Path] = []
+    cwd_env: Path | None = None
     try:
-        candidates.append(Path.cwd() / ".env")
+        cwd_env = Path.cwd() / ".env"
+        candidates.append(cwd_env)
     except Exception:
         pass
+    # .env files that belong to this install/source layout are expected; a
+    # cwd .env resolving anywhere else is surprising and worth announcing.
+    trusted_envs: set[Path] = set()
     try:
         module_path = Path(__file__).resolve()
         # Source layout: <repo>/scripts/common_utils.py -> <repo>/.env
-        candidates.append(module_path.parents[1] / ".env")
+        repo_env = module_path.parents[1] / ".env"
+        candidates.append(repo_env)
         # Wheel/editable flat module layout fallback: next to installed module
-        candidates.append(module_path.parent / ".env")
+        install_env = module_path.parent / ".env"
+        candidates.append(install_env)
+        for trusted in (repo_env, install_env):
+            try:
+                trusted_envs.add(trusted.resolve())
+            except OSError:
+                trusted_envs.add(trusted)
     except Exception:
         pass
 
@@ -832,7 +844,25 @@ def load_dotenv_if_present() -> None:
                     continue
                 key, val = line.split("=", 1)
                 key = key.strip()
-                val = val.strip().strip('"').strip("'")
+                # Shell-style "export KEY=VALUE" lines are common in copied
+                # snippets; the prefix is not part of the variable name.
+                if key.startswith("export ") or key.startswith("export\t"):
+                    key = key[len("export") + 1 :].strip()
+                val = val.strip()
+                if val[:1] in ("\"", "'"):
+                    # Quoted value: a '#' inside the quotes is literal content
+                    # ("PASSWORD='a#b'"), and anything after the closing quote
+                    # (e.g. an inline comment) is dropped.
+                    end_quote = val.find(val[0], 1)
+                    val = val[1:end_quote] if end_quote != -1 else val[1:]
+                else:
+                    # Unquoted value: an inline comment starts at the first
+                    # whitespace-preceded '#'. A '#' glued to the value
+                    # ("COLOR=#FF0000") stays literal.
+                    comment = re.search(r"\s#", val)
+                    if comment:
+                        val = val[: comment.start()]
+                    val = val.strip()
                 if key in _DOTENV_ALLOWED_KEYS:
                     parsed[key] = val
         except OSError:
@@ -840,5 +870,11 @@ def load_dotenv_if_present() -> None:
         for key, val in parsed.items():
             os.environ[key] = val
             _DOTENV_LOADED_KEYS.add(key)
+        if (
+            env_path is cwd_env
+            and parsed
+            and resolved not in trusted_envs
+        ):
+            print(f"已从当前目录加载 .env: {env_path}", flush=True)
         # Only load the first existing .env.
         return

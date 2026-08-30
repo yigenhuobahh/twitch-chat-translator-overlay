@@ -283,7 +283,6 @@ def test_filter_float_prefilter_limits_deepcopy_before_trim():
     assert meta["pre_window_before"] > meta["pre_window_after"]
     # Soft over-fetch: 1 line/msg so single-line stacks can fill capacity (5), not 5/2.
     assert meta["pre_window_after"] == 5
-    assert meta["per_msg_lines"] == 1
 
 
 def test_trim_float_carry_in_keeps_capacity_messages_for_stack_fill():

@@ -42,9 +42,10 @@ def _make_start_offset_video(out_path: Path, content_s: float = 3.0, lead_in: fl
 
 def test_expected_compose_duration_ignores_lead_in_padding():
     burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
-    assert burn.expected_compose_duration(374.03, 1.0) == pytest.approx(374.03)
-    assert burn.expected_compose_duration(15.0, 0.0) == pytest.approx(15.0)
-    assert burn.expected_compose_duration(10.0, 2.5) == pytest.approx(10.0)
+    # video_lead_in parameter was removed (never read); duration passes through.
+    assert burn.expected_compose_duration(374.03) == pytest.approx(374.03)
+    assert burn.expected_compose_duration(15.0) == pytest.approx(15.0)
+    assert burn.expected_compose_duration(10.0) == pytest.approx(10.0)
 
 
 def test_validate_accepts_source_length_when_expected_is_source_not_source_plus_leadin(
@@ -103,7 +104,7 @@ def test_compose_math_matches_fontinalia_case():
     source_duration = 374.033667
     video_lead_in = 1.0
     # render_duration from probe_video_duration ≈ format duration
-    expected = burn.expected_compose_duration(source_duration, video_lead_in)
+    expected = burn.expected_compose_duration(source_duration)
     assert expected == pytest.approx(374.033667)
     # actual partial was ~374.067 — must pass with default 0.35 tolerance
     # simulate by checking the comparison logic via a real short file is enough;

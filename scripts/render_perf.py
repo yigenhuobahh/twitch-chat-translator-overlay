@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Frame-sequence performance helpers: static reuse, blank-gap skipping, stage timing."""
+"""Frame-sequence performance helpers: static reuse, blank-gap skipping, disk headroom."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import shutil
-import time
 
 MIN_RENDER_DISK_RESERVE_BYTES = 512 * 1024 * 1024
 
@@ -32,41 +29,6 @@ def ensure_render_disk_headroom(
             f"{reserve / (1024 * 1024):.0f} MiB reserve required)"
         )
     return free_bytes
-
-
-@dataclass
-class StageTimer:
-    """Collect named stage durations for run_meta / console summary."""
-
-    stages: dict[str, float] = field(default_factory=dict)
-    _starts: dict[str, float] = field(default_factory=dict)
-
-    def start(self, name: str) -> None:
-        self._starts[name] = time.perf_counter()
-
-    def stop(self, name: str) -> float:
-        begin = self._starts.pop(name, None)
-        if begin is None:
-            return 0.0
-        elapsed = time.perf_counter() - begin
-        self.stages[name] = self.stages.get(name, 0.0) + elapsed
-        return elapsed
-
-    def mark(self, name: str, seconds: float) -> None:
-        self.stages[name] = self.stages.get(name, 0.0) + float(seconds)
-
-    def summary_lines(self) -> list[str]:
-        if not self.stages:
-            return []
-        total = sum(self.stages.values()) or 1.0
-        lines = []
-        for name, sec in self.stages.items():
-            lines.append(f"  - {name}: {sec:.1f}s ({sec / total * 100:.0f}%)")
-        lines.append(f"  - total_tracked: {sum(self.stages.values()):.1f}s")
-        return lines
-
-    def to_dict(self) -> dict[str, float]:
-        return {k: round(v, 3) for k, v in self.stages.items()}
 
 
 def frame_path(frames_dir: str | Path, frame_index: int) -> Path:
@@ -116,11 +78,6 @@ def write_or_reuse_frame(
     return "write"
 
 
-def is_blank_visible(visible: Iterable) -> bool:
-    """True when no messages are visible (fully transparent frames)."""
-    return not list(visible)
-
-
 def blank_gap_frame_indexes(
     start_i: int,
     end_i: int,
@@ -134,9 +91,9 @@ def blank_gap_frame_indexes(
     if end_i <= start_i:
         return []
     stride = max(1, int(hold_stride))
+    # range(start_i, end_i, stride) is non-empty (end_i > start_i, stride >= 1)
+    # and always starts exactly at start_i, so no first-index fixup is needed.
     indexes = list(range(start_i, end_i, stride))
-    if not indexes or indexes[0] != start_i:
-        indexes.insert(0, start_i)
     # Ensure last covered frame before end exists when stride skips tail.
     last_needed = end_i - 1
     if indexes[-1] != last_needed:
@@ -257,19 +214,3 @@ def expand_frame_sequence_for_ffmpeg(
         context="expand_frame_sequence_for_ffmpeg",
     )
     return stats
-
-
-def estimate_disk_bytes(path: str | Path) -> int:
-    path = Path(path)
-    if not path.exists():
-        return 0
-    if path.is_file():
-        return path.stat().st_size
-    total = 0
-    for root, _dirs, files in os.walk(path):
-        for name in files:
-            try:
-                total += (Path(root) / name).stat().st_size
-            except OSError:
-                pass
-    return total

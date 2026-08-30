@@ -22,6 +22,7 @@ from tui_models import (
     MODE_TRANSLATED_PREVIEW,
     TuiDownloadDraft,
     TuiJobDraft,
+    sanitize_download_source_for_history,
 )
 from tui_task import TaskSession, format_event, redact_command, redact_text, sanitize_diagnostic_file
 
@@ -212,14 +213,46 @@ def test_event_format_and_redaction_are_safe():
         "--oauth secret-value",
         "--oauth=secret-value",
         "OPENAI_COMPAT_API_KEY is missing",
-        "AGNES_BASE_URL is missing",
+        "MY_TOKEN=secret-value",
+        "AUTHORIZATION=secret-value",
     ):
         redacted = redact_text(value)
         assert "secret-value" not in redacted
         if "secret-value" in value:
             assert "[redacted]" in redacted
         assert "OPENAI_COMPAT_API_KEY" not in redacted
-        assert "AGNES_BASE_URL" not in redacted
+
+    # 单段 userinfo（只有用户名没有密码）也必须剥掉。
+    bare_userinfo = redact_text("request to https://token@host.example/v1 failed")
+    assert "[redacted]@" in bare_userinfo
+    assert "token@" not in bare_userinfo
+
+    # 密钥后缀白名单之外的普通环境变量名不再被整体脱敏；
+    # 但只要值里带 Base URL，值本身必须被 _BASE_URL_VALUE 规则剥掉。
+    bare_name = redact_text("AGNES_BASE_URL is missing")
+    assert "AGNES_BASE_URL" in bare_name
+    with_value = redact_text("AGNES_BASE_URL=https://alice:url-password@example.invalid/v1")
+    assert "AGNES_BASE_URL" in with_value
+    assert "url-password" not in with_value and "alice" not in with_value
+
+
+def test_sanitize_download_source_strips_url_credentials():
+    malicious = sanitize_download_source_for_history("https://user:secret@evil.example.com/p?x=1#f")
+    assert malicious == "https://evil.example.com/p"
+    single_part = sanitize_download_source_for_history("https://token@evil.example.com/p")
+    assert single_part == "https://evil.example.com/p"
+    # 普通 Twitch URL 仍归一化为稳定公开 ID，查询串凭据不落盘。
+    assert (
+        sanitize_download_source_for_history("https://www.twitch.tv/videos/2819850140?oauth=secret-token")
+        == "2819850140"
+    )
+    # 非 URL 文本保持不变。
+    assert sanitize_download_source_for_history("2819850140") == "2819850140"
+
+
+def test_imported_source_media_check_is_normalized():
+    assert TuiJobDraft.from_fields({"source_media_check": "  FAST "}).source_media_check == "fast"
+    assert TuiJobDraft.from_fields({}).source_media_check == "decode"
 
 
 def test_output_cannot_replace_source_video(tmp_path: Path):
@@ -590,6 +623,26 @@ def test_textual_media_check_selects_round_trip_from_drafts():
             assert app.query_one("#download-media-check", Select).value == "fast"
             app.query_one("#source-media-check", Select).value = "off"
             assert app._draft().source_media_check == "off"
+
+    import asyncio
+
+    asyncio.run(exercise())
+
+
+def test_textual_set_select_falls_back_to_default_for_unknown_value():
+    """Unknown option values must fall back to the default instead of crashing."""
+    pytest.importorskip("textual")
+    from textual.widgets import Select
+
+    from tui_run import OverlayTui
+
+    async def exercise() -> None:
+        app = OverlayTui()
+        async with app.run_test(size=(140, 45)):
+            app._set_select("#source-media-check", "not-a-real-check")
+            assert app.query_one("#source-media-check", Select).value == "decode"
+            app._set_select("#source-media-check", "fast")
+            assert app.query_one("#source-media-check", Select).value == "fast"
 
     import asyncio
 

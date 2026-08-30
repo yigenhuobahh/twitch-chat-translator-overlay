@@ -15,16 +15,54 @@ import uuid
 
 from run_meta import pid_is_alive
 from task_results import read_task_result
-from tui_models import TuiDownloadDraft, TuiJobDraft, sanitize_download_source_for_history
+from tui_models import (
+    TuiDownloadDraft,
+    TuiJobDraft,
+    _is_sensitive_field,
+    sanitize_download_source_for_history,
+)
+from tui_task import redact_text
 
 HISTORY_SCHEMA_VERSION = 1
 DEFAULT_HISTORY_LIMIT = 100
-_SENSITIVE_KEY_PARTS = ("apikey", "token", "password", "authorization", "secret", "oauth")
+# Lock acquisition is non-blocking with a bounded retry window so a wedged
+# TUI instance cannot freeze this instance's UI thread forever.
+LOCK_TIMEOUT_S = 5.0
+LOCK_RETRY_INTERVAL_S = 0.05
+
+# Sensitive-key filtering shares one vocabulary with tui_models.
+_is_sensitive_key = _is_sensitive_field
 
 
-def _is_sensitive_key(key: object) -> bool:
-    normalized = "".join(character for character in str(key).lower() if character.isalnum())
-    return any(part in normalized for part in _SENSITIVE_KEY_PARTS)
+def _try_lock_history(handle) -> bool:
+    """Attempt a non-blocking exclusive lock; return False when contended."""
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+    import fcntl
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
+def _unlock_history(handle) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def default_history_path(root: str | Path | None = None) -> Path:
@@ -43,7 +81,10 @@ def _safe_value(value: Any, *, field_name: str | None = None) -> Any:
         return [_safe_value(item, field_name=field_name) for item in value]
     if field_name == "download" and isinstance(value, str):
         return sanitize_download_source_for_history(value)
-    if isinstance(value, (str, int, float, bool)) or value is None:
+    if isinstance(value, str):
+        # 自由文本字段同样过一遍 UI 日志脱敏规则，凭据形态的字符串不能落盘。
+        return redact_text(value)
+    if isinstance(value, (int, float, bool)) or value is None:
         return value
     return str(value)
 
@@ -60,32 +101,36 @@ class TuiHistoryStore:
         """Serialize read-modify-write history updates across TUI processes."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        # 参照 process_util.exclusive_file_lock：锁文件被符号链接替换时拒绝跟随。
+        if lock_path.is_symlink():
+            raise OSError(f"任务历史锁文件不能是符号链接: {lock_path}")
         with lock_path.open("a+b") as handle:
             handle.seek(0, os.SEEK_END)
             if handle.tell() == 0:
                 handle.write(b"0")
                 handle.flush()
             handle.seek(0)
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            opened = os.fstat(handle.fileno())
+            on_disk = lock_path.lstat()
+            if (opened.st_dev, opened.st_ino) != (on_disk.st_dev, on_disk.st_ino):
+                raise OSError(f"任务历史锁文件在打开后被替换: {lock_path}")
+            locked = False
             try:
+                deadline = time.monotonic() + LOCK_TIMEOUT_S
+                while not _try_lock_history(handle):
+                    if time.monotonic() >= deadline:
+                        raise OSError(
+                            f"任务历史被其他实例长期占用（等待约 {LOCK_TIMEOUT_S:.0f} 秒）: {lock_path}"
+                        )
+                    time.sleep(LOCK_RETRY_INTERVAL_S)
+                locked = True
                 yield
             finally:
-                if os.name == "nt":
-                    import msvcrt
-
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                if locked:
+                    try:
+                        _unlock_history(handle)
+                    except OSError:
+                        pass
 
     def _load(self) -> list[dict[str, Any]]:
         try:

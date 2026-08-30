@@ -61,6 +61,28 @@ def test_build_video_and_chat_cmds_include_embed():
     assert "-b" not in clip
 
 
+def test_slot_values_reject_option_like_tokens(tmp_path: Path):
+    """Slot values starting with '-' would be parsed as options by the .NET CLI."""
+    from twitch_download import TwitchDownloadError, build_chat_cmd, build_video_cmd
+
+    cli = Path("TwitchDownloaderCLI.exe")
+    out = tmp_path / "v.mp4"
+    with pytest.raises(TwitchDownloadError, match="画质"):
+        build_video_cmd(cli, kind="vod", source_id="123", output=out, quality="-q:evil")
+    with pytest.raises(TwitchDownloadError, match="开始时间"):
+        build_video_cmd(cli, kind="vod", source_id="123", output=out, begin="-b:evil")
+    with pytest.raises(TwitchDownloadError, match="结束时间"):
+        build_video_cmd(cli, kind="vod", source_id="123", output=out, end="-e:evil")
+    with pytest.raises(TwitchDownloadError, match="OAuth"):
+        build_video_cmd(cli, kind="vod", source_id="123", output=out, oauth="-o:evil")
+    with pytest.raises(TwitchDownloadError, match="ID"):
+        build_video_cmd(cli, kind="vod", source_id="-o:evil", output=out)
+    with pytest.raises(TwitchDownloadError, match="ID"):
+        build_chat_cmd(cli, source_id="-o:evil", output=tmp_path / "c.html")
+    with pytest.raises(TwitchDownloadError, match="开始时间"):
+        build_chat_cmd(cli, source_id="123", output=tmp_path / "c.html", begin="-b:evil")
+
+
 def test_parse_td_time_and_segment_line_smoke():
     from twitch_download import format_td_t_seconds, parse_segment_line, parse_td_time
 

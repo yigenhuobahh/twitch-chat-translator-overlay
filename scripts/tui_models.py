@@ -63,6 +63,49 @@ MODES = (
     *CORE_MODES,
     *LEGACY_MODES,
 )
+
+# Canonical job-field projection per task mode.  This is the single source of
+# truth for to_job_fields so the mode→flags mapping cannot drift between the
+# YAML projection and the translation requirement below.
+_MODE_JOB_FIELDS: dict[str, dict[str, Any]] = {
+    MODE_QUICK_PREVIEW_ORIGINAL: {"mode": "preview", "render_original": True},
+    MODE_QUICK_PREVIEW_TRANSLATED: {"mode": "preview"},
+    MODE_FULL_PRODUCTION: {"mode": "full"},
+    MODE_ORIGINAL_PRODUCTION: {"mode": "render", "render_original": True},
+    MODE_STEP_EXPORT_MANUAL: {"mode": "translate", "manual_translation": True},
+    MODE_STEP_API_AND_REVIEW: {"mode": "full", "review": True},
+    MODE_STEP_RESUME_RENDER: {"mode": "render", "reuse_translation": True},
+    MODE_ORIGINAL_PREVIEW: {"mode": "preview", "render_original": True},
+    MODE_TRANSLATED_PREVIEW: {"mode": "preview"},
+    MODE_FULL_RENDER: {"mode": "full"},
+    MODE_REUSE_RENDER: {"mode": "render", "reuse_translation": True},
+    MODE_TRANSLATE_ONLY: {"mode": "translate"},
+    MODE_RENDER_ONLY: {"mode": "render"},
+    MODE_AUTO: {"mode": "auto"},
+    MODE_RENDER_ORIGINAL: {"mode": "render", "render_original": True},
+}
+_MODE_JOB_FIELDS_DEFAULT = {"mode": "full"}
+
+# Preview modes additionally carry the requested preview window.
+_PREVIEW_MODES = frozenset({
+    MODE_QUICK_PREVIEW_ORIGINAL,
+    MODE_QUICK_PREVIEW_TRANSLATED,
+    MODE_ORIGINAL_PREVIEW,
+    MODE_TRANSLATED_PREVIEW,
+})
+
+# Modes that call the translation API unless a manual/render/reuse override
+# short-circuits it first (see TuiJobDraft.requires_translation).
+_TRANSLATION_REQUIRED_MODES = frozenset({
+    MODE_QUICK_PREVIEW_TRANSLATED,
+    MODE_TRANSLATED_PREVIEW,
+    MODE_FULL_PRODUCTION,
+    MODE_FULL_RENDER,
+    MODE_STEP_API_AND_REVIEW,
+    MODE_TRANSLATE_ONLY,
+    MODE_AUTO,
+})
+
 _FORM_FIELDS = {
     "video", "chat_html", "output", "translation_json", "mode", "render_original", "reuse_translation",
     "target_language", "layout_preset", "render_preset", "preview_clip", "profile", "rules", "encoder",
@@ -96,7 +139,10 @@ def sanitize_download_source_for_history(value: object) -> str:
         pass
     parsed = urlsplit(source)
     if parsed.scheme and parsed.netloc:
-        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+        # Strip userinfo (user:pass@) before persisting; the credential part of
+        # a host is never needed to re-run a download and must not survive.
+        host = parsed.netloc.rsplit("@", 1)[-1]
+        return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
     return source.split("#", 1)[0]
 
 
@@ -206,7 +252,7 @@ class TuiJobDraft:
             encoder=text("encoder"),
             crf=text("crf"),
             workers=text("workers"),
-            source_media_check=text("source_media_check", "decode"),
+            source_media_check=text("source_media_check", "decode").strip().lower() or "decode",
             keep_temp=bool(fields.get("keep_temp", False)),
             review=bool(fields.get("review", False)),
             manual_translation=bool(fields.get("manual_translation", False)),
@@ -241,28 +287,9 @@ class TuiJobDraft:
             "review": self.review,
             "manual_translation": self.manual_translation,
         })
-        if self.mode in (MODE_QUICK_PREVIEW_ORIGINAL, MODE_ORIGINAL_PREVIEW):
-            fields.update(mode="preview", render_original=True, preview_clip=self.preview_clip)
-        elif self.mode in (MODE_QUICK_PREVIEW_TRANSLATED, MODE_TRANSLATED_PREVIEW):
-            fields.update(mode="preview", preview_clip=self.preview_clip)
-        elif self.mode in (MODE_FULL_PRODUCTION, MODE_FULL_RENDER):
-            fields.update(mode="full")
-        elif self.mode in (MODE_ORIGINAL_PRODUCTION, MODE_RENDER_ORIGINAL):
-            fields.update(mode="render", render_original=True)
-        elif self.mode == MODE_STEP_EXPORT_MANUAL:
-            fields.update(mode="translate", manual_translation=True)
-        elif self.mode == MODE_STEP_API_AND_REVIEW:
-            fields.update(mode="full", review=True)
-        elif self.mode in (MODE_STEP_RESUME_RENDER, MODE_REUSE_RENDER):
-            fields.update(mode="render", reuse_translation=True)
-        elif self.mode == MODE_TRANSLATE_ONLY:
-            fields.update(mode="translate")
-        elif self.mode == MODE_RENDER_ONLY:
-            fields.update(mode="render")
-        elif self.mode == MODE_AUTO:
-            fields.update(mode="auto")
-        else:
-            fields.update(mode="full")
+        fields.update(dict(_MODE_JOB_FIELDS.get(self.mode, _MODE_JOB_FIELDS_DEFAULT)))
+        if self.mode in _PREVIEW_MODES:
+            fields["preview_clip"] = self.preview_clip
         if self.render_original:
             fields["render_original"] = True
         if self.reuse_translation:
@@ -283,26 +310,7 @@ class TuiJobDraft:
     def requires_translation(self) -> bool:
         if self.manual_translation or self.render_original or self.reuse_translation:
             return False
-        if self.mode in (
-            MODE_QUICK_PREVIEW_ORIGINAL,
-            MODE_ORIGINAL_PREVIEW,
-            MODE_ORIGINAL_PRODUCTION,
-            MODE_RENDER_ORIGINAL,
-            MODE_RENDER_ONLY,
-            MODE_REUSE_RENDER,
-            MODE_STEP_RESUME_RENDER,
-            MODE_STEP_EXPORT_MANUAL,
-        ):
-            return False
-        return self.mode in (
-            MODE_QUICK_PREVIEW_TRANSLATED,
-            MODE_TRANSLATED_PREVIEW,
-            MODE_FULL_PRODUCTION,
-            MODE_FULL_RENDER,
-            MODE_STEP_API_AND_REVIEW,
-            MODE_TRANSLATE_ONLY,
-            MODE_AUTO,
-        )
+        return self.mode in _TRANSLATION_REQUIRED_MODES
 
     def validate(self, *, check_api: bool = True, check_environment: bool = True) -> list[str]:
         """Return user-facing validation errors without changing files."""

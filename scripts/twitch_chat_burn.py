@@ -23,6 +23,7 @@ Twitch Chat Overlay Tool
 
 import argparse
 import bisect
+from collections import Counter, OrderedDict
 import json
 import math
 import os
@@ -40,6 +41,11 @@ _MAX_EMOTE_ANIMATION_FRAMES = 300
 _MAX_EMOTE_SOURCE_PIXELS = 4_000_000
 _MAX_EMOTE_DECODED_BYTES_PER_ASSET = 32 * 1024 * 1024
 _MAX_EMOTE_DECODED_BYTES_TOTAL = 256 * 1024 * 1024
+
+# Chat fade envelope (seconds): message alpha ramps in over FADE_IN_SECONDS from
+# its first visible frame and out over FADE_OUT_SECONDS before it leaves.
+FADE_IN_SECONDS = 0.3
+FADE_OUT_SECONDS = 0.5
 
 
 def emote_decode_plan(
@@ -135,7 +141,6 @@ from process_util import (
     run_tracked,
 )
 from render_perf import (
-    assert_contiguous_frame_sequence,
     blank_gap_frame_indexes,
     ensure_render_disk_headroom,
     expand_frame_sequence_for_ffmpeg,
@@ -158,13 +163,15 @@ resolve_message_image_cache_policy = _overlay_scene.resolve_message_image_cache_
 # ============================================================
 
 def is_cjk_char(ch):
-    """判断字符是否为 CJK 字符（中文/日文/韩文）"""
+    """判断字符是否为 CJK 字符（中文/日文假名/韩文谚文）"""
     cp = ord(ch)
     if (0x4E00 <= cp <= 0x9FFF or      # CJK Unified Ideographs
         0x3400 <= cp <= 0x4DBF or      # CJK Extension A
         0x20000 <= cp <= 0x2A6DF or    # CJK Extension B
         0xFF00 <= cp <= 0xFFEF or      # Fullwidth Forms
-        0x3000 <= cp <= 0x303F):       # CJK Symbols & Punctuation
+        0x3000 <= cp <= 0x303F or      # CJK Symbols & Punctuation
+        0x3040 <= cp <= 0x30FF or      # Hiragana + Katakana (日文假名)
+        0xAC00 <= cp <= 0xD7AF):       # Hangul Syllables (韩文谚文)
         return True
     return False
 
@@ -858,6 +865,7 @@ def schedule_messages(
         return True
 
     dropped_past_duration = 0
+    dropped_min_visible = 0
     for i, m in enumerate(messages):
         source_t = float(m.get("timestamp", 0) or 0)
         # Rate limiting delays on-screen start; lifetime is measured from admit
@@ -919,6 +927,9 @@ def schedule_messages(
                     best_max_end = max_end
                     best_lane = lane
             if not _evict_overlapping(best_lane, nl, t):
+                # min_visible protection refused to evict in-progress messages;
+                # the new arrival is dropped. Count it instead of failing silently.
+                dropped_min_visible += 1
                 continue
             schedule_idx = len(msg_schedule)
             msg_schedule.append((t, end, best_lane, i, nl))
@@ -932,6 +943,12 @@ def schedule_messages(
         print(
             f"  [WARN] lanes 调度: {dropped_past_duration} 条因 arrival_interval 延后超出 "
             f"时长 {float(duration):.2f}s 未上屏",
+            flush=True,
+        )
+    if dropped_min_visible:
+        print(
+            f"  [WARN] lanes 调度: {dropped_min_visible} 条因场上消息未达 "
+            f"min_visible_seconds={min_visible:.2f}s 不可顶替、且无空闲 lane 被丢弃",
             flush=True,
         )
     return msg_schedule
@@ -1270,6 +1287,7 @@ def apply_imported_translations(chat_data, trans_data, strict=False):
     replaced = 0
     stripped_placeholders = 0
     mismatch_count = 0
+    dropped_empty_translations = 0
     for i, m in enumerate(messages):
         item = trans_map.get(i)
         if not item:
@@ -1351,6 +1369,11 @@ def apply_imported_translations(chat_data, trans_data, strict=False):
             # Pure-emote after placeholder strip: keep image fragments only.
             m["fragments"] = list(emote_frags)
             replaced += 1
+        elif not translation and not emote_frags:
+            # Cleaned translation ended up empty with no emote to keep. Skip the
+            # row (original fragments stay) instead of writing a {"text": ""}
+            # fragment that layout must filter out again.
+            dropped_empty_translations += 1
         elif not emote_frags:
             # Text-only: single translated text fragment (merge multi-text).
             m["fragments"] = [{"type": "text", "text": translation}]
@@ -1378,6 +1401,10 @@ def apply_imported_translations(chat_data, trans_data, strict=False):
                 f"严格导入失败: {mismatch_count} 条翻译与 HTML 身份不一致"
                 f"（作者/时间戳/原文），已拒绝错贴译文"
             )
+    if dropped_empty_translations:
+        warnings.append(
+            f"{dropped_empty_translations} 条译文清洗后为空且无 emote，已跳过该行（保留原消息碎片）"
+        )
 
     return replaced, stripped_placeholders, warnings
 
@@ -1494,38 +1521,8 @@ def render_overlay(chat_data, out_dir, video_path, config):
     gap = MESSAGE_GAP
     indent = MESSAGE_INDENT
 
-    # --- 预计算每条消息的行数（用于 lane 分配）---
-    MAX_W = config.width - 4
-    def text_width(s):
-        bb = font.getbbox(s)
-        return bb[2] - bb[0]
-
-    max_message_lines = max(0, int(getattr(config, "max_message_lines", 0) or 0))
-
-    def calc_msg_lines(msg):
-        """计算消息需要多少行（与 render_message 共用 layout_message_lines）。"""
-        _lines, _header, num_lines = layout_message_lines(
-            msg,
-            max_w=MAX_W,
-            font=font,
-            font_bold=font_bold,
-            text_width_fn=text_width,
-            emote_width_fn=emote_width,
-            emote_available_fn=lambda cls: cls in emote_imgs,
-            max_message_lines=max_message_lines,
-            truncate_with_ellipsis=False,
-            padding=padding,
-            badge_size=badge_size,
-            gap=gap,
-            indent=indent,
-        )
-        return num_lines
-
-    msg_line_count = {}
-    for i, m in enumerate(messages):
-        msg_line_count[i] = calc_msg_lines(m)
-
-    # Build the immutable scene budget before scheduling or generating frames.
+    # Build the immutable scene budget before the line-count prepass, scheduling,
+    # or generating frames (its duration drives the prepass skip below).
     scene = OverlayScenePlan.from_config(
         source_duration=probe_video_duration(video_path),
         config=config,
@@ -1563,6 +1560,41 @@ def render_overlay(chat_data, out_dir, video_path, config):
         else:
             print(f"  预览短片模式: 仅渲染前 {duration:.1f}s", flush=True)
 
+    # --- 预计算每条消息的行数（用于 lane 分配）---
+    MAX_W = config.width - 4
+    def text_width(s):
+        bb = font.getbbox(s)
+        return bb[2] - bb[0]
+
+    max_message_lines = max(0, int(getattr(config, "max_message_lines", 0) or 0))
+
+    def calc_msg_lines(msg):
+        """计算消息需要多少行（与 render_message 共用 layout_message_lines）。"""
+        _lines, _header, num_lines = layout_message_lines(
+            msg,
+            max_w=MAX_W,
+            font=font,
+            font_bold=font_bold,
+            text_width_fn=text_width,
+            emote_width_fn=emote_width,
+            emote_available_fn=lambda cls: cls in emote_imgs,
+            max_message_lines=max_message_lines,
+            truncate_with_ellipsis=False,
+            padding=padding,
+            badge_size=badge_size,
+            gap=gap,
+            indent=indent,
+        )
+        return num_lines
+
+    msg_line_count = {}
+    for i, m in enumerate(messages):
+        # Messages starting at/after the render duration are always dropped by
+        # the scheduler (t >= duration); skip their layout measurement entirely.
+        if float(m.get("timestamp", 0) or 0) >= duration:
+            continue
+        msg_line_count[i] = calc_msg_lines(m)
+
     if stack_mode == "float":
         msg_schedule = schedule_messages_float(
             messages,
@@ -1584,7 +1616,6 @@ def render_overlay(chat_data, out_dir, video_path, config):
             auto_capacity=auto_capacity,
         )
 
-    from collections import Counter
     if stack_mode == "float":
         print(
             f"  调度(float上浮): {len(msg_schedule)} 条事件, capacity={MAX_VISIBLE} 行",
@@ -1686,8 +1717,6 @@ def render_overlay(chat_data, out_dir, video_path, config):
     # Message bitmap cache:
     # - default: pre-render all static message images (predictable, existing behavior)
     # - --lazy-message-images: only render when a message becomes visible; LRU cap for long VODs
-    from collections import OrderedDict
-
     lazy_images = scene.lazy_message_images
     cache_cap = scene.message_image_cache_size
     auto_lazy = scene.auto_lazy_message_images
@@ -1808,16 +1837,15 @@ def render_overlay(chat_data, out_dir, video_path, config):
         # Static segment key: same visible message set, none animated, and no fade edges
         # inside this change-point range. Safe to draw once and hardlink the rest.
         # Blank segments are also static (fully transparent).
-        # IMPORTANT: fade-in (first 0.3s) / fade-out (last 0.5s) make alpha time-dependent.
+        # IMPORTANT: fade-in (first FADE_IN_SECONDS) / fade-out (last FADE_OUT_SECONDS)
+        # make alpha time-dependent.
         # Even with change_points at start/end, the *boundary segment that still contains*
         # the fade window must NOT be static-reused, or every hardlinked frame freezes
         # the first (or last) alpha sample.
-        FADE_IN = 0.3
-        FADE_OUT = 0.5
         segment_has_anim = any(idx in animated_message_ids for _lane, idx, _s, _e, _nl in visible)
         segment_has_fade = any(
-            (cp < (start + FADE_IN) and next_cp > start)
-            or (cp < end and next_cp > (end - FADE_OUT))
+            (cp < (start + FADE_IN_SECONDS) and next_cp > start)
+            or (cp < end and next_cp > (end - FADE_OUT_SECONDS))
             for _lane, idx, start, end, _nl in visible
         )
         static_key = None
@@ -1913,10 +1941,10 @@ def render_overlay(chat_data, out_dir, video_path, config):
                         age = current_t - start
                         remaining = end - current_t
                         alpha = 255
-                        if age < 0.3:
-                            alpha = int(255 * min(1.0, max(0.0, age / 0.3)))
-                        elif remaining < 0.5:
-                            alpha = int(255 * max(0.0, remaining / 0.5))
+                        if age < FADE_IN_SECONDS:
+                            alpha = int(255 * min(1.0, max(0.0, age / FADE_IN_SECONDS)))
+                        elif remaining < FADE_OUT_SECONDS:
+                            alpha = int(255 * max(0.0, remaining / FADE_OUT_SECONDS))
 
                         if alpha < 255:
                             msg_img = msg_img.copy()
@@ -1945,7 +1973,6 @@ def render_overlay(chat_data, out_dir, video_path, config):
         # 进度
         now = time.time()
         if (cp_idx + 1) % 10 == 0 or cp_idx == len(change_points) - 1 or now - last_progress_time >= 5:
-            pct = (frame_num / total_frames * 100) if total_frames > 0 else 100
             # Progress against timeline coverage, not sparse write count.
             covered = len(set(written_indexes))
             pct = (covered / total_frames * 100) if total_frames > 0 else 100
@@ -1971,12 +1998,8 @@ def render_overlay(chat_data, out_dir, video_path, config):
         stats["filled"] += int(fill_stats.get("filled", 0))
         stats["hardlink"] += int(fill_stats.get("hardlink", 0))
         stats["copy"] += int(fill_stats.get("copy", 0))
-        assert_contiguous_frame_sequence(
-            frames_dir,
-            total_frames,
-            start=0,
-            context="render_overlay",
-        )
+        # expand_frame_sequence_for_ffmpeg ends with its own contiguous-coverage
+        # hard guarantee; keep only the on-disk count cross-check before compose.
         final_count = len(
             [n for n in os.listdir(frames_dir) if n.startswith("frame_") and n.endswith(".png")]
         )
@@ -2184,14 +2207,15 @@ def resolve_source_av_timing(video_path, source_has_audio=None):
     }
 
 
-def expected_compose_duration(render_duration, video_lead_in=0.0):
+def expected_compose_duration(render_duration):
     """Target container duration for compose_video.
 
-    `video_lead_in` only rewrites timestamps so both streams start at 0 and the
+    Lead-in handling only rewrites timestamps so both streams start at 0 and the
     first video frame freezes for editors. It does **not** mean we must publish
     a file longer than the source container / render window. Using
     render_duration + lead_in here previously false-failed complete encodes
-    (~source length) as "too short".
+    (~source length) as "too short", so the never-read ``video_lead_in``
+    parameter was removed.
     """
     return max(0.0, float(render_duration or 0.0))
 
@@ -2394,7 +2418,7 @@ def compose_video(video_path, frames_dir, out_dir, config, duration):
     # Lead-in rewrites A/V start times (freeze first frame for editors).
     # Container duration target stays the render window (~source length),
     # not source+lead_in — otherwise validation false-fails complete encodes.
-    output_duration = expected_compose_duration(duration, video_lead_in)
+    output_duration = expected_compose_duration(duration)
     # Floor rejects truly truncated outputs (lost more than a small lead-in).
     min_output_duration = max(
         0.0,
@@ -2639,7 +2663,9 @@ def _validate_runtime_args(args) -> None:
     if not 0 <= args.bg_alpha <= 255:
         raise ValueError("--bg-alpha must be between 0 and 255")
 
-def main():
+def _main(status_sink=None):
+    """Full CLI pipeline. ``status_sink`` (dict) receives the resolved job out_dir
+    so the public main() wrapper can mark run_meta failed on unexpected crashes."""
     from env_bootstrap import prepend_tools_ffmpeg_to_path
 
     prepend_tools_ffmpeg_to_path()
@@ -2670,7 +2696,7 @@ def main():
         "--output-fps",
         type=float,
         default=None,
-        help="最终成片视频帧率（可用 29.97 / 30000/1001 等）；默认跟随源视频。不要与 --fps 混用：--fps 只控弹幕层",
+        help="最终成片视频帧率（只接受小数，如 29.97 / 59.94）；默认跟随源视频。不要与 --fps 混用：--fps 只控弹幕层",
     )
     parser.add_argument(
         "--max-visible",
@@ -2890,48 +2916,8 @@ def main():
         except (OSError, ValueError) as e:
             parser.error(str(e))
 
-    # Explicit range checks (fail early with clear messages).
-    try:
-        validate_positive_int("--fps", args.fps, minimum=1, maximum=240)
-        if args.output_fps is not None:
-            validate_positive_float("--output-fps", args.output_fps, minimum=1.0, maximum=240.0)
-        validate_positive_int("--w/--width", args.width, minimum=16, maximum=7680)
-        validate_positive_int("--h/--height", args.height, minimum=16, maximum=4320)
-        validate_positive_int("--font-size", args.font_size, minimum=8, maximum=128)
-        validate_positive_int("--emote-height", args.emote_height, minimum=8, maximum=256)
-        validate_positive_int("--max-visible", args.max_visible, minimum=0, maximum=100)
-        stack_mode_cli = str(getattr(args, "stack_mode", "lanes") or "lanes").strip().lower()
-        if stack_mode_cli not in ("float", "lanes"):
-            raise ValueError(f"--stack-mode must be float or lanes, got {args.stack_mode!r}")
-        args.stack_mode = stack_mode_cli
-        if stack_mode_cli == "lanes":
-            validate_positive_float("--msg-lifetime", args.msg_lifetime, minimum=0.1, maximum=600.0)
-        # float stack_mode: msg_lifetime is ignored (capacity-only eviction)
-        validate_positive_int("--max-message-lines", args.max_message_lines, minimum=0, maximum=100)
-        validate_non_negative_float("--min-visible-seconds", args.min_visible_seconds, maximum=600.0)
-        validate_non_negative_float("--arrival-interval", args.arrival_interval, maximum=600.0)
-        for ratio_arg in ("x_ratio", "y_ratio", "width_ratio", "height_ratio", "font_size_ratio"):
-            validate_non_negative_float(f"--{ratio_arg.replace('_', '-')}", getattr(args, ratio_arg), maximum=1.0)
-        if (
-            str(getattr(args, "stack_mode", "lanes")).lower() == "lanes"
-            and args.msg_lifetime > 0
-            and args.min_visible_seconds > args.msg_lifetime
-        ):
-            raise ValueError("--min-visible-seconds must be <= --msg-lifetime")
-        if args.preview_frame is not None:
-            validate_non_negative_float("--preview-frame", args.preview_frame, maximum=24 * 3600.0)
-        if args.preview_clip is not None:
-            validate_non_negative_float("--preview-clip", args.preview_clip, maximum=24 * 3600.0)
-            if float(args.preview_clip) <= 0:
-                raise ValueError("--preview-clip must be > 0")
-        if args.offset is not None:
-            # Offset may be negative (chat behind video) or large positive (VOD clip start).
-            _validate_offset(args.offset)
-        validate_non_negative_float("--blank-hold-seconds", args.blank_hold_seconds, maximum=30.0)
-        if args.blank_hold_seconds <= 0:
-            raise ValueError("--blank-hold-seconds must be > 0")
-    except ValueError as e:
-        parser.error(str(e))
+    # Note: explicit range checks run once via _validate_runtime_args AFTER both
+    # presets apply (see below) — CLI flags and preset overrides share one path.
 
     if getattr(args, "render_preset", None):
         try:
@@ -2987,9 +2973,6 @@ def main():
         )
     except ValueError as e:
         parser.error(str(e))
-
-    if not 0 <= args.bg_alpha <= 255:
-        parser.error("--bg-alpha 必须在 0 到 255 之间")
 
     video_path = os.path.abspath(args.video)
     html_path = os.path.abspath(args.chat_html)
@@ -3055,6 +3038,10 @@ def main():
         print(f"工作目录(job): {work_dir}", flush=True)
 
     out_dir = work_dir
+    if status_sink is not None:
+        # Publish the location before any rendering work so a later crash can
+        # still mark run_meta failed at the right job directory.
+        status_sink["out_dir"] = out_dir
 
     # Resolve "auto" fonts without inventing a platform-foreign path.
     try:
@@ -3481,12 +3468,23 @@ def main():
             return src_path
         base_name = os.path.basename(src_path)
         lock_path = os.path.join(out_base, f".{base_name}.publish.guard")
+        published = None
         try:
             with exclusive_file_lock(lock_path, timeout=30.0):
-                return _promote_to_out_base_locked(src_path)
+                published = _promote_to_out_base_locked(src_path)
         except OSError as exc:
             print(f"  警告: 等待输出发布锁失败 {lock_path}: {exc}", flush=True)
             return None
+        if published:
+            # Success: drop the guard file so out_base is not littered. Failure /
+            # exception paths keep it for post-mortem. Best-effort — a concurrent
+            # waiter still holding the lock open (notably on Windows) can block
+            # the unlink; that only leaves the file behind, never breaks publishing.
+            try:
+                os.remove(lock_path)
+            except OSError:
+                pass
+        return published
 
 
     if args.preview_frame is not None:
@@ -3627,6 +3625,32 @@ def main():
             f"{os.path.join(out_dir, 'ffmpeg-webm.log')}"
         )
         return 1
+
+
+def main():
+    """CLI entry point: run the pipeline, marking run_meta failed on crashes.
+
+    An unexpected exception (disk-full OSError, renderer bug, ...) previously
+    left run_meta stuck at status=running plus a bare traceback. The wrapper
+    records a failed status at the job directory first, then re-raises so the
+    caller still sees the real error and non-zero exit code.
+    """
+    status_sink: dict[str, str | None] = {"out_dir": None}
+    try:
+        return _main(status_sink=status_sink)
+    except Exception as exc:
+        out_dir = status_sink.get("out_dir")
+        if out_dir:
+            try:
+                mark_run_status(
+                    out_dir,
+                    "failed",
+                    stage="unexpected_error",
+                    note=f"{type(exc).__name__}: {exc}",
+                )
+            except OSError:
+                pass
+        raise
 
 
 if __name__ == "__main__":

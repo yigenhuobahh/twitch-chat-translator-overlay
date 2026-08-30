@@ -317,7 +317,11 @@ def build_translation_batches(
 
 
 def extract_json(text):
-    if "```" in text:
+    text = str(text or "").strip()
+    # Only treat a leading code fence as a fence wrapper. A "```" that merely
+    # appears later is often chatter + a bare JSON object, which the brace
+    # slice below handles more robustly.
+    if text.startswith("```"):
         first = text.find("```")
         last = text.rfind("```")
         if first != last:
@@ -328,7 +332,16 @@ def extract_json(text):
             if lines and lines[-1].strip() == "```":
                 lines = lines[:-1]
             text = "\n".join(lines)
-    return text.strip()
+        return text.strip()
+    # Unfenced output: models often prepend chatter ("Here is the JSON:")
+    # or append a remark after a bare JSON object. Slice from the first "{"
+    # to the last "}"; if that slice still is not JSON, json.loads fails and
+    # the existing BAD_JSON retry path takes over unchanged.
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace != -1 and last_brace > first_brace:
+        return text[first_brace : last_brace + 1]
+    return text
 
 
 # 空白只归后一个 token 消费:若像旧写法那样每个分支两侧都带 \s*,
@@ -406,6 +419,30 @@ def translate_batch(client, batch, batch_num, context, target_language, cache=No
             json_str = extract_json(result)
             parsed = json.loads(json_str)
             translations = parsed.get("translations", [])
+            # Some models emit indexes as JSON strings ("0" instead of 0).
+            # Coerce to int before any index comparison so a string/number
+            # mismatch cannot fail the whole batch. An index that cannot be
+            # coerced maps to no message at all: that row is dropped here and
+            # accounted as invalid below instead of retrying the whole batch.
+            coerced_translations = []
+            invalid_index_count = 0
+            for item in translations:
+                if not isinstance(item, dict):
+                    coerced_translations.append(item)
+                    continue
+                raw_index = item.get("index")
+                try:
+                    coerced_index = int(raw_index)
+                except (TypeError, ValueError):
+                    invalid_index_count += 1
+                    continue
+                if isinstance(raw_index, int):
+                    coerced_translations.append(item)
+                else:
+                    fixed_index = dict(item)
+                    fixed_index["index"] = coerced_index
+                    coerced_translations.append(fixed_index)
+            translations = coerced_translations
             expected_indexes = [msg["index"] for msg in need_model]
             expected_set = set(expected_indexes)
             returned_indexes = [item.get("index") for item in translations if isinstance(item, dict)]
@@ -415,15 +452,24 @@ def translate_batch(client, batch, batch_num, context, target_language, cache=No
                     f"duplicate indexes in model response: {returned_indexes}"
                 )
             returned_set = set(returned_indexes)
-            if translations and (not returned_set <= expected_set or len(translations) != len(need_model)):
+            # Dropped non-numeric-index rows still count toward the response
+            # size, so one garbage row is not misread as a missing translation.
+            # A response where every row was dropped stays a failed response
+            # and keeps the existing in-batch retry semantics.
+            returned_total = len(translations) + invalid_index_count
+            if (translations or invalid_index_count) and (
+                not returned_set <= expected_set
+                or returned_total != len(need_model)
+                or (invalid_index_count and not translations)
+            ):
                 # Some models return batch-local indexes (0..N-1) or omit one item.
                 # Only remap by order when indexes look batch-local 0..N-1 and counts match.
                 # Never zip-order remap when global indexes are present but shuffled/wrong.
                 print(f"  [批次 {batch_num}] 索引/数量不匹配，尝试修复", flush=True)
                 n = len(need_model)
                 batch_local = set(range(n))
-                is_batch_local = returned_set == batch_local and len(returned_indexes) == n
-                if is_batch_local and len(translations) == n:
+                is_batch_local = returned_set == batch_local and returned_total == n
+                if is_batch_local and returned_total == n:
                     remapped = []
                     # Prefer index-based local remap (item index i -> need_model[i]), not zip-order.
                     by_local = {
@@ -441,9 +487,15 @@ def translate_batch(client, batch, batch_num, context, target_language, cache=No
                         fixed["index"] = msg["index"]
                         remapped.append(fixed)
                     translations = remapped
-                elif len(translations) != n:
+                elif returned_total != n:
                     raise ValueError(
-                        f"translation count mismatch: got {len(translations)}, expected {n}"
+                        f"translation count mismatch: got {returned_total}, expected {n}"
+                    )
+                elif not translations:
+                    # Every returned row carried a non-numeric index; nothing
+                    # is usable, so treat the response as failed and retry.
+                    raise ValueError(
+                        f"all {invalid_index_count} returned indexes are non-numeric"
                     )
                 else:
                     # Global indexes present but not a subset / wrong set: do not scramble by zip.
@@ -453,7 +505,7 @@ def translate_batch(client, batch, batch_num, context, target_language, cache=No
                     )
 
             cleaned_translations = []
-            invalid_translations = 0
+            invalid_translations = invalid_index_count
             for item in translations:
                 if not isinstance(item, dict):
                     invalid_translations += 1
@@ -468,7 +520,7 @@ def translate_batch(client, batch, batch_num, context, target_language, cache=No
             if invalid_translations:
                 _count_error(TranslationErrorKind.BAD_JSON)
                 print(
-                    f"  [批次 {batch_num}] 忽略 {invalid_translations} 条清洗后为空的译文",
+                    f"  [批次 {batch_num}] 忽略 {invalid_translations} 条无效或清洗后为空的译文",
                     flush=True,
                 )
             translations = cleaned_translations
@@ -668,6 +720,11 @@ def main():
     progress_fps = progress.get("fingerprints") or {}
     progress_json_fps = progress.get("json_translation_fingerprints") or {}
     for k, v in (progress.get("translations") or {}).items():
+        if not isinstance(v, str):
+            # Corrupted or hand-edited progress: a non-string value (dict,
+            # list, number) must never be str()-ed into a bogus "translation"
+            # below. Skip it; the affected row is re-translated as missing.
+            continue
         try:
             progress_map[int(k)] = v
         except (TypeError, ValueError):
