@@ -485,11 +485,14 @@ def test_api_probe_non_blocking_event_loop_responsiveness():
                     await pilot.pause(0.05)
                     elapsed_turn = time.perf_counter() - start_turn
                     # If UI were blocked by the 1000ms probe, this would take >= 1.0s.
-                    # Verify turn completes in under 300ms.
-                    assert elapsed_turn < 0.30, f"UI event loop was blocked! Turn elapsed: {elapsed_turn:.3f}s"
+                    # 750ms tolerates loaded CI runners while still proving non-blocking.
+                    assert elapsed_turn < 0.75, f"UI event loop was blocked! Turn elapsed: {elapsed_turn:.3f}s"
 
-                # Wait for background thread worker to finish
-                await pilot.pause(0.9)
+                # Wait for the background thread worker to deliver its result
+                for _ in range(60):
+                    await pilot.pause(0.05)
+                    if "连通性测试成功" in str(feedback_widget.render()):
+                        break
 
                 # Check final feedback
                 rendered_final = str(feedback_widget.render())

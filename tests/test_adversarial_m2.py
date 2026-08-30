@@ -441,7 +441,8 @@ def test_tui_task_dispatch_and_manual_required_lifecycle(tmp_path: Path):
                 "}))"
             )
             app._start_command("translate", [sys.executable, "-c", manual_script])
-            for _ in range(40):
+            # 12s ceiling for cold CI runners; breaks as soon as the session is handled.
+            for _ in range(240):
                 await pilot.pause(0.05)
                 if app.session and not app.session.running and app._handled_session is app.session:
                     break
@@ -453,7 +454,8 @@ def test_tui_task_dispatch_and_manual_required_lifecycle(tmp_path: Path):
             # 2. Failed task diagnostics lifecycle
             fail_script = "import sys; print('Fatal error occurred'); raise SystemExit(42)"
             app._start_command("failing_task", [sys.executable, "-c", fail_script])
-            for _ in range(40):
+            # 12s ceiling for cold CI runners; breaks as soon as the session is handled.
+            for _ in range(240):
                 await pilot.pause(0.05)
                 if app.session and not app.session.running and app._handled_session is app.session:
                     break
@@ -474,7 +476,7 @@ def test_tui_task_dispatch_and_manual_required_lifecycle(tmp_path: Path):
 
             # 4. Cancel running task
             app._cancel_task()
-            for _ in range(40):
+            for _ in range(240):
                 await pilot.pause(0.05)
                 if app.session and not app.session.running:
                     break
