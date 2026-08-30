@@ -28,6 +28,8 @@ Notable changes to this project are documented in this file.
 - Prevented local history clearing while queued or running tasks still exist, including tasks owned by another TUI process.
 - Fixed `scripts/run_tests.py --help` crashing when formatting the coverage percentage.
 - Kept the scheduled CI lint gate green under ruff 0.16 by removing newly flagged unused imports, fixing import order, renaming ambiguous loop variables, and pinning ruff to `0.16.5` in dev requirements.
+- Prevented the TUI poll timer from crashing the app with a widget lookup error when a task finishes during shutdown or before a lazily mounted tab is ready; affected refreshes now skip the tick instead of raising.
+- Hardened timing-sensitive TUI tests against loaded CI runners by polling lazily mounted widgets and async form validation instead of using fixed pauses, and pinned textual in dev requirements.
 
 ## [0.2.4] - 2026-07-24
 
