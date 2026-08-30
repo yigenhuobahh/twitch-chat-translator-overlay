@@ -854,6 +854,14 @@ class OverlayTui(App[None]):
     def _poll_session(self) -> None:
         if not self.session:
             return
+        try:
+            self._poll_session_once()
+        except NoMatches:
+            # 应用关闭窗口期或懒挂载页未就绪时控件可能短暂缺失；各刷新点
+            # 已单独容错，这里是最后防线，等下个轮询周期自然恢复。
+            pass
+
+    def _poll_session_once(self) -> None:
         logs, events = self.session.poll()
         for line in events:
             self._log("[阶段] " + line)
@@ -1003,7 +1011,9 @@ class OverlayTui(App[None]):
         )
 
     def _set_history_clear_enabled(self, enabled: bool) -> None:
-        self.query_one("#history-clear", Button).disabled = not enabled
+        clear_button = self._query_optional("#history-clear", Button)
+        if clear_button is not None:
+            clear_button.disabled = not enabled
 
     def _has_unfinished_task(self) -> bool:
         """Keep history intact until a completed child has been recorded."""
