@@ -148,6 +148,27 @@ def env_loaded_from_dotenv(key: str) -> bool:
     """Whether this process variable was populated by load_dotenv_if_present."""
     return str(key) in _DOTENV_LOADED_KEYS
 
+
+def stdin_is_interactive() -> bool:
+    """True only when we can reasonably prompt the user (real TTY, not piped/devnull).
+
+    Windows and CI sometimes still report ``isatty`` on non-usable streams, so
+    also reject the null device by name.
+    """
+    try:
+        if sys.stdin is None or not sys.stdin.isatty():
+            return False
+    except Exception:
+        return False
+    try:
+        name = getattr(sys.stdin, "name", "") or ""
+        if name in ("nul", "NUL", "/dev/null"):
+            return False
+    except Exception:
+        pass
+    return True
+
+
 def format_cli_invocation(script: str) -> str:
     """Return a copy-pasteable source-script or installed-entry command."""
     cleaned = str(script or "scripts/render_cn_chat.py").strip().strip("'").strip('"')

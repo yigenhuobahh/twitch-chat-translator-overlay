@@ -18,6 +18,9 @@ from common_utils import (
     pick_preset_from_menu,
     safe_which,
 )
+from common_utils import (
+    stdin_is_interactive as _stdin_is_interactive,
+)
 from job_config import (
     default_jobs_dir,
     last_job_path,
@@ -78,23 +81,6 @@ def run_quick_start() -> int:
     print("\nNext: choose a purpose and layout. You can drag media onto run.bat later.")
     created = run_job_wizard()
     return 0 if created is None else _confirm_and_run_job(created)
-
-
-def _stdin_is_interactive() -> bool:
-    """True only when we can reasonably prompt the user (real TTY, not piped/devnull)."""
-    try:
-        if sys.stdin is None or not sys.stdin.isatty():
-            return False
-    except Exception:
-        return False
-    # Windows / CI sometimes still reports isatty on non-usable streams.
-    try:
-        name = getattr(sys.stdin, "name", "") or ""
-        if name in ("nul", "NUL", "/dev/null"):
-            return False
-    except Exception:
-        pass
-    return True
 
 
 def _prompt(msg: str, default: str | None = None) -> str:

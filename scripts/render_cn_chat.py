@@ -55,6 +55,9 @@ from common_utils import (
     safe_which,
     validate_positive_float,
 )
+from common_utils import (
+    stdin_is_interactive as _stdin_is_interactive,
+)
 from env_bootstrap import (
     maybe_prompt_offer_fixes,
     maybe_prompt_offer_td_cli,
@@ -161,22 +164,6 @@ def log(msg, level="info"):
         return
     if VERBOSE or level != "debug":
         print(msg, flush=True)
-
-
-def _stdin_is_interactive() -> bool:
-    """True when we can pause for the user (real TTY)."""
-    try:
-        if sys.stdin is None or not sys.stdin.isatty():
-            return False
-    except Exception:
-        return False
-    try:
-        name = getattr(sys.stdin, "name", "") or ""
-        if name in ("nul", "NUL", "/dev/null"):
-            return False
-    except Exception:
-        pass
-    return True
 
 
 def _render_preview_clip(

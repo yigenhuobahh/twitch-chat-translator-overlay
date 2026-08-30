@@ -12,6 +12,7 @@ Notable changes to this project are documented in this file.
 - Added a tested Windows direct-dependency constraint set that `install.bat` uses automatically while keeping cross-platform package requirements compatible.
 - Added a shared cut timeline so multi-segment video trimming and chat timestamp remapping use the same normalized ranges.
 - Added execution-scoped pipeline results and an immutable overlay-scene plan for safer task lifecycle handling and render planning.
+- Added overlay content-level smoke tests that assert rendered frames actually contain chat pixels, plus end-to-end translation pipeline tests covering concurrent workers with partial failures and a stub HTTP API subprocess.
 
 ### Changed
 
@@ -22,6 +23,8 @@ Notable changes to this project are documented in this file.
 - Upgraded layout presets, render presets, and video encoders in TUI from free-text inputs to structured `Select` dropdowns with built-in options.
 - Made VOD crop segments optional in the download tab, allowing full VOD downloads without mandatory cropping.
 - Centralized pipeline command projection and shared burn-flag forwarding so TUI and CLI adapters use one canonical parameter contract.
+- Consolidated the duplicate pytest configuration into `pyproject.toml` as the single source of truth and enabled `--strict-markers` so undeclared test markers fail collection.
+- Documented in the README (Chinese and English) and in the TUI download tab that the TwitchDownloaderCLI only accepts OAuth as a command-line argument, so the token is briefly visible in the local process list during downloads.
 
 ### Fixed
 
@@ -30,6 +33,15 @@ Notable changes to this project are documented in this file.
 - Kept the scheduled CI lint gate green under ruff 0.16 by removing newly flagged unused imports, fixing import order, renaming ambiguous loop variables, and pinning ruff to `0.16.5` in dev requirements.
 - Prevented the TUI poll timer from crashing the app with a widget lookup error when a task finishes during shutdown or before a lazily mounted tab is ready; affected refreshes now skip the tick instead of raising.
 - Hardened timing-sensitive TUI tests against loaded CI runners by polling lazily mounted widgets and async form validation instead of using fixed pauses, and pinned textual in dev requirements.
+- Fixed catastrophic regex backtracking in the emote-only message detectors that could hang translation and lint for hours on a single emote-spam line; the patterns now disambiguate whitespace so matching stays linear.
+- Fixed `--mode render` accepting `--review`/`--lint-translation` in a way that silently ran full LLM translation despite the mode's no-API promise; `--mode render --lint-translation <file>` is now an explicit lint-only path that actually checks the given file.
+- Made translation JSON rewrites (`normalize_translation`, XLSX/TSV review import) atomic so an interrupted process can no longer corrupt the only resume source; a manual pause now also records a `manual_required` end state instead of a false success.
+- Fixed preview windows combining `--preview-frame` with `--preview-clip` (or out-of-range frames) rendering an empty or time-mismatched overlay; the chat filter window now uses the same clamped preview time as the renderer and warns on adjustment.
+- Throttled translation progress persistence (fingerprints computed once, time/batch-based saving) so very large VODs no longer spend quadratic CPU and disk rewriting unchanged state every batch.
+- Hardened TUI task workers and history locking against shutdown races, blocked indefinite POSIX file-lock waits, drained superseded sessions cleanly, capped the in-memory log buffer, redacted additional URL credential and authorization header shapes, and stopped saving userinfo credentials from pasted URLs into history snapshots.
+- Preserved pre-video-start chat messages under large `--offset` values instead of clamping them to the first frame, counted silently dropped messages under `--min-visible-seconds`, and marked `run_meta` as failed when the renderer crashes outside its stage guards.
+- Hardened the pipeline against `--dry-run` side effects (real downloads, review exports, lint reports, last-job writes are now suppressed), bare media paths dropped onto job YAML, and duplicate lint passes when exporting both review table formats.
+- Extended CJK detection to kana, hangul, and Extension A ideographs so echo prefixes strip correctly for Japanese/Korean targets, and fixed parser edge cases for `background-color` attributes and HTML comments containing fake messages.
 
 ## [0.2.4] - 2026-07-24
 

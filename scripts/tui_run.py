@@ -206,6 +206,10 @@ class OverlayTui(App[None]):
                     with Horizontal(classes="field-row"):
                         yield Label("OAuth（可选，不会保存）", classes="field-label")
                         yield Input(placeholder="OAuth（订阅限定 VOD；仅本次下载使用）", password=True, id="download-oauth")
+                    yield Static(
+                        "提示：OAuth 不会落盘，但下载进行时会短暂出现在本机进程列表的命令行中（TwitchDownloaderCLI 限制）；公用电脑请知悉。",
+                        classes="hint",
+                    )
                     yield Button("下载并载入新任务", id="download-start", variant="primary")
             with TabPane("新任务", id="new-task"):
                 with VerticalScroll():
