@@ -121,3 +121,36 @@ def make_translation_for_export(export_data: dict, mapping: dict[str, str] | Non
         item["translation"] = translation
         out["messages"].append(item)
     return out
+
+
+async def wait_for_widget(app, pilot, selector: str, *, attempts: int = 120, interval: float = 0.05):
+    """Poll until selector matches at least one node and return the first match.
+
+    TabPane content mounts asynchronously after run_test returns, so a widget
+    may be briefly absent on loaded CI runners; fixed pauses race that window.
+    """
+    for _ in range(attempts):
+        matches = app.query(selector)
+        if matches:
+            return matches.first()
+        await pilot.pause(interval)
+    raise AssertionError(f"{selector!r} never appeared within {attempts} polls")
+
+
+async def wait_for_validation_state(app, pilot, *, absent=None, present=None, attempts: int = 120, interval: float = 0.05):
+    """Poll #form-validation until it exists and matches the expected text state.
+
+    Validation refreshes via async Input.Changed events; returns the widget once
+    `present` (if given) is in the rendered text and `absent` (if given) is not.
+    """
+    for _ in range(attempts):
+        matches = app.query("#form-validation")
+        if matches:
+            widget = matches.first()
+            text = str(widget.render())
+            if (absent is None or absent not in text) and (present is None or present in text):
+                return widget
+        await pilot.pause(interval)
+    raise AssertionError(
+        f"#form-validation never matched absent={absent!r} present={present!r} within {attempts} polls"
+    )

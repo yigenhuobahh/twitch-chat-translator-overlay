@@ -30,6 +30,7 @@ if str(SCRIPTS) not in sys.path:
 
 from textual.widgets import Button, Checkbox, Input, OptionList, RichLog, Select, Static, TabbedContent
 
+from helpers import wait_for_validation_state, wait_for_widget
 from tui_history import TuiHistoryStore
 from tui_models import (
     MODE_FULL_PRODUCTION,
@@ -278,22 +279,21 @@ def test_select_dropdown_reactivity_and_validation(tmp_path: Path):
     async def run():
         app = OverlayTui()
         async with app.run_test(size=(140, 50)) as pilot:
+            await wait_for_widget(app, pilot, "#form-validation")
             # Populate basic valid draft
             app.query_one("#video", Input).value = str(video)
             app.query_one("#chat", Input).value = str(chat)
             app.query_one("#task-mode", Select).value = MODE_QUICK_PREVIEW_ORIGINAL
-            await pilot.pause(0.1)
 
-            val_widget = app.query_one("#form-validation", Static)
+            val_widget = await wait_for_validation_state(app, pilot, present="表单检查通过")
             assert "ready" in val_widget.classes
-            assert "表单检查通过" in str(val_widget.render())
 
             # Switch mode to step_resume_render (which requires translation_json)
             app.query_one("#task-mode", Select).value = MODE_STEP_RESUME_RENDER
-            await pilot.pause(0.1)
-
+            val_widget = await wait_for_validation_state(
+                app, pilot, present="复用翻译渲染需要选择已存在的翻译 JSON"
+            )
             assert "invalid" in val_widget.classes
-            assert "复用翻译渲染需要选择已存在的翻译 JSON" in str(val_widget.render())
 
             # Fill translation-json -> should immediately become ready
             app.query_one("#translation-json", Input).value = str(trans)
@@ -434,21 +434,8 @@ def test_invalid_and_out_of_range_offset_validation(invalid_input: str, tmp_path
             app.query_one("#offset", Input).value = invalid_input
             await pilot.pause(0.1)
 
-            # #form-validation lives in a lazily mounted tab and refreshes via
-            # async Input.Changed events; poll so loaded CI runners converge.
-            val_widget = None
-            for _ in range(120):
-                matches = app.query("#form-validation")
-                if matches:
-                    candidate = matches.first()
-                    if "invalid" in candidate.classes and "时间偏移" in str(candidate.render()):
-                        val_widget = candidate
-                        break
-                await pilot.pause(0.05)
-
-            assert val_widget is not None, "form validation never surfaced the offset error"
+            val_widget = await wait_for_validation_state(app, pilot, present="时间偏移")
             assert "invalid" in val_widget.classes
-            assert "时间偏移" in str(val_widget.render())
 
     asyncio.run(run())
 

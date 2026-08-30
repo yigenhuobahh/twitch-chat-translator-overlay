@@ -4,6 +4,9 @@ pytest-cov>=4.0
 # 锁定 exact 版本：ruff 新版会引入新 lint 规则，曾导致 2026-08-25~29 scheduled CI 连续变红。
 # 升级时请手动 bump 并跑 python scripts/run_tests.py --lint 确认无新规则违规。
 ruff==0.16.5
+# 锁定 exact 版本：textual 点版本之间 TabPane 挂载时序有漂移，会导致 TUI 测试在 CI 上抖动
+# （本地 8.2.8 全量绿）。升级时手动 bump 并跑完整 TUI 测试确认。
+textual==8.2.8
 bandit>=1.8
 pip-audit>=2.7
 tomli>=2.0; python_version < "3.11"

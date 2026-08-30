@@ -13,6 +13,7 @@ if str(SCRIPTS) not in sys.path:
 
 from textual.widgets import Checkbox, Input, OptionList, RichLog, Select, Static, TabbedContent
 
+from helpers import wait_for_validation_state, wait_for_widget
 from tui_history import TuiHistoryStore
 from tui_models import (
     MODE_FULL_PRODUCTION,
@@ -121,65 +122,56 @@ def test_tui_offset_inputs_and_validation(tmp_path: Path):
     async def exercise():
         app = OverlayTui()
         async with app.run_test(size=(140, 50)) as pilot:
+            await wait_for_widget(app, pilot, "#form-validation")
             app._set_input("#video", str(video))
             app._set_input("#chat", str(chat))
             app._set_select("#task-mode", MODE_QUICK_PREVIEW_ORIGINAL)
-            await pilot.pause(0.05)
-
-            validation = app.query_one("#form-validation", Static)
 
             # Valid positive offset
             app._set_input("#offset", "12.5")
-            await pilot.pause(0.02)
             assert app._draft().offset == "12.5"
-            assert "待处理" not in str(validation.render())
+            await wait_for_validation_state(app, pilot, absent="待处理")
             cmd = app._draft().build_command("python", "render_cn_chat.py")
             assert "--offset" in cmd and "12.5" in cmd
 
             # Valid negative offset
             app._set_input("#offset", "-8.25")
-            await pilot.pause(0.02)
             assert app._draft().offset == "-8.25"
-            assert "待处理" not in str(validation.render())
+            await wait_for_validation_state(app, pilot, absent="待处理")
             cmd = app._draft().build_command("python", "render_cn_chat.py")
             assert "--offset" in cmd and "-8.25" in cmd
 
             # Valid zero and empty offset
             app._set_input("#offset", "0.0")
-            await pilot.pause(0.02)
             assert app._draft().offset == "0.0"
-            assert "待处理" not in str(validation.render())
+            await wait_for_validation_state(app, pilot, absent="待处理")
 
             app._set_input("#offset", "")
-            await pilot.pause(0.02)
             assert app._draft().offset == ""
-            assert "待处理" not in str(validation.render())
+            await wait_for_validation_state(app, pilot, absent="待处理")
 
             # Boundary extremes
             app._set_input("#offset", "604800.0")
-            await pilot.pause(0.02)
             assert app._draft().offset == "604800.0"
-            assert "待处理" not in str(validation.render())
+            await wait_for_validation_state(app, pilot, absent="待处理")
 
             app._set_input("#offset", "-604800.0")
-            await pilot.pause(0.02)
             assert app._draft().offset == "-604800.0"
-            assert "待处理" not in str(validation.render())
+            await wait_for_validation_state(app, pilot, absent="待处理")
 
             # Out-of-bounds offset
             app._set_input("#offset", "604801.0")
-            await pilot.pause(0.02)
+            validation = await wait_for_validation_state(app, pilot, present="时间偏移")
             assert "待处理" in str(validation.render())
-            assert "时间偏移" in str(validation.render())
 
             app._set_input("#offset", "-604801.0")
-            await pilot.pause(0.02)
+            validation = await wait_for_validation_state(app, pilot, present="时间偏移")
             assert "待处理" in str(validation.render())
 
             # Malformed non-numeric values
             for bad_val in ["abc", "12.3.4", "--5", "NaN", "Infinity", "1e99999"]:
                 app._set_input("#offset", bad_val)
-                await pilot.pause(0.02)
+                validation = await wait_for_validation_state(app, pilot, present="时间偏移")
                 assert "待处理" in str(validation.render()), f"Expected validation failure for offset: {bad_val}"
 
     asyncio.run(exercise())
@@ -432,6 +424,8 @@ def test_tui_task_dispatch_and_manual_required_lifecycle(tmp_path: Path):
 
     async def exercise():
         async with app.run_test(size=(140, 50)) as pilot:
+            # Startup barrier: pane content mounts asynchronously after run_test.
+            await wait_for_widget(app, pilot, "#form-validation")
             # 1. manual_required lifecycle
             manual_script = (
                 "import json, os; "

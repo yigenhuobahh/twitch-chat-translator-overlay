@@ -242,20 +242,19 @@ def test_offset_pipeline_plan_building(tmp_path: Path):
 def test_tui_rapid_offset_input_and_validation():
     """Verify rapid offset input changes do not crash Textual app."""
     pytest.importorskip("textual")
-    from textual.widgets import Input, Static
 
+    from helpers import wait_for_widget
     from tui_run import OverlayTui
 
     async def exercise():
         app = OverlayTui()
         async with app.run_test(size=(140, 50)) as pilot:
-            offset_input = app.query_one("#offset", Input)
+            offset_input = await wait_for_widget(app, pilot, "#offset")
             for val in ["1", "12", "12.", "12.5", "-12.5", "invalid", "", "0", "-0.5"]:
                 offset_input.value = val
                 await pilot.pause(0.01)
 
-            val_widget = app.query_one("#form-validation", Static)
-            assert val_widget is not None
+            await wait_for_widget(app, pilot, "#form-validation")
 
     asyncio.run(exercise())
 

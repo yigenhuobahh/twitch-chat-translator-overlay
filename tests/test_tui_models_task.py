@@ -479,6 +479,7 @@ def test_textual_form_labels_and_action_follow_input_order():
 def test_textual_form_validation_updates_while_editing(tmp_path: Path):
     pytest.importorskip("textual")
 
+    from helpers import wait_for_validation_state, wait_for_widget
     from tui_run import OverlayTui
 
     video = tmp_path / "source.mp4"
@@ -489,24 +490,23 @@ def test_textual_form_validation_updates_while_editing(tmp_path: Path):
     async def exercise() -> None:
         app = OverlayTui()
         async with app.run_test(size=(140, 45)) as pilot:
-            validation = app.query_one("#form-validation")
+            await wait_for_widget(app, pilot, "#form-validation")
+            validation = await wait_for_validation_state(app, pilot, present="待处理")
             assert "待处理" in str(validation.render())
 
             app.query_one("#video").value = str(video)
             app.query_one("#chat").value = str(chat)
-            await pilot.pause(0.05)
-            assert "表单检查通过" in str(validation.render())
+            validation = await wait_for_validation_state(app, pilot, present="表单检查通过")
             assert validation.has_class("ready")
 
             app.query_one("#output").value = str(video)
-            await pilot.pause(0.05)
-            assert "输出文件不能与源视频相同" in str(validation.render())
+            validation = await wait_for_validation_state(app, pilot, present="输出文件不能与源视频相同")
             assert validation.has_class("invalid")
 
             app.query_one("#output").value = ""
             app.query_one("#preview-clip").value = "0"
-            await pilot.pause(0.05)
-            assert "预览时长必须大于 0" in str(validation.render())
+            validation = await wait_for_validation_state(app, pilot, present="预览时长必须大于 0")
+            assert validation.has_class("invalid")
 
     import asyncio
 

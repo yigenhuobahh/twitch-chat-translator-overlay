@@ -462,6 +462,7 @@ def test_textual_history_loads_saved_draft(tmp_path: Path):
 def test_textual_history_clear_requires_confirmation_and_preserves_running_task(tmp_path: Path):
     pytest.importorskip("textual")
 
+    from helpers import wait_for_widget
     from tui_history import TuiHistoryStore
     from tui_run import OverlayTui
 
@@ -469,7 +470,8 @@ def test_textual_history_clear_requires_confirmation_and_preserves_running_task(
         app = OverlayTui()
         app.history = TuiHistoryStore(tmp_path / "history.json")
         record = app.history.start(None, label="running")
-        async with app.run_test():
+        async with app.run_test() as pilot:
+            await wait_for_widget(app, pilot, "#history-clear")
             app.session = type("Session", (), {"running": True})()
             app._set_history_clear_enabled(False)
             assert app.query_one("#history-clear").disabled is True
