@@ -276,3 +276,181 @@ def test_pause_stop_publishes_manual_required(monkeypatch, tmp_path, pipeline_mo
     assert manifest["state"] == "manual_required", manifest
     # 只允许发生翻译器调用，渲染（burn）绝不能启动
     assert len(pipeline_mocks) == 1, pipeline_mocks
+
+
+# ---------------------------------------------------------------------------
+# PIPE-O1: --dry-run 不得产生真实写副作用
+# ---------------------------------------------------------------------------
+
+
+def test_export_review_tables_dry_run_skips_write(monkeypatch, tmp_path):
+    """写侧守卫：DRY_RUN 下复核表导出函数不落盘。"""
+    trans = _write_trans_json(tmp_path / "trans.json", fail=False)
+    tsv = tmp_path / "review.tsv"
+    xlsx = tmp_path / "review.xlsx"
+    monkeypatch.setattr(pipe, "DRY_RUN", True)
+    try:
+        pipe.export_review_tsv(trans, tsv)
+        pipe.export_review_xlsx(trans, xlsx)
+    finally:
+        monkeypatch.setattr(pipe, "DRY_RUN", False)
+    assert not tsv.exists(), "dry-run 不得写出复核 TSV"
+    assert not xlsx.exists(), "dry-run 不得写出复核 XLSX"
+
+
+def test_dry_run_reuse_review_does_not_write_review_tables(monkeypatch, tmp_path, pipeline_mocks):
+    """--dry-run --reuse-translation --review：此前会真实写出复核 TSV/XLSX。"""
+    video, html = _make_inputs(tmp_path)
+    trans = _write_trans_json(tmp_path / "trans.json", fail=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "render_cn_chat.py",
+            str(video),
+            str(html),
+            "--reuse-translation",
+            "--translation-json",
+            str(trans),
+            "--review",
+            "--dry-run",
+        ],
+    )
+    try:
+        pipe.main()
+        tsv = video.with_name(video.stem + "_translation_review.tsv")
+        xlsx = tsv.with_suffix(".xlsx")
+        assert not tsv.exists(), "dry-run 不得写出复核 TSV"
+        assert not xlsx.exists(), "dry-run 不得写出复核 XLSX"
+    finally:
+        pipe.DRY_RUN = False  # main() 会真实改写模块全局，防止泄漏给后续用例
+
+
+def test_dry_run_download_flow_skips_real_download(monkeypatch):
+    """--download 在 DRY_RUN 全局赋值前执行，必须在入口拦截，不能真实下载。"""
+    import twitch_download as td
+
+    def _boom(*a, **k):
+        raise AssertionError("dry-run 下不得调用真实下载")
+
+    monkeypatch.setattr(td, "download_assets", _boom)
+    monkeypatch.setattr(td, "download_assets_multi", _boom)
+    args = SimpleNamespace(download="https://www.twitch.tv/videos/123", dry_run=True)
+    assert pipe._run_download_flow(args) == 0
+
+
+def test_dry_run_job_does_not_touch_last_job(monkeypatch, tmp_path, pipeline_mocks):
+    """--dry-run --job 不得写出 jobs/.last_job。"""
+    video, html = _make_inputs(tmp_path)
+    job = tmp_path / "style.yaml"
+    job.write_text("mode: auto\n", encoding="utf-8")
+    calls: list = []
+    monkeypatch.setattr(pipe, "save_last_job", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["render_cn_chat.py", str(video), str(html), "--job", str(job), "--dry-run"],
+    )
+    try:
+        pipe.main()
+        assert calls == [], "dry-run 不得记录 .last_job"
+    finally:
+        pipe.DRY_RUN = False  # main() 会真实改写模块全局，防止泄漏给后续用例
+
+
+def test_dry_run_lint_report_not_written(monkeypatch, tmp_path, pipeline_mocks):
+    """--dry-run --lint-translation --lint-report：lint 照常执行，但报告不落盘。"""
+    trans = _write_trans_json(tmp_path / "clean.json", fail=False)
+    report = tmp_path / "lint_report.tsv"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "render_cn_chat.py",
+            "--lint-translation",
+            str(trans),
+            "--lint-report",
+            str(report),
+            "--dry-run",
+        ],
+    )
+    try:
+        with pytest.raises(SystemExit) as excinfo:
+            pipe.main()
+        assert excinfo.value.code == 0
+        assert not report.exists(), "dry-run 不得写出质检报告"
+    finally:
+        pipe.DRY_RUN = False  # main() 会真实改写模块全局，防止泄漏给后续用例
+
+
+# ---------------------------------------------------------------------------
+# PIPE-O4: preview 模式不应为 10 秒预览完整解码全片
+# ---------------------------------------------------------------------------
+
+
+def _preview_args(source_media_check: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        mode="preview",
+        preview_clip=None,
+        preview_frame=None,
+        overlay_codec="vp9",
+        render_preset=None,
+        source_media_check=source_media_check,
+    )
+
+
+def test_preview_mode_downgrades_decode_media_check(monkeypatch):
+    # 模拟 TUI/其他入口把 decode 作为默认值传入、用户未显式写 --source-media-check
+    monkeypatch.setattr(sys, "argv", ["render_cn_chat.py"])
+    args = _preview_args("decode")
+    applied = pipe.apply_mode_defaults(args)
+    assert args.source_media_check == "fast"
+    assert "source_media_check=fast" in applied
+
+
+def test_preview_mode_respects_explicit_decode_flag(monkeypatch):
+    monkeypatch.setattr(
+        sys, "argv", ["render_cn_chat.py", "--source-media-check", "decode"]
+    )
+    args = _preview_args("decode")
+    applied = pipe.apply_mode_defaults(args)
+    assert args.source_media_check == "decode"
+    assert "source_media_check=fast" not in applied
+
+
+def test_preview_mode_keeps_fast_without_flag(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["render_cn_chat.py"])
+    args = _preview_args("fast")
+    pipe.apply_mode_defaults(args)
+    assert args.source_media_check == "fast"
+
+
+# ---------------------------------------------------------------------------
+# PIPE-O5: 复核表导出只解析一次 JSON、只跑一次 lint
+# ---------------------------------------------------------------------------
+
+
+def test_review_export_pair_lints_once(monkeypatch, tmp_path):
+    trans = _write_trans_json(tmp_path / "trans.json", fail=False)
+    calls: list = []
+    orig_lint = pipe.lint_translation
+
+    def spy(*a, **k):
+        calls.append(a)
+        return orig_lint(*a, **k)
+
+    monkeypatch.setattr(pipe, "lint_translation", spy)
+    monkeypatch.setattr(pipe, "DRY_RUN", False)  # 防止前面的 main() 级用例遗留 True
+    data, issue_map = pipe._prepare_review_export(trans)
+    pipe.export_review_tsv(trans, tmp_path / "review.tsv", data=data, issue_map=issue_map)
+    pipe.export_review_xlsx(trans, tmp_path / "review.xlsx", data=data, issue_map=issue_map)
+    assert len(calls) == 1, f"lint 应只跑一次，实际 {len(calls)} 次"
+    assert (tmp_path / "review.tsv").is_file()
+    assert (tmp_path / "review.xlsx").is_file()
+
+
+def test_lint_translation_accepts_preparsed_data(tmp_path):
+    trans = _write_trans_json(tmp_path / "trans.json", fail=True)  # 缺 translation → FAIL
+    data = json.loads(trans.read_text(encoding="utf-8"))
+    issues = pipe.lint_translation(trans, data=data)
+    assert any(i["severity"] == "FAIL" for i in issues)

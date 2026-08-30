@@ -95,6 +95,7 @@ python scripts\render_cn_chat.py --job jobs\example_job.yaml
 | 各用各的 `--workdir` / `--output` | **最推荐** | 完全隔离，路径最好认 |
 | `--no-job-dir` 共用 out-dir | **不安全** | 共享 `overlay_frames`，后写覆盖；仅兼容旧行为 |
 | 运行中 `--clean` | **安全** | 默认只删 `*.partial.mp4`；`--clean-all` 清已结束/stale running job（仍 skip 存活 pid） |
+| 同一视频同目录并发两个翻译管线 | **不安全** | 共享 `<视频>_translation.json` 与复核文件（写原子但互相丢批次）；不同视频或各自 `--workdir`/`--output` 安全 |
 
 ```powershell
 # 推荐：两个片子并行，各自 workdir + output

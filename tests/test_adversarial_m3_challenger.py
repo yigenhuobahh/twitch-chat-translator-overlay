@@ -3,9 +3,12 @@
 
 Covers:
 1. Mock isolation and environment variable leakage prevention across test runs.
-2. Robustness of save_dotenv_api_config under adversarial file formats (CRLF, BOM, malformed lines, duplicates, whitespace, Unicode).
+2. Robustness of save_dotenv_api_config under adversarial file formats (CRLF, BOM,
+   malformed lines, duplicates, whitespace, Unicode). The dedicated special-characters
+   value test was deduplicated into test_adversarial_m3.py.
 3. Robustness of probe_translate_api under adverse error conditions (SSLError, ConnectionReset, 429 RateLimit, 500 ServerError, invalid response).
-4. Boundary and adversarial cases for --offset parsing, serialization, and CLI propagation.
+4. Offset propagation through PipelinePlan. The boundary/adversarial --offset parsing
+   parametrization was deduplicated into test_adversarial_m3.py.
 5. Async Textual UI stress testing (rapid input typing, tab switching during probe, unmounting while probe thread is active).
 6. Deterministic reproduction of DOM query safety failure in _refresh_form_validation.
 """
@@ -116,20 +119,11 @@ def test_save_dotenv_api_config_handles_crlf_and_utf8_bom(tmp_path: Path):
     assert "FOO=BAR" in read_text
 
 
-def test_save_dotenv_api_config_handles_special_characters_and_spaces(tmp_path: Path):
-    """Adversarial check: paths/keys with spaces, symbols, and unicode in values."""
-    env_file = tmp_path / ".env"
-    ok, msg = save_dotenv_api_config(
-        base_url="https://api.example.com/v1/custom?query=test#frag",
-        api_key="sk-special_!@#$%^&*()_+-=[]{}|;:,.<>?",
-        model="deepseek/deepseek-chat-v3:latest",
-        env_path=env_file,
-    )
-    assert ok is True
-    read_text = env_file.read_text(encoding="utf-8")
-    assert "OPENAI_COMPAT_BASE_URL=https://api.example.com/v1/custom?query=test#frag" in read_text
-    assert "OPENAI_COMPAT_API_KEY=sk-special_!@#$%^&*()_+-=[]{}|;:,.<>?" in read_text
-    assert "OPENAI_COMPAT_MODEL=deepseek/deepseek-chat-v3:latest" in read_text
+# NOTE: the former dedicated special-characters/spaces save test was merged
+# into test_adversarial_m3.py::test_adversarial_save_dotenv_special_characters,
+# and the former 19-case offset boundary parametrization was merged into
+# test_adversarial_m3.py::test_adversarial_offset_valid_inputs /
+# ::test_adversarial_offset_invalid_inputs.
 
 
 # ============================================================================
@@ -179,44 +173,9 @@ def test_probe_translate_api_simulated_network_failures():
 # ============================================================================
 # 3. Time Offset (--offset) Extreme Values and Boundary Conditions
 # ============================================================================
-
-
-@pytest.mark.parametrize(
-    ("offset_val", "should_be_valid", "expected_float"),
-    [
-        ("0", True, 0.0),
-        ("-0", True, 0.0),
-        ("+0", True, 0.0),
-        ("0.0001", True, 0.0001),
-        ("-0.0001", True, -0.0001),
-        ("604800", True, 604800.0),      # max 7 days
-        ("-604800", True, -604800.0),    # min -7 days
-        ("604800.000", True, 604800.0),
-        ("-604800.000", True, -604800.0),
-        ("604800.1", False, None),       # exceeds upper bound
-        ("-604800.1", False, None),      # exceeds lower bound
-        ("1e20", False, None),
-        ("-1e20", False, None),
-        ("infinity", False, None),
-        ("-inf", False, None),
-        ("nan", False, None),
-        ("NaN", False, None),
-        ("abc", False, None),
-        ("12.34.56", False, None),
-        (" --5 ", False, None),
-    ],
-)
-def test_offset_validation_boundaries(offset_val: str, should_be_valid: bool, expected_float: float | None):
-    draft = TuiJobDraft(video="v.mp4", chat_html="c.html", offset=offset_val)
-    problems = draft.validate(check_api=False, check_environment=False)
-    offset_problems = [p for p in problems if "时间偏移" in p or "offset" in p]
-
-    if should_be_valid:
-        assert len(offset_problems) == 0, f"Expected offset '{offset_val}' to be valid, got problems: {offset_problems}"
-        fields = draft.to_job_fields()
-        assert fields.get("offset") == expected_float
-    else:
-        assert len(offset_problems) > 0, f"Expected offset '{offset_val}' to be invalid, but validation passed"
+# NOTE: the former 19-case parametrized offset boundary test lives on in
+# test_adversarial_m3.py (valid-input and invalid-input parametrizations,
+# extended with the boundary and beyond-bound values unique to this file).
 
 
 def test_offset_pipeline_plan_building(tmp_path: Path):

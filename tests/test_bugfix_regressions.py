@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Regressions for deep-audit bugfixes (lane clamp, import align, duration, fade)."""
+"""Regressions for deep-audit bugfixes (lane clamp, import align, duration, resume)."""
 
 from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from helpers import load_module
 
 
-def test_schedule_clamps_overlong_message_lines():
-    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
+@pytest.fixture(scope="module")
+def burn():
+    """One shared exec of the 3.6k-line module for the whole regression file."""
+    return load_module("twitch_chat_burn_regressions", "twitch_chat_burn.py")
+
+
+def test_schedule_clamps_overlong_message_lines(burn):
     messages = [{"timestamp": 1.0, "author": "a", "fragments": [], "badges": []}]
     # 25 lines would previously make max_lane negative and crash / corrupt schedule
     schedule = burn.schedule_messages(
@@ -28,8 +37,7 @@ def test_schedule_clamps_overlong_message_lines():
     assert lane + nl <= 10
 
 
-def test_schedule_mobile_controls_protect_visible_and_rate_limit():
-    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
+def test_schedule_mobile_controls_protect_visible_and_rate_limit(burn):
     messages = [
         {"timestamp": 1.0, "author": "a", "fragments": [], "badges": []},
         {"timestamp": 1.0, "author": "b", "fragments": [], "badges": []},
@@ -50,9 +58,8 @@ def test_schedule_mobile_controls_protect_visible_and_rate_limit():
     assert all(end - start >= 3.0 for start, end, *_rest in schedule)
 
 
-def test_lanes_delayed_admit_never_inverts_visibility_window():
+def test_lanes_delayed_admit_never_inverts_visibility_window(burn):
     """arrival_interval > remaining life must not invent start >= end rows."""
-    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
     messages = [
         {"timestamp": 1.0, "fragments": [], "badges": []},
         {"timestamp": 1.1, "fragments": [], "badges": []},
@@ -70,9 +77,8 @@ def test_lanes_delayed_admit_never_inverts_visibility_window():
         assert start < end
 
 
-def test_float_arrival_interval_does_not_delay_carry_in():
+def test_float_arrival_interval_does_not_delay_carry_in(burn):
     """Rebased pre-window messages must all be visible at t=0 with mobile arrival_interval."""
-    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
     stamps = [-0.55, -0.50, -0.45, -0.40, -0.35, -0.30, -0.25, -0.20, -0.15, -0.10, -0.05, 0.0]
     messages = [{"timestamp": t} for t in stamps]
     events = burn.schedule_messages_float(
@@ -87,8 +93,7 @@ def test_float_arrival_interval_does_not_delay_carry_in():
     assert len(visible) == 12
 
 
-def test_float_arrival_interval_still_paces_in_window_arrivals():
-    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
+def test_float_arrival_interval_still_paces_in_window_arrivals(burn):
     messages = [{"timestamp": 0.0}, {"timestamp": 0.01}, {"timestamp": 0.02}]
     events = burn.schedule_messages_float(
         messages,
@@ -100,9 +105,8 @@ def test_float_arrival_interval_still_paces_in_window_arrivals():
     assert [round(e[0], 2) for e in events] == [0.0, 0.35, 0.7]
 
 
-def test_float_throttle_from_protects_absolute_preview_frame_history():
+def test_float_throttle_from_protects_absolute_preview_frame_history(burn):
     """Non-rebased float --preview-frame must not rate-limit ts < frame_t."""
-    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
     frame_t = 100.0
     stamps = [frame_t - 0.05 * i for i in range(12, 0, -1)]  # 99.4 .. 99.95
     messages = [{"timestamp": t} for t in stamps]
@@ -120,8 +124,7 @@ def test_float_throttle_from_protects_absolute_preview_frame_history():
     assert getattr(events, "starts", None) == stamps
 
 
-def test_schedule_max_visible_zero_uses_auto_capacity():
-    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
+def test_schedule_max_visible_zero_uses_auto_capacity(burn):
     # height 363 / (15+14) => 12 lanes
     assert burn.compute_lane_capacity(363, 15) == 12
     messages = [{"timestamp": float(i), "author": f"u{i}", "fragments": [], "badges": []} for i in range(20)]
@@ -138,9 +141,8 @@ def test_schedule_max_visible_zero_uses_auto_capacity():
     assert max_lane < 12
 
 
-def test_resolve_lane_budget_clamps_above_physical_capacity():
+def test_resolve_lane_budget_clamps_above_physical_capacity(burn):
     """Explicit max_visible above physical capacity must clamp (old fixed-10 path)."""
-    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
     # 360p ratio box from e2e: h=223, font≈14 => capacity 7 (LINE_H=28, bottom_pad=4)
     assert burn.compute_lane_capacity(223, 14) == 7
     budget, capacity, warn = burn.resolve_lane_budget(10, 223, 14)
@@ -157,9 +159,8 @@ def test_resolve_lane_budget_clamps_above_physical_capacity():
     assert (budget_auto, capacity_auto, warn_auto) == (7, 7, None)
 
 
-def test_default_max_visible_is_auto_fill():
+def test_default_max_visible_is_auto_fill(burn):
     """run.bat / default layout: max_visible=0 fills by box height, no clamp warn."""
-    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
     assert burn.OverlayConfig().max_visible == 0
     budget, capacity, warn = burn.resolve_lane_budget(0, 363, 15)
     assert warn is None
@@ -168,9 +169,8 @@ def test_default_max_visible_is_auto_fill():
     assert budget >= 10
 
 
-def test_lane_y_from_budget_never_stacks_at_top_when_clamped():
+def test_lane_y_from_budget_never_stacks_at_top_when_clamped(burn):
     """After resolve_lane_budget, single-line lane y must stay non-negative and distinct."""
-    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
     height, font_size = 223, 14
     budget, _capacity, _warn = burn.resolve_lane_budget(10, height, font_size)
     line_h = burn.line_height_px(font_size)
@@ -183,8 +183,7 @@ def test_lane_y_from_budget_never_stacks_at_top_when_clamped():
     assert len(ys) == len(set(ys))
 
 
-def test_schedule_mobile_protection_drops_new_message_when_full():
-    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
+def test_schedule_mobile_protection_drops_new_message_when_full(burn):
     messages = [
         {"timestamp": 1.0, "author": "a", "fragments": [], "badges": []},
         {"timestamp": 2.0, "author": "b", "fragments": [], "badges": []},
@@ -200,9 +199,8 @@ def test_schedule_mobile_protection_drops_new_message_when_full():
     assert [(row[0], row[3]) for row in schedule] == [(1.0, 0)]
 
 
-def test_schedule_min_visible_does_not_partially_truncate_on_reject():
+def test_schedule_min_visible_does_not_partially_truncate_on_reject(burn):
     """If any seized row is still protected, no overlapping row may be mutated."""
-    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
     messages = [
         {"timestamp": 0.0, "author": "old", "fragments": [], "badges": []},
         {"timestamp": 3.0, "author": "protected", "fragments": [], "badges": []},
@@ -223,8 +221,7 @@ def test_schedule_min_visible_does_not_partially_truncate_on_reject():
     assert by_idx[1][1] == 13.0
 
 
-def test_schedule_keeps_message_starting_before_duration():
-    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
+def test_schedule_keeps_message_starting_before_duration(burn):
     messages = [
         {"timestamp": 9.5, "author": "tail", "fragments": [], "badges": []},
         {"timestamp": 10.0, "author": "exact", "fragments": [], "badges": []},
@@ -244,8 +241,7 @@ def test_schedule_keeps_message_starting_before_duration():
     assert "after" not in authors
 
 
-def test_apply_imported_translations_matches_by_index_and_strips_emote():
-    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
+def test_apply_imported_translations_matches_by_index_and_strips_emote(burn):
     chat = {
         "messages": [
             {
@@ -299,8 +295,7 @@ def test_apply_imported_translations_matches_by_index_and_strips_emote():
     assert chat["messages"][1]["fragments"][0]["text"] == "只有文字"
 
 
-def test_apply_imported_warns_on_author_mismatch():
-    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
+def test_apply_imported_warns_on_author_mismatch(burn):
     chat = {
         "messages": [
             {
@@ -323,9 +318,7 @@ def test_apply_imported_warns_on_author_mismatch():
     assert any("跳过导入" in w for w in warnings)
 
 
-def test_probe_video_duration_rejects_empty(monkeypatch):
-    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
-
+def test_probe_video_duration_rejects_empty(burn, monkeypatch):
     class Fake:
         returncode = 1
         stdout = ""
@@ -336,51 +329,83 @@ def test_probe_video_duration_rejects_empty(monkeypatch):
         burn.probe_video_duration("x.mp4")
 
 
-def test_segment_fade_disables_static_key_logic_unit():
-    """Document/assert the fade window predicate used by render_overlay."""
-    FADE_IN = 0.3
-    FADE_OUT = 0.5
-    # message visible [10, 24)
-    start, end = 10.0, 24.0
-    # first segment after start: cp=10, next=12 -> in fade-in
-    cp, next_cp = 10.0, 12.0
-    in_fade = (cp < (start + FADE_IN) and next_cp > start) or (
-        cp < end and next_cp > (end - FADE_OUT)
+def test_resume_keeps_translation_equal_to_original(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Non-empty translation == original counts as done for resume.
+
+    Verified through the real tr.main() resume seeding (not by re-implementing
+    the rule); a pure-emote row additionally exercises should_preserve_original.
+    """
+    tr = load_module("translate_chat_openai_regressions", "translate_chat_openai.py")
+    messages = [
+        {"index": 0, "author": "alice", "original": "hello", "translation": "hello"},
+        {"index": 1, "author": "bob", "original": "[Pog]", "translation": "[Pog]"},
+    ]
+    json_path = tmp_path / "resume.json"
+    json_path.write_text(
+        json.dumps({"messages": messages}, ensure_ascii=False),
+        encoding="utf-8",
     )
-    assert in_fade is True
-    # interior: cp=12, next=20
-    cp, next_cp = 12.0, 20.0
-    in_fade = (cp < (start + FADE_IN) and next_cp > start) or (
-        cp < end and next_cp > (end - FADE_OUT)
+    # Compatible progress whose fingerprints match the JSON rows exactly.
+    tr.save_progress(
+        tr.progress_path_for(json_path),
+        {
+            "schema_version": tr.PROGRESS_SCHEMA_VERSION,
+            "provider": tr.TRANSLATION_PROVIDER,
+            "base_url_fingerprint": tr.base_url_fingerprint("https://provider.invalid/v1"),
+            "model": "stub-model",
+            "prompt_version": tr.PROMPT_VERSION,
+            "target_language": "zh",
+            "context": "livestream chat",
+            "translations": {"0": "hello"},
+            "fingerprints": {
+                str(m["index"]): tr.fingerprint_message(m) for m in messages
+            },
+            "json_translation_fingerprints": {
+                str(m["index"]): tr.fingerprint_translation(m["translation"])
+                for m in messages
+            },
+            "failed": [],
+        },
     )
-    assert in_fade is False
-    # fade-out tail: cp=23.6, next=24
-    cp, next_cp = 23.6, 24.0
-    in_fade = (cp < (start + FADE_IN) and next_cp > start) or (
-        cp < end and next_cp > (end - FADE_OUT)
+
+    record = {"calls": 0}
+
+    class Completions:
+        def create(self, **_kwargs):
+            record["calls"] += 1
+            return SimpleNamespace(choices=[])
+
+    class Client:
+        def __init__(self, **_kwargs):
+            self.chat = SimpleNamespace(completions=Completions())
+
+    monkeypatch.setattr(tr, "OpenAI", Client)
+    monkeypatch.setattr(tr, "BASE_URL", "https://provider.invalid/v1")
+    monkeypatch.setattr(tr, "API_KEY", "stub-key")
+    monkeypatch.setattr(tr, "MODEL", "stub-model")
+    monkeypatch.setattr(
+        tr.sys,
+        "argv",
+        ["translate_chat_openai.py", str(json_path), "--workers", "1"],
     )
-    assert in_fade is True
+
+    tr.main()
+
+    updated = json.loads(json_path.read_text(encoding="utf-8"))
+    progress = tr.load_progress(tr.progress_path_for(json_path))
+    # translation == original is trusted as done: the model was never called.
+    assert record["calls"] == 0
+    assert updated["messages"][0]["translation"] == "hello"
+    # Pure-emote rows are preserved verbatim (should_preserve_original path).
+    assert updated["messages"][1]["translation"] == "[Pog]"
+    assert progress["failed"] == []
+    assert progress["translations"]["0"] == "hello"
 
 
-def test_resume_keeps_translation_equal_to_original():
-    """Non-empty translation == original should still count as done for resume."""
-    tr = load_module("translate_chat_openai", "translate_chat_openai.py")
-    existing = "Hello"
-    original = "Hello"
-    # Mirror product seed rule used in translate_chat_openai.main.
-    resume = True
-    translation_map = {}
-    if resume and str(existing or "").strip():
-        translation_map[0] = existing
-    assert 0 in translation_map
-    assert translation_map[0] == original
-    # should_preserve_original is separate (pure emote/url rows).
-    assert tr.should_preserve_original("[LUL]") is True
-    assert tr.should_preserve_original("Hello") is False
-
-
-def test_float_stack_bottom_is_newest():
-    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
+def test_float_stack_bottom_is_newest(burn):
     messages = [{"timestamp": float(i), "author": f"u{i}"} for i in range(5)]
     events = burn.schedule_messages_float(
         messages,
@@ -396,8 +421,7 @@ def test_float_stack_bottom_is_newest():
     assert set(by_lane.values()) == {2, 3, 4}
 
 
-def test_float_stack_multiline_respects_capacity():
-    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
+def test_float_stack_multiline_respects_capacity(burn):
     messages = [{"timestamp": float(i)} for i in range(4)]
     events = burn.schedule_messages_float(
         messages,
@@ -413,9 +437,8 @@ def test_float_stack_multiline_respects_capacity():
     assert 3 in idxs
 
 
-def test_float_stack_does_not_resurrect_older_under_oversize_newer():
+def test_float_stack_does_not_resurrect_older_under_oversize_newer(burn):
     """When newest does not fit remaining capacity, stop — do not skip to older small msgs."""
-    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
     # A(1) @0, B(3) @1, C(2) @2; capacity 4.
     # At t=2.5 newest-first: C(2) fits, B(3) does not → must NOT admit A underneath.
     messages = [{"timestamp": float(i)} for i in range(3)]
@@ -432,9 +455,8 @@ def test_float_stack_does_not_resurrect_older_under_oversize_newer():
     assert sum(v[4] for v in visible) <= 4
 
 
-def test_default_stack_mode_is_lanes_preserving_lifetime():
+def test_default_stack_mode_is_lanes_preserving_lifetime(burn):
     """CLI/config default stays lanes so --msg-lifetime still expires messages."""
-    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
     assert burn.OverlayConfig().stack_mode == "lanes"
     messages = [{"timestamp": float(i)} for i in range(3)]
     schedule = burn.schedule_messages(
@@ -448,8 +470,7 @@ def test_default_stack_mode_is_lanes_preserving_lifetime():
     assert all(end - start == 5.0 for start, end, *_ in schedule)
 
 
-def test_active_float_stack_handles_unsorted_events():
-    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
+def test_active_float_stack_handles_unsorted_events(burn):
     # Deliberately reverse order: (start, end, lane, idx, nl)
     events = [
         (3.0, 1e9, 0, 2, 1),
@@ -461,8 +482,7 @@ def test_active_float_stack_handles_unsorted_events():
     assert visible[0][1] == 2  # newest at bottom
 
 
-def test_float_no_lifetime_only_capacity_evicts():
-    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
+def test_float_no_lifetime_only_capacity_evicts(burn):
     messages = [{"timestamp": float(i)} for i in range(5)]
     events = burn.schedule_messages_float(
         messages,

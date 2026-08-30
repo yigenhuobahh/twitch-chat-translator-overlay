@@ -12,6 +12,7 @@ import pytest
 from helpers import load_module
 
 
+@pytest.mark.smoke
 def test_validate_rejects_missing_audio_when_required(make_test_video, tmp_path: Path):
     burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
     # Video-only file
@@ -39,6 +40,7 @@ def test_validate_rejects_missing_audio_when_required(make_test_video, tmp_path:
     assert summary.get("has_audio") is False
 
 
+@pytest.mark.smoke
 def test_validate_accepts_duration_within_tolerance(make_test_video):
     burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
     video = make_test_video(duration=2.0, fps=30)

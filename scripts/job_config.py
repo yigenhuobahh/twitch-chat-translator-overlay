@@ -46,6 +46,8 @@ JOB_FIELD_ALIASES: dict[str, str] = {
     "preview-dense": "preview_dense",
     "offset": "offset",
     "mode": "mode",
+    "source_media_check": "source_media_check",
+    "source-media-check": "source_media_check",
     "target_language": "target_language",
     "target-language": "target_language",
     "context": "context",
@@ -443,6 +445,11 @@ def apply_job_to_namespace(
 
     Explicit CLI flags always win (same contract as layout/render presets).
     Returns list of applied field names.
+
+    「CLI 显式优先」的实现方式是按默认值比较：显式传入但恰好等于默认值的参数
+    不视为覆盖。例如 ``--workers 4 --job x.yaml`` 且 yaml 里 workers=8 时，
+    yaml 的 8 生效（4 是默认值，不算显式选择）；只有 CLI 传了非默认值
+    （如 --workers 2）才胜出。
     """
     cli_defaults = dict(cli_defaults or {})
     applied: list[str] = []
@@ -460,6 +467,9 @@ def apply_job_to_namespace(
         else:
             # Unknown default: only fill when unset / False for bool flags that
             # store_true typically defaults to False.
+            # 注意：若某字段有非 None/False 的 argparse 默认值但没登记进
+            # cli_defaults，job 值会在这里被静默跳过——新字段必须同时补进
+            # render_cn_chat.PIPELINE_CLI_DEFAULTS 才能从 job YAML 生效。
             if current is not None and current is not False:
                 continue
         setattr(args, key, value)

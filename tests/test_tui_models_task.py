@@ -662,7 +662,15 @@ def test_textual_download_button_builds_existing_cli_command(monkeypatch):
         monkeypatch.setattr(app, "_start_command", lambda *args, **kwargs: captured.update(args=args, kwargs=kwargs))
         async with app.run_test(size=(140, 45)) as pilot:
             app.query_one(TabbedContent).active = "download"
-            await pilot.pause(0.05)
+            # Poll until the download pane is actually shown: tab panes mount
+            # eagerly, so DOM presence alone does not mean the button can
+            # receive the click (a hidden pane yields a zero-size region and a
+            # silent no-op pilot.click).
+            for _ in range(40):
+                await pilot.pause(0.05)
+                if app.query_one("#download-start").region.width > 0:
+                    break
+            assert app.query_one("#download-start").region.width > 0
             app.query_one("#download-url").value = "2819850140"
             app.query_one("#download-segments").value = "1:00:00-1:00:08; 1:00:20-1:00:28"
             app.query_one("#download-oauth").value = "secret-token"

@@ -28,6 +28,7 @@ def test_hex_to_rgb_soft_shared():
     assert burn.hex_to_rgb("#abc") == cu.hex_to_rgb_soft("#abc")
 
 
+@pytest.mark.smoke
 def test_validate_rejects_too_long_output(make_test_video):
     burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
     video = make_test_video(duration=3.0, fps=30)
@@ -43,6 +44,7 @@ def test_validate_rejects_too_long_output(make_test_video):
     assert summary["duration"] > 1.0
 
 
+@pytest.mark.smoke
 def test_validate_rejects_tiny_dimensions(tmp_path: Path):
     burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
     out = tmp_path / "tiny.mp4"

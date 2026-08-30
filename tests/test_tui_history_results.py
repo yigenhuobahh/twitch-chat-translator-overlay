@@ -656,6 +656,11 @@ def test_textual_unmount_marks_running_task_interrupted(tmp_path: Path):
         app = OverlayTui()
         app.history = TuiHistoryStore(tmp_path / "history.json")
         async with app.run_test() as pilot:
+            # The 30s child sleep is never waited for: it only guarantees the
+            # task outlives this sub-second test window on slow runners.
+            # Leaving the run_test context unmounts the app, whose cleanup calls
+            # session.cancel() -> kill_process_tree, reaping the child at once
+            # and marking the history record "interrupted".
             app._start_command("interrupt probe", [sys.executable, "-c", "import time; time.sleep(30)"])
             await pilot.pause(0.1)
             assert app.session and app.session.running

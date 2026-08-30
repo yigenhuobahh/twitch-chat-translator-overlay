@@ -38,61 +38,6 @@ def test_progress_helpers_roundtrip(tmp_path: Path):
     assert 3 in loaded["failed"] or "3" in map(str, loaded["failed"])
 
 
-def test_resume_skips_existing_translations_logic():
-    """Unit-level check matching product resume seed rules in translate_chat_openai.main."""
-    import translate_chat_openai as tr
-
-    messages = [
-        {"index": 0, "original": "[LUL]", "translation": ""},  # pure emote preserve
-        {"index": 1, "original": "hello", "translation": "你好"},  # done
-        {"index": 2, "original": "world", "translation": ""},  # todo
-        {"index": 3, "original": "again", "translation": "again"},  # keep-original still done
-    ]
-    translation_map = {}
-    todo = []
-    resume = True
-    for msg in messages:
-        idx = msg["index"]
-        original = msg.get("original", "")
-        if tr.should_preserve_original(original):
-            continue
-        existing = str(msg.get("translation", "") or "").strip()
-        # Product rule: any non-empty translation counts as done (incl. == original),
-        # only when progress is still compatible with this run's lang/context.
-        progress_compatible = True
-        trust_existing_json = bool(resume and progress_compatible)
-        if trust_existing_json and existing:
-            translation_map[idx] = existing
-            continue
-        if idx not in translation_map:
-            todo.append(idx)
-    assert translation_map == {1: "你好", 3: "again"}
-    assert todo == [2]
-
-
-def test_resume_retranslates_when_progress_lang_incompatible():
-    """Filled JSON must not block re-translate after target-language switch."""
-    messages = [
-        {"index": 1, "original": "hello", "translation": "你好"},
-        {"index": 2, "original": "world", "translation": "世界"},
-    ]
-    resume = True
-    progress_compatible = False  # lang/context wipe
-    trust_existing_json = bool(resume and progress_compatible)
-    translation_map = {}
-    todo = []
-    for msg in messages:
-        idx = msg["index"]
-        existing = str(msg.get("translation", "") or "").strip()
-        if trust_existing_json and existing:
-            translation_map[idx] = existing
-            continue
-        if idx not in translation_map:
-            todo.append(idx)
-    assert translation_map == {}
-    assert todo == [1, 2]
-
-
 def test_param_validation_helpers():
     import pytest
 

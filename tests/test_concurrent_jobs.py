@@ -164,43 +164,72 @@ def test_pipeline_accepts_job_plus_cli_media(tmp_path: Path, make_test_video):
     assert out.is_file()
 
 
-def test_promote_to_out_base_uses_job_unique_name_on_collision(tmp_path: Path):
-    """Unit-level simulation of concurrent promote basename collision."""
-    import shutil
+@pytest.mark.smoke
+def test_promote_to_out_base_uses_job_unique_name_on_collision(tmp_path: Path, make_test_video):
+    """End-to-end: two real runs promoting into the same out_base must not
+    overwrite each other's published file (second run uses a job-tagged name).
 
+    Exercises the real promote_to_out_base logic inside twitch_chat_burn.main,
+    including the Wave 2 publish-guard cleanup, via fast single-frame
+    --preview-mode runs instead of mirroring the heuristic in Python.
+    """
+    video = make_test_video(duration=2.0, fps=10)
+    html = ROOT / "tests" / "fixtures" / "twitchdownloader_chat.html"
+    if not html.is_file():
+        pytest.skip("fixture html missing")
     out_base = tmp_path / "out"
-    job_a = tmp_path / "job_1_111_aaa"
-    job_b = tmp_path / "job_2_222_bbb"
     out_base.mkdir()
+    # Job dirs must live under out-dir; each run still promotes its artifact
+    # up to out_base where the basename collision happens.
+    job_a = out_base / "job_test_a"
+    job_b = out_base / "job_test_b"
     job_a.mkdir()
     job_b.mkdir()
-    src_a = job_a / "clip_chat.mp4"
-    src_b = job_b / "clip_chat.mp4"
-    src_a.write_bytes(b"AAAA")
-    src_b.write_bytes(b"BBBB")
-    # First promote wins default name
-    first = out_base / "clip_chat.mp4"
-    shutil.copy2(src_a, first)
-    # Second should prefer unique name when default exists and is not samefile
-    base_name = "clip_chat.mp4"
-    promoted = out_base / base_name
-    assert promoted.is_file()
-    job_tag = job_b.name
-    stem, ext = os.path.splitext(base_name)
-    alt = out_base / f"{stem}__{job_tag}{ext}"
-    # Mimic production heuristic
-    try:
-        same = os.path.samefile(src_b, promoted)
-    except OSError:
-        same = False
-    assert not same
-    target = alt if not same else promoted
-    shutil.copy2(src_b, target)
-    assert first.read_bytes() == b"AAAA"
-    assert alt.read_bytes() == b"BBBB"
+
+    def run_preview(job_dir: Path) -> subprocess.CompletedProcess:
+        cmd = [
+            sys.executable,
+            str(SCRIPTS / "twitch_chat_burn.py"),
+            str(video),
+            str(html),
+            "--preview-frame",
+            "1.5",
+            "--out-dir",
+            str(out_base),
+            "--job-dir",
+            str(job_dir),
+            "--offset",
+            "0",
+            "--keep-temp",
+        ]
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=_env(),
+        )
+
+    r1 = run_preview(job_a)
+    assert r1.returncode == 0, (r1.stdout or "") + (r1.stderr or "")
+    default_name = f"{video.stem}_preview_1.5s.png"
+    published_a = out_base / default_name
+    assert published_a.is_file(), (r1.stdout or "") + (r1.stderr or "")
+    first_bytes = published_a.read_bytes()
+
+    r2 = run_preview(job_b)
+    assert r2.returncode == 0, (r2.stdout or "") + (r2.stderr or "")
+    # Collision: run A keeps the default name; run B publishes job-unique.
+    assert published_a.is_file()
+    assert published_a.read_bytes() == first_bytes
+    alt = out_base / f"{video.stem}_preview_1.5s__{job_b.name}.png"
+    assert alt.is_file(), (r2.stdout or "") + (r2.stderr or "")
+    assert "[concurrent]" in (r2.stdout or "")
+    # Wave 2 guard cleanup: publish lock file is removed after successful publish.
+    assert not list(out_base.glob(".*.publish.guard"))
 
 
-@pytest.mark.smoke
 @pytest.mark.max
 def test_concurrent_burns_shared_out_dir_isolated(tmp_path: Path, make_test_video):
     """Two burns, same --out-dir, default job dirs: both succeed with distinct job_*."""

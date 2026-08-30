@@ -146,34 +146,49 @@ class TestReviewRoundtrip:
 
 
 class TestEmotePlaceholderRemoval:
-    """Test that [emote] placeholders are removed when matching images exist."""
+    """[emote] placeholders are stripped from imported translations that match
+    real emote images, via the production apply_imported_translations."""
 
     def test_placeholder_removal_logic(self):
-        # The logic: given a translation text with [LUL] and the original message
-        # has an <img title="LUL">, the [LUL] should be removed from translation.
-        # We test the regex logic used in twitch_chat_burn.py
-        import re
+        import twitch_chat_burn as burn
 
-        # Simulate: original has emotes with titles ["LUL", "Hey", "xdx"]
-        emote_titles = {"LUL", "Hey", "xdx"}
+        def message(fragments):
+            return {"timestamp": 1.0, "author": "Alice", "fragments": fragments, "badges": []}
 
-        # Case 1: translation "[LUL] Hello world!" -> "Hello world!"
-        text = "[LUL] Hello world!"
-        for title in emote_titles:
-            text = re.sub(rf"\[{re.escape(title)}\]\s*", "", text)
-        assert text == "Hello world!", f"Got: {text!r}"
+        def translation_json(original, translation):
+            return {"messages": [{"index": 0, "original": original, "translation": translation}]}
 
-        # Case 2: translation "游戏不错 [LUL]" -> "游戏不错 "
-        text2 = "游戏不错 [LUL]"
-        for title in emote_titles:
-            text2 = re.sub(rf"\[{re.escape(title)}\]\s*", "", text2)
-        assert text2.strip() == "游戏不错", f"Got: {text2!r}"
+        # Case 1: "[LUL] Hello world!" with a real LUL emote -> placeholder removed.
+        chat = {"messages": [message([
+            {"type": "text", "text": ": hello "},
+            {"type": "emote", "class": "first-1", "title": "LUL"},
+            {"type": "text", "text": " hi"},
+        ])]}
+        replaced, stripped, _warnings = burn.apply_imported_translations(
+            chat, translation_json("hello [LUL] hi", "[LUL] Hello world!")
+        )
+        assert replaced == 1
+        assert stripped == 1
+        texts = [f["text"] for f in chat["messages"][0]["fragments"] if f["type"] == "text"]
+        assert any("Hello world!" in t for t in texts)
+        assert all("[LUL]" not in t for t in texts)
 
-        # Case 3: non-emote bracket [together] should remain
-        text3 = "[together] something"
-        for title in emote_titles:
-            text3 = re.sub(rf"\[{re.escape(title)}\]\s*", "", text3)
-        assert text3 == "[together] something", f"Got: {text3!r}"
+        # Case 2: non-emote bracket tokens stay untouched.
+        chat2 = {"messages": [message([{"type": "text", "text": ": something"}])]}
+        burn.apply_imported_translations(chat2, translation_json("something", "[together] something"))
+        assert chat2["messages"][0]["fragments"][0]["text"] == "[together] something"
+
+        # Case 3: translation that is only placeholders collapses to pure emote rows.
+        chat3 = {"messages": [message([
+            {"type": "emote", "class": "first-2", "title": "Hey"},
+        ])]}
+        replaced3, _s, _w = burn.apply_imported_translations(
+            chat3, translation_json("[Hey]", "[Hey]")
+        )
+        assert replaced3 == 1
+        assert chat3["messages"][0]["fragments"] == [
+            {"type": "emote", "class": "first-2", "title": "Hey"}
+        ]
 
 
 class TestRegressionGuards:
@@ -260,27 +275,11 @@ class TestTranslationCleaning:
     """Guard translate_chat_openai text cleanup against URL/path damage."""
 
     def _load_translator(self):
-        import importlib.util
-        import types
+        # helpers.load_module injects an openai stub only when the real
+        # package is unavailable (single shared implementation for the suite).
+        from helpers import load_module
 
-        # Avoid hard dependency on the real openai package during unit tests.
-        if "openai" not in sys.modules:
-            fake = types.ModuleType("openai")
-
-            class _OpenAI:
-                def __init__(self, *args, **kwargs):
-                    pass
-
-            fake.OpenAI = _OpenAI
-            sys.modules["openai"] = fake
-
-        spec = importlib.util.spec_from_file_location(
-            "translate_chat_openai",
-            str(SCRIPTS_DIR / "translate_chat_openai.py"),
-        )
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod
+        return load_module("translate_chat_openai", "translate_chat_openai.py")
 
     def test_clean_translation_text_keeps_urls_and_paths(self):
         mod = self._load_translator()

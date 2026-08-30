@@ -206,7 +206,7 @@ def test_review_export_includes_lint_columns(tmp_path: Path):
     assert data["messages"][0]["translation"] == "新译文"
 
 
-def test_lint_detects_token_loss():
+def test_lint_detects_token_loss(tmp_path: Path):
     import contextlib
     import io
 
@@ -222,18 +222,12 @@ def test_lint_detects_token_loss():
             }
         ]
     }
-    p = Path(__file__).resolve().parent / "fixtures" / "_tmp_lint.json"
+    p = tmp_path / "_tmp_lint.json"
     p.write_text(json.dumps(payload), encoding="utf-8")
-    try:
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            issues = pipeline.lint_translation(p)
-        codes = {i["code"] for i in issues}
-        assert "mention_lost" in codes
-        assert "url_lost" in codes
-        assert "bracket_token_lost" in codes
-    finally:
-        try:
-            p.unlink()
-        except OSError:
-            pass
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        issues = pipeline.lint_translation(p)
+    codes = {i["code"] for i in issues}
+    assert "mention_lost" in codes
+    assert "url_lost" in codes
+    assert "bracket_token_lost" in codes

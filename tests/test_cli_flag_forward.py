@@ -312,3 +312,81 @@ def test_unknown_kind_raises():
     except ValueError:
         raised = True
     assert raised
+
+
+# ---------------------------------------------------------------------------
+# PIPE-O6: job YAML 的 source_media_check 必须生效
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_cli_defaults_include_source_media_check():
+    import render_cn_chat as pipe
+
+    # 缺了这条，job 值会落进 apply_job_to_namespace 的 unknown-default 分支被静默丢弃
+    assert "source_media_check" in pipe.PIPELINE_CLI_DEFAULTS
+    assert pipe.PIPELINE_CLI_DEFAULTS["source_media_check"] == "fast"
+
+
+def test_job_field_aliases_accept_source_media_check():
+    import job_config as jc
+
+    assert jc._norm_key("source_media_check") == "source_media_check"
+    assert jc._norm_key("source-media-check") == "source_media_check"
+
+
+def test_job_source_media_check_applies_when_at_default():
+    import job_config as jc
+    import render_cn_chat as pipe
+
+    args = SimpleNamespace(source_media_check="fast")
+    applied = jc.apply_job_to_namespace(
+        args, {"source_media_check": "decode"}, cli_defaults=pipe.PIPELINE_CLI_DEFAULTS
+    )
+    assert "source_media_check" in applied
+    assert args.source_media_check == "decode"
+
+
+def test_job_source_media_check_respects_explicit_cli():
+    import job_config as jc
+    import render_cn_chat as pipe
+
+    args = SimpleNamespace(source_media_check="off")  # 非 argparse 默认值 → 视为显式
+    applied = jc.apply_job_to_namespace(
+        args, {"source_media_check": "decode"}, cli_defaults=pipe.PIPELINE_CLI_DEFAULTS
+    )
+    assert "source_media_check" not in applied
+    assert args.source_media_check == "off"
+
+
+def test_job_source_media_check_forwarded_to_media_gate(monkeypatch, tmp_path, capsys):
+    """job YAML 设 source_media_check: decode → 管线媒体门禁收到 decode。"""
+    import render_cn_chat as pipe
+
+    job = tmp_path / "style.yaml"
+    job.write_text("source_media_check: decode\n", encoding="utf-8")
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00\x00")
+    html = tmp_path / "chat.html"
+    html.write_text("<html></html>", encoding="utf-8")
+
+    seen: dict = {}
+    monkeypatch.setattr(
+        pipe, "validate_source_media", lambda v, *, mode, dry_run=False: seen.update(mode=mode)
+    )
+    monkeypatch.setattr(pipe, "resolve_font_paths", lambda *a, **k: ("font.ttf", "font-bold.ttf"))
+    monkeypatch.setattr(pipe, "run", lambda cmd, *a, **k: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "render_cn_chat.py",
+            str(video),
+            str(html),
+            "--render-original",
+            "--job",
+            str(job),
+        ],
+    )
+
+    assert pipe.main() is None
+    assert seen.get("mode") == "decode"

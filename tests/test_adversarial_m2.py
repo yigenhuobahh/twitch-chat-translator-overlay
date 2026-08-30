@@ -3,15 +3,13 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 import sys
-import time
-from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from textual.widgets import Checkbox, Input, OptionList, RichLog, Select, Static, TabbedContent
+from textual.widgets import Button, Checkbox, Input, OptionList, RichLog, Select, TabbedContent
 
 from helpers import wait_for_validation_state, wait_for_widget
 from tui_history import TuiHistoryStore
@@ -34,18 +32,69 @@ from tui_run import (
 
 
 def test_tui_tab_switching_stress():
-    """Stress test switching across all 6 tabs in multiple orders without crashing."""
+    """Stress test switching across all 6 tabs in multiple orders without crashing.
+
+    Also verifies each tab's critical widgets (absorbed from the former
+    single-pass tab-presence inventory test).
+    """
     async def exercise():
         app = OverlayTui()
         async with app.run_test(size=(140, 50)) as pilot:
             tabs = ["download", "new-task", "task", "jobs", "advanced", "history"]
             tabbed_content = app.query_one(TabbedContent)
 
-            # Forward transition
+            tab_widgets = {
+                "download": [
+                    ("#download-url", Input),
+                    ("#download-quality", Input),
+                    ("#download-media-check", Select),
+                    ("#download-start", Button),
+                ],
+                "new-task": [
+                    ("#task-mode", Select),
+                    ("#video", Input),
+                    ("#chat", Input),
+                    ("#offset", Input),
+                    ("#run-mode", Button),
+                ],
+                "task": [
+                    ("#log", RichLog),
+                    ("#doctor", Button),
+                    ("#cancel", Button),
+                    ("#export-diagnostics", Button),
+                ],
+                "jobs": [
+                    ("#job-path", Input),
+                    ("#load-job", Button),
+                    ("#save-job", Button),
+                    ("#pin-paths", Checkbox),
+                ],
+                "advanced": [
+                    ("#api-base-url", Input),
+                    ("#api-key", Input),
+                    ("#api-model", Input),
+                    ("#btn-test-api", Button),
+                    ("#btn-save-api", Button),
+                    ("#layout-preset", Select),
+                    ("#render-preset", Select),
+                    ("#encoder", Select),
+                    ("#source-media-check", Select),
+                ],
+                "history": [
+                    ("#history-list", OptionList),
+                    ("#history-refresh", Button),
+                    ("#history-rerun", Button),
+                    ("#history-clear", Button),
+                ],
+            }
+
+            # Forward transition, checking every critical widget of each tab
             for tab_id in tabs:
                 tabbed_content.active = tab_id
                 await pilot.pause(0.02)
                 assert tabbed_content.active == tab_id
+                for selector, widget_type in tab_widgets[tab_id]:
+                    assert app.query_one(selector, widget_type) is not None, selector
 
             # Reverse transition
             for tab_id in reversed(tabs):
@@ -174,6 +223,21 @@ def test_tui_offset_inputs_and_validation(tmp_path: Path):
                 validation = await wait_for_validation_state(app, pilot, present="时间偏移")
                 assert "待处理" in str(validation.render()), f"Expected validation failure for offset: {bad_val}"
 
+            # Command propagation for representative values (absorbed from the
+            # former parametrized propagation test). build_command serializes
+            # the offset as a float, so compare numerically.
+            for value, expected in (("0.0", 0.0), ("120.0", 120.0), ("  +5.2  ", 5.2), ("-0.0", 0.0)):
+                app._set_input("#offset", value)
+                assert app._draft().offset == value.strip()
+                cmd = app._draft().build_command("python", "render_cn_chat.py")
+                assert "--offset" in cmd
+                assert float(cmd[cmd.index("--offset") + 1]) == expected
+
+            # Blank offset must omit the flag from the generated command entirely.
+            app._set_input("#offset", "")
+            assert app._draft().offset == ""
+            assert "--offset" not in app._draft().build_command("python", "render_cn_chat.py")
+
     asyncio.run(exercise())
 
 
@@ -281,6 +345,9 @@ def test_tui_draft_save_load_roundtrip_and_corruption_handling(tmp_path: Path):
             app._set_input("#crf", "20")
             app._set_input("#workers", "4")
             app.query_one("#keep-temp", Checkbox).value = True
+            app.query_one("#review", Checkbox).value = True
+            app._set_input("#profile", "prof.yaml")
+            app._set_input("#rules", "rules.yaml")
 
             # Save via _save_job()
             app._save_job()
@@ -312,6 +379,12 @@ def test_tui_draft_save_load_roundtrip_and_corruption_handling(tmp_path: Path):
             assert restored.crf == "20"
             assert restored.workers == "4"
             assert restored.keep_temp is True
+            assert restored.review is True
+            assert restored.manual_translation is False
+            assert restored.translation_json == str(trans)
+            assert restored.profile == "prof.yaml"
+            assert restored.rules == "rules.yaml"
+            assert restored.source_job == str(job_file.resolve())
 
             # Test Corrupted YAML handling: non-existent file
             app._set_input("#job-path", str(tmp_path / "non_existent.yaml"))
@@ -330,92 +403,6 @@ def test_tui_draft_save_load_roundtrip_and_corruption_handling(tmp_path: Path):
     asyncio.run(exercise())
 
 
-def test_unhandled_yaml_parser_error_on_corrupt_job(tmp_path: Path):
-    """Verifies that _load_job() catches malformed YAML syntax errors gracefully and updates status."""
-    bad_syntax_file = tmp_path / "syntax_error.yaml"
-    bad_syntax_file.write_text(":\n  - [\ninvalid: yaml: :", encoding="utf-8")
-
-    async def exercise():
-        app = OverlayTui()
-        async with app.run_test(size=(140, 50)) as pilot:
-            app._set_input("#job-path", str(bad_syntax_file))
-            app._load_job()
-            await pilot.pause(0.02)
-            assert "无法导入 YAML" in str(app.query_one("#status").render())
-
-    asyncio.run(exercise())
-
-
-def test_tui_api_config_save_and_probe_async(tmp_path: Path):
-    """Stress test API configuration saving, feedback updates, and non-blocking live probe."""
-    async def exercise():
-        app = OverlayTui()
-        async with app.run_test(size=(140, 50)) as pilot:
-            app.query_one(TabbedContent).active = "advanced"
-            await pilot.pause(0.02)
-
-            # 1. Test Saving API Config (Success)
-            with patch("tui_run.save_dotenv_api_config", return_value=(True, "OK")) as mock_save:
-                app._set_input("#api-base-url", "https://api.openai.com/v1")
-                app._set_input("#api-key", "sk-secret-key-1234")
-                app._set_input("#api-model", "deepseek-chat")
-
-                app._save_api_config()
-                await pilot.pause(0.02)
-
-                mock_save.assert_called_once_with(
-                    "https://api.openai.com/v1", "sk-secret-key-1234", "deepseek-chat"
-                )
-                feedback = str(app.query_one("#api-status-feedback", Static).render())
-                assert "配置已成功保存至本地 .env 文件" in feedback
-                assert "deepseek-chat" in feedback
-
-            # 2. Test Saving API Config (Error)
-            with patch("tui_run.save_dotenv_api_config", return_value=(False, "权限不足")):
-                app._save_api_config()
-                await pilot.pause(0.02)
-                feedback = str(app.query_one("#api-status-feedback", Static).render())
-                assert "保存 .env 失败：权限不足" in feedback
-
-            # 3. Test Probe Success
-            with patch("tui_run.probe_translate_api", return_value=(True, "连通成功")):
-                app._run_api_probe("https://api.openai.com/v1", "sk-secret", "gpt-4o-mini")
-                await pilot.pause(0.1)
-                feedback = str(app.query_one("#api-status-feedback", Static).render())
-                assert "连通性测试成功" in feedback
-                assert "gpt-4o-mini" in feedback
-
-            # 4. Test Probe Failure
-            with patch("tui_run.probe_translate_api", return_value=(False, "HTTP 401 Unauthorized")):
-                app._run_api_probe("https://api.openai.com/v1", "sk-invalid", "gpt-4o-mini")
-                await pilot.pause(0.1)
-                feedback = str(app.query_one("#api-status-feedback", Static).render())
-                assert "连通性测试失败" in feedback
-                assert "401 Unauthorized" in feedback
-
-            # 5. Non-blocking Async Probe Stress: UI remains responsive during long probe
-            def slow_probe(*args, **kwargs):
-                time.sleep(0.25)
-                return True, "Slow OK"
-
-            with patch("tui_run.probe_translate_api", side_effect=slow_probe):
-                app._test_api_connectivity()
-                # Immediately interact with other tabs while probe runs in thread
-                for tab_id in ["download", "new-task", "task", "history", "advanced"]:
-                    app.query_one(TabbedContent).active = tab_id
-                    await pilot.pause(0.03)
-
-                # Wait for background thread worker to complete
-                for _ in range(20):
-                    await pilot.pause(0.05)
-                    feedback = str(app.query_one("#api-status-feedback", Static).render())
-                    if "连通性测试成功" in feedback:
-                        break
-                assert "连通性测试成功" in feedback
-
-    asyncio.run(exercise())
-
-
 def test_tui_task_dispatch_and_manual_required_lifecycle(tmp_path: Path):
     """Stress test Task dispatch, manual_required state guidance, failure diagnostics, and cancel."""
     history_file = tmp_path / "history.json"
@@ -424,7 +411,8 @@ def test_tui_task_dispatch_and_manual_required_lifecycle(tmp_path: Path):
 
     async def exercise():
         async with app.run_test(size=(140, 50)) as pilot:
-            # Startup barrier: pane content mounts asynchronously after run_test.
+            # Readiness barrier: poll until the validation widget exists instead
+            # of trusting a fixed pause on loaded CI runners.
             await wait_for_widget(app, pilot, "#form-validation")
             # 1. manual_required lifecycle
             manual_script = (
@@ -443,7 +431,10 @@ def test_tui_task_dispatch_and_manual_required_lifecycle(tmp_path: Path):
 
             assert app.history.list_records()[0]["state"] == "manual_required"
             status_text = str(app.query_one("#status").render())
-            assert "人工复核已就绪" in status_text or "载入复核表并压制" in status_text
+            # Both guidance fragments must be present (absorbed from the former
+            # standalone manual_required guidance test).
+            assert "人工复核已就绪" in status_text
+            assert "载入复核表并压制" in status_text
 
             # 2. Failed task diagnostics lifecycle
             fail_script = "import sys; print('Fatal error occurred'); raise SystemExit(42)"

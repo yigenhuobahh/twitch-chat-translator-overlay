@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import calendar
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -18,8 +20,20 @@ def run_meta_path(job_dir: str | Path) -> Path:
     return Path(job_dir) / "run_meta.json"
 
 
+def _local_fixed_utc_offset_sec() -> int:
+    """本地时区当前 UTC 偏移（秒）。进程内固定采样，不做历史 DST 推导。"""
+    return int(datetime.now().astimezone().utcoffset().total_seconds())
+
+
 def _parse_meta_time(value: Any) -> float | None:
-    """Parse run_meta timestamps to epoch seconds; None if unknown."""
+    """Parse run_meta timestamps to epoch seconds; None if unknown.
+
+    写入端（write_run_meta）是无时区的本地挂钟字符串。旧实现用 time.mktime 按
+    "该日期的 DST 规则"回推 epoch：DST 回退日同一挂钟出现两次，stale 判定可能
+    偏差 1 小时。这里改为固定无 DST 语义：统一用本地当前 UTC 偏移换算
+    （calendar.timegm 按 UTC 计秒再减偏移）。字符串格式保持不变，旧记录仍可
+    解析；对小时级的 stale 窗口，跨 DST 边界的残差可忽略。
+    """
     if value is None:
         return None
     if isinstance(value, (int, float)):
@@ -27,11 +41,13 @@ def _parse_meta_time(value: Any) -> float | None:
     text = str(value).strip()
     if not text:
         return None
+    offset = _local_fixed_utc_offset_sec()
     for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
         try:
-            return time.mktime(time.strptime(text[:19], fmt))
-        except (ValueError, OverflowError, OSError):
+            naive = datetime.strptime(text[:19], fmt)
+        except ValueError:
             continue
+        return float(calendar.timegm(naive.timetuple()) - offset)
     return None
 
 

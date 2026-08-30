@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import atexit
 import importlib.util
 import json
 import os
@@ -26,17 +27,36 @@ def utf8_env(extra: dict | None = None) -> dict:
     return env
 
 
+def _ensure_openai_importable() -> None:
+    """Guarantee ``import openai`` succeeds so translate_chat_openai can load.
+
+    The real package is imported (and cached) when installed. Only when it is
+    genuinely unavailable is a minimal stub injected, and that stub is
+    registered for removal at interpreter exit so it never outlives the
+    session or masks a later real installation.
+    """
+    try:
+        import openai  # noqa: F401
+        return
+    except ImportError:
+        pass
+    if "openai" in sys.modules:
+        return
+    fake = types.ModuleType("openai")
+
+    class _OpenAI:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    fake.OpenAI = _OpenAI
+    sys.modules["openai"] = fake
+    atexit.register(sys.modules.pop, "openai", None)
+
+
 def load_module(module_name: str, filename: str):
     """Load a scripts/*.py module by path, with light dependency stubs if needed."""
-    if module_name == "translate_chat_openai" and "openai" not in sys.modules:
-        fake = types.ModuleType("openai")
-
-        class _OpenAI:
-            def __init__(self, *args, **kwargs):
-                pass
-
-        fake.OpenAI = _OpenAI
-        sys.modules["openai"] = fake
+    if module_name == "translate_chat_openai":
+        _ensure_openai_importable()
 
     path = SCRIPTS_DIR / filename
     spec = importlib.util.spec_from_file_location(module_name, str(path))

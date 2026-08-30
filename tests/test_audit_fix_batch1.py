@@ -85,6 +85,7 @@ def test_compose_video_fails_fast_on_missing_frame(tmp_path: Path):
         burn.compose_video(str(video), str(frames), str(tmp_path), config, duration=1.0)
 
 
+@pytest.mark.smoke
 def test_validate_min_duration_floor_is_not_dead(make_test_video):
     """min_duration below expected must still allow a complete ~expected file."""
     burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
@@ -103,6 +104,7 @@ def test_validate_min_duration_floor_is_not_dead(make_test_video):
     assert ok, reason
 
 
+@pytest.mark.smoke
 def test_validate_rejects_too_long_with_tight_default_allowance(make_test_video):
     burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
     video = make_test_video(duration=3.0, fps=30)
@@ -253,6 +255,7 @@ def test_clean_imported_translation_preserves_url_and_drive():
     assert burn.clean_imported_translation("[12] hello", "user") == "hello"
 
 
+@pytest.mark.smoke
 def test_compose_publish_restores_bak_on_replace_failure(tmp_path: Path, make_test_video):
     """If out→.bak rename succeeded but partial→out replace fails, restore bak."""
     burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")

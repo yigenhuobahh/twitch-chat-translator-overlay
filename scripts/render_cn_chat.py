@@ -267,9 +267,11 @@ def pause_after_translation_for_review(
     Non-interactive / --yes / dry-run: prints paths and continues without blocking.
     """
     # Always refresh review tables so user has something to open.
+    # JSON 只解析一次、lint 只跑一次，两个导出共用同一份结果。
     try:
-        export_review_tsv(trans_json, review_tsv)
-        export_review_xlsx(trans_json, review_xlsx)
+        data, issue_map = _prepare_review_export(trans_json)
+        export_review_tsv(trans_json, review_tsv, data=data, issue_map=issue_map)
+        export_review_xlsx(trans_json, review_xlsx, data=data, issue_map=issue_map)
     except Exception as e:
         log(f"[WARN] 导出复核表失败（仍可继续渲染）: {e}")
 
@@ -507,6 +509,11 @@ def _parse_cli_segments(raw_segments) -> list[tuple[str, str]]:
 
 def _run_download_flow(args, *, runner: PipelineRunner | None = None) -> int:
     """CLI entry for --download: fetch VOD/clip + HTML via TwitchDownloaderCLI."""
+    if getattr(args, "dry_run", False):
+        # --download 在 _main 里先于 DRY_RUN 全局赋值执行，必须在此写侧拦截，
+        # 否则 --dry-run 也会真实请求 Twitch 并写出媒体文件。
+        print("[dry-run] 已跳过下载：--dry-run 不会真实下载视频/聊天 HTML。")
+        return 0
     from twitch_download import TwitchDownloadError, download_assets, download_assets_multi
 
     out_dir = Path(args.download_dir).resolve() if getattr(args, "download_dir", None) else None
@@ -677,6 +684,8 @@ def _fallback_manual_after_export(
     else:
         log("[手翻] 导出人工复核表（不调用 LLM；translation 列为空，请自行填写）…")
     try:
+        # 注意：这里保持两参调用。测试用严格签名 stub 替换导出函数，
+        # 预计算参数只在 _main 的导出路径传递。
         export_review_tsv(trans_json, review_tsv)
         export_review_xlsx(trans_json, review_xlsx)
     except Exception as e:
@@ -1079,25 +1088,28 @@ def load_profile(profile_path: Path):
     return "\n\n".join(context_parts), data
 
 
-def _review_issue_map(json_path: Path, max_chars: int = 90):
-    """Map message index -> (severity, codes, notes) from lint, without printing a full report."""
-    try:
-        raw = json_path.read_text(encoding="utf-8")
-        json.loads(raw)
-    except FileNotFoundError:
-        print(f"[WARN] 复核表 lint 跳过：找不到 {json_path}", flush=True)
-        return {}
-    except (OSError, UnicodeError, json.JSONDecodeError) as e:
-        # Do not fail export on bad JSON here; surface why lint columns are empty.
-        print(f"[WARN] 复核表 lint 跳过：无法解析 {json_path}: {e}", flush=True)
-        return {}
+def _review_issue_map(json_path: Path, max_chars: int = 90, data: dict | None = None):
+    """Map message index -> (severity, codes, notes) from lint, without printing a full report.
+
+    data: 调用方已解析好的翻译 JSON；缺省 None 时自行读盘解析（失败仅告警返回空表）。
+    """
+    if data is None:
+        try:
+            data = json.loads(json_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            print(f"[WARN] 复核表 lint 跳过：找不到 {json_path}", flush=True)
+            return {}
+        except (OSError, UnicodeError, json.JSONDecodeError) as e:
+            # Do not fail export on bad JSON here; surface why lint columns are empty.
+            print(f"[WARN] 复核表 lint 跳过：无法解析 {json_path}: {e}", flush=True)
+            return {}
     # Reuse lint rules quietly; suppress console noise via stdout redirect.
     import contextlib
     import io
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         try:
-            issues = lint_translation(json_path, report_path=None, max_chars=max_chars)
+            issues = lint_translation(json_path, report_path=None, max_chars=max_chars, data=data)
         except SystemExit:
             issues = []
         except Exception as e:
@@ -1122,9 +1134,20 @@ def _review_issue_map(json_path: Path, max_chars: int = 90):
     return by_index
 
 
-def _review_rows(json_path: Path, include_lint: bool = True, max_chars: int = 90):
-    data = json.loads(json_path.read_text(encoding="utf-8"))
-    issue_map = _review_issue_map(json_path, max_chars=max_chars) if include_lint else {}
+def _review_rows(
+    json_path: Path,
+    include_lint: bool = True,
+    max_chars: int = 90,
+    data: dict | None = None,
+    issue_map: dict | None = None,
+):
+    if data is None:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    if include_lint:
+        if issue_map is None:
+            issue_map = _review_issue_map(json_path, max_chars=max_chars, data=data)
+    else:
+        issue_map = {}
     rows = []
     for msg in data.get("messages", []):
         idx = msg.get("index", "")
@@ -1145,17 +1168,49 @@ def _review_rows(json_path: Path, include_lint: bool = True, max_chars: int = 90
     return rows
 
 
-def export_review_tsv(json_path: Path, review_path: Path):
-    """导出人工复核 TSV。translation 列可直接编辑后再导入。"""
+def _prepare_review_export(json_path: Path, max_chars: int = 90) -> tuple[dict, dict]:
+    """翻译 JSON 只解析一次、lint 只跑一次；结果供 TSV/XLSX 两个导出函数共用。"""
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    issue_map = _review_issue_map(json_path, max_chars=max_chars, data=data)
+    return data, issue_map
+
+
+def export_review_tsv(
+    json_path: Path,
+    review_path: Path,
+    *,
+    data: dict | None = None,
+    issue_map: dict | None = None,
+):
+    """导出人工复核 TSV。translation 列可直接编辑后再导入。
+
+    data/issue_map: 由 _prepare_review_export 预计算传入（JSON/lint 只算一次）；
+    缺省时函数内部自行计算。
+    """
+    if DRY_RUN:
+        log(f"[dry-run] 跳过复核表 TSV 写出: {review_path}")
+        return
     lines = ["index\ttimestamp\tauthor\toriginal\ttranslation\tlint_severity\tlint_codes\tlint_notes"]
-    for row in _review_rows(json_path, include_lint=True):
+    for row in _review_rows(json_path, include_lint=True, data=data, issue_map=issue_map):
         lines.append("\t".join(map(str, row)))
     review_path.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
     print(f"\n[人工复核] 已导出中英对照 TSV: {review_path}")
 
 
-def export_review_xlsx(json_path: Path, review_path: Path):
-    """导出带列宽、换行和冻结表头的人工复核 XLSX。"""
+def export_review_xlsx(
+    json_path: Path,
+    review_path: Path,
+    *,
+    data: dict | None = None,
+    issue_map: dict | None = None,
+):
+    """导出带列宽、换行和冻结表头的人工复核 XLSX。
+
+    data/issue_map: 与 export_review_tsv 相同的预计算入参；dry-run 下不写出。
+    """
+    if DRY_RUN:
+        log(f"[dry-run] 跳过复核表 XLSX 写出: {review_path}")
+        return
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Alignment, Font, PatternFill
@@ -1167,7 +1222,7 @@ def export_review_xlsx(json_path: Path, review_path: Path):
     ws.title = "review"
     header = ["index", "timestamp", "author", "original", "translation", "lint_severity", "lint_codes", "lint_notes"]
     ws.append(header)
-    for row in _review_rows(json_path, include_lint=True):
+    for row in _review_rows(json_path, include_lint=True, data=data, issue_map=issue_map):
         ws.append(row)
 
     header_fill = PatternFill("solid", fgColor="D9EAF7")
@@ -1323,14 +1378,25 @@ def _lint_issue(issues, idx, code, message, severity="WARN", original="", transl
     })
 
 
-def lint_translation(json_path: Path, report_path: Path | None = None, max_chars: int = 90, max_ratio: float = 2.8):
-    """检查翻译 JSON 中的常见可疑问题，返回 issue 列表。"""
+def lint_translation(
+    json_path: Path,
+    report_path: Path | None = None,
+    max_chars: int = 90,
+    max_ratio: float = 2.8,
+    data: dict | None = None,
+):
+    """检查翻译 JSON 中的常见可疑问题，返回 issue 列表。
+
+    data: 调用方已解析好的翻译 JSON（复核表导出等场景避免同一文件反复读盘解析）；
+    缺省 None 时从 json_path 读取。对外位置签名保持兼容。
+    """
     if not json_path.is_file():
         raise SystemExit(f"错误: 翻译 JSON 不存在: {json_path}")
-    try:
-        data = json.loads(json_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
-        raise SystemExit(f"错误: JSON 解析失败: {json_path}: {e}")
+    if data is None:
+        try:
+            data = json.loads(json_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"错误: JSON 解析失败: {json_path}: {e}")
 
     issues = []
     messages = data.get("messages")
@@ -1401,26 +1467,25 @@ def lint_translation(json_path: Path, report_path: Path | None = None, max_chars
         print("  未发现确定性规则问题。")
 
     if report_path:
-        lines = ["index\tseverity\tcode\tmessage\toriginal\ttranslation"]
-        for issue in issues:
-            row = [
-                str(issue["index"]),
-                issue["severity"],
-                issue["code"],
-                issue["message"],
-                str(issue.get("original", "")).replace("\t", " ").replace("\r", " ").replace("\n", " "),
-                str(issue.get("translation", "")).replace("\t", " ").replace("\r", " ").replace("\n", " "),
-            ]
-            lines.append("\t".join(row))
-        report_path.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
-        print(f"  质检报告: {report_path}")
+        if DRY_RUN:
+            # dry-run 不落盘：质检报告写出统一在写侧拦截（lint 计算本身只读，照常执行）。
+            print(f"  [dry-run] 跳过质检报告写出: {report_path}")
+        else:
+            lines = ["index\tseverity\tcode\tmessage\toriginal\ttranslation"]
+            for issue in issues:
+                row = [
+                    str(issue["index"]),
+                    issue["severity"],
+                    issue["code"],
+                    issue["message"],
+                    str(issue.get("original", "")).replace("\t", " ").replace("\r", " ").replace("\n", " "),
+                    str(issue.get("translation", "")).replace("\t", " ").replace("\r", " ").replace("\n", " "),
+                ]
+                lines.append("\t".join(row))
+            report_path.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
+            print(f"  质检报告: {report_path}")
 
     return issues
-
-
-def _doctor_script_invocation() -> str:
-    """Best-effort script or console-entry path for copy-paste hints."""
-    return current_cli_script()
 
 
 def doctor(args):
@@ -1497,15 +1562,27 @@ def doctor(args):
             fix=f"pip install {display}\n      或: pip install -r requirements.txt",
         )
 
-    if getattr(args, "font_path", None) and args.font_path != "auto":
-        check("常规字体", Path(args.font_path).is_file(), args.font_path, "用 --font-path 指定一个可用字体")
+    # 系统字体探测代价高：detect_cjk_font() 返回 (regular, bold) 元组，只调用一次，
+    # 常规/粗体两个 auto 分支按需取用。
+    auto_font: tuple[str | None, str | None] | None = None
+
+    def _auto_cjk_font():
+        nonlocal auto_font
+        if auto_font is None:
+            auto_font = detect_cjk_font()
+        return auto_font
+
+    font_path = getattr(args, "font_path", None)
+    if font_path and font_path != "auto":
+        check("常规字体", Path(font_path).is_file(), font_path, "用 --font-path 指定一个可用字体")
     elif getattr(args, "font_path", "auto") == "auto":
-        reg, _ = detect_cjk_font()
+        reg, _ = _auto_cjk_font()
         check("常规字体 (auto)", bool(reg), reg or "未检测到 CJK 字体", "用 --font-path 手动指定字体路径")
-    if getattr(args, "font_bold_path", None) and args.font_bold_path != "auto":
-        check("粗体字体", Path(args.font_bold_path).is_file(), args.font_bold_path, "用 --font-bold-path 指定一个可用字体")
+    font_bold_path = getattr(args, "font_bold_path", None)
+    if font_bold_path and font_bold_path != "auto":
+        check("粗体字体", Path(font_bold_path).is_file(), font_bold_path, "用 --font-bold-path 手动指定字体路径")
     elif getattr(args, "font_bold_path", "auto") == "auto":
-        _, bold = detect_cjk_font()
+        _, bold = _auto_cjk_font()
         check("粗体字体 (auto)", bool(bold), bold or "未检测到 CJK 字体", "用 --font-bold-path 手动指定字体路径")
 
     base_url = os.getenv("OPENAI_COMPAT_BASE_URL")
@@ -1638,7 +1715,7 @@ def doctor(args):
             min_ok, full_ok = print_readiness_report()
 
     # ---- 推荐下一步（可复制命令）----
-    script = _doctor_script_invocation()
+    script = current_cli_script()
     if fails:
         print("\n先处理 FAIL 项（上方「修复建议」可复制）：")
         for name in fails:
@@ -1705,6 +1782,10 @@ PIPELINE_CLI_DEFAULTS = {
     "list_jobs": False,
     "job": None,
     "mode": "auto",
+    # 与 argparse 的 --source-media-check 默认值一致；缺了这条，job YAML 的
+    # source_media_check 会落进 apply_job_to_namespace 的 unknown-default 分支
+    # （非 None/False 即跳过）而被静默丢弃。
+    "source_media_check": "fast",
     "workdir": None,
     "dry_run": False,
     "quiet": False,
@@ -1749,7 +1830,12 @@ PIPELINE_CLI_DEFAULTS = {
 
 
 def _cli_flag_present(*flags: str) -> bool:
-    """True if any of the given CLI flags appear in sys.argv (explicit user intent)."""
+    """True if any of the given CLI flags appear in sys.argv (explicit user intent).
+
+    已知限制: 不识别 argparse 的无歧义前缀缩写（如 ``--overlay-cod`` 代表
+    ``--overlay-codec``）。缩写形式会被判为"未显式传入"而走默认值分支——
+    只影响这里的显式性判断（例如 preview 降级检查），不影响 argparse 实际解析。
+    """
     argv = sys.argv[1:]
     for flag in flags:
         if flag in argv:
@@ -1788,6 +1874,15 @@ def apply_mode_defaults(args) -> list[str]:
                 applied.append("overlay_codec=png")
             else:
                 applied.append(name)
+        # 预览只为确认 offset/布局；未显式传 --source-media-check 时不要为
+        # 10 秒预览完整解码全片（显式传 decode 则尊重用户选择）。
+        if (
+            str(getattr(args, "source_media_check", "fast") or "").strip().lower() == "decode"
+            and not _cli_flag_present("--source-media-check")
+        ):
+            args.source_media_check = "fast"
+            applied.append("source_media_check=fast")
+            log("[preview] 预览模式输入检查降级为 fast（不完整解码全片）；如需完整解码请显式传 --source-media-check decode")
         return applied
 
     if mode == "translate":
@@ -2230,13 +2325,16 @@ def _main():
                 raise SystemExit(msg)
             if media_problems and getattr(args, "dry_run", False):
                 print("[job] 警告: " + " | ".join(str(p).splitlines()[0] for p in media_problems[:2]))
-            save_last_job(job_path)
+            if getattr(args, "dry_run", False):
+                # dry-run 不落盘：jobs/.last_job 也是真实写出，统一在写侧拦截。
+                print("[dry-run] 跳过记录 jobs/.last_job。")
+            else:
+                save_last_job(job_path)
         except SystemExit:
             # Preserve intentional exits (missing media / non-interactive).
             raise
         except (OSError, ValueError) as e:
             raise SystemExit(f"错误: {e}")
-    args._job_applied = set(job_applied)  # type: ignore[attr-defined]
 
     if args.layout_preset:
         try:
@@ -2481,8 +2579,9 @@ def _main():
             log("\n[dry-run] 跳过复核表导出和后续步骤。")
             return
         log("\n[2/2] 导出人工复核表（无需 LLM）")
-        export_review_tsv(trans_json, review_tsv)
-        export_review_xlsx(trans_json, review_xlsx)
+        data, issue_map = _prepare_review_export(trans_json)
+        export_review_tsv(trans_json, review_tsv, data=data, issue_map=issue_map)
+        export_review_xlsx(trans_json, review_xlsx, data=data, issue_map=issue_map)
         mark_manual_translation_required()
         print("\n[OK] 请优先编辑 XLSX 最后一列 translation：")
         print(f"     {review_xlsx}")
@@ -2594,8 +2693,13 @@ def _main():
             raise PipelineError("错误: 翻译质检存在 FAIL，请修复后再渲染；如需只查看报告，可单独运行 --lint-translation。")
 
     if args.review:
-        export_review_tsv(trans_json, review_tsv)
-        export_review_xlsx(trans_json, review_xlsx)
+        if DRY_RUN:
+            # dry-run 不落盘：复核表导出统一在写侧拦截（导出函数内部同样有守卫）。
+            log("\n[dry-run] 跳过复核表导出（TSV/XLSX 不会写出）。")
+        else:
+            data, issue_map = _prepare_review_export(trans_json)
+            export_review_tsv(trans_json, review_tsv, data=data, issue_map=issue_map)
+            export_review_xlsx(trans_json, review_xlsx, data=data, issue_map=issue_map)
         mark_manual_translation_required()
         print("  请优先编辑 XLSX 的最后一列 translation；TSV 仅作为兼容备份。")
         print("\n[OK] 已停在人工复核环节，尚未渲染视频。")

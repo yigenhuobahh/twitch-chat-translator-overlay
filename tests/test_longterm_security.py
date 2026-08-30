@@ -234,7 +234,10 @@ def test_translation_cache_identity_and_unique_temp_files(
     assert not list((tmp_path / "cache").glob("*.tmp"))
 
 
-def test_cache_write_failure_does_not_discard_model_result():
+def test_cache_write_failure_does_not_discard_model_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     import translate_chat_openai as tr
 
     class BrokenCache:
@@ -256,8 +259,8 @@ def test_cache_write_failure_does_not_discard_model_result():
             completions=SimpleNamespace(create=lambda **_kwargs: response)
         )
     )
-    tr.MODEL = "test-model"
-    tr.BASE_URL = "https://provider.invalid/v1"
+    monkeypatch.setattr(tr, "MODEL", "test-model")
+    monkeypatch.setattr(tr, "BASE_URL", "https://provider.invalid/v1")
 
     result = tr.translate_batch(
         client,

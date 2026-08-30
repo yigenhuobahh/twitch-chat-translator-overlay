@@ -307,6 +307,65 @@ def test_wizard_apply_extra_cli_path_overrides(tmp_path: Path):
     assert same is not session
 
 
+# ---------------------------------------------------------------------------
+# PIPE-O3: 拖放 job.yaml + 裸媒体路径不得导致 argparse "unrecognized arguments"
+# ---------------------------------------------------------------------------
+
+
+def test_wizard_split_bare_media_paths_strips_dropped_media(tmp_path: Path):
+    """裸媒体路径按现有后缀约定剥离；--flag 取值与不存在的路径保持原样。"""
+    import job_wizard as jw
+
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"x")
+    html = tmp_path / "c.html"
+    html.write_text("x", encoding="utf-8")
+    out_flag = tmp_path / "out.mp4"
+    out_flag.write_bytes(b"x")
+
+    overrides, rest = jw._split_bare_media_paths(
+        ["--output", str(out_flag), str(video), str(html), "--yes"]
+    )
+    assert overrides == {"video": str(video), "chat_html": str(html)}
+    assert rest == ["--output", str(out_flag), "--yes"]
+
+    # 不存在的裸媒体路径不劫持（留给管线给出明确报错）
+    missing = str(tmp_path / "missing.mp4")
+    overrides2, rest2 = jw._split_bare_media_paths([missing])
+    assert overrides2 == {}
+    assert rest2 == [missing]
+
+    # 空入参
+    assert jw._split_bare_media_paths(None) == ({}, [])
+
+
+def test_wizard_drag_drop_job_with_media_builds_clean_cli(tmp_path: Path, monkeypatch):
+    """拖放 job.yaml + 视频 + HTML：媒体进 session，CLI 只含一份位置参数。"""
+    import job_wizard as jw
+
+    job = tmp_path / "style.yaml"
+    job.write_text("mode: preview\nrender_original: true\n", encoding="utf-8")
+    video = tmp_path / "source.mp4"
+    video.write_bytes(b"video")
+    chat = tmp_path / "chat.html"
+    chat.write_text("<html></html>", encoding="utf-8")
+
+    captured: list[tuple[str, ...]] = []
+    monkeypatch.setattr(jw, "_run_pipeline", lambda *args: captured.append(args) or 0)
+    monkeypatch.setattr(jw, "save_last_job", lambda _path, *_a, **_k: None)
+    monkeypatch.setattr(jw, "_prompt", lambda _msg, _default=None: "")
+
+    rc = jw.run_drag_drop([str(job), str(video), str(chat)])
+    assert rc == 0
+    assert captured, "管线未被调用"
+    cmd = captured[0]
+    # 位置参数 video/chat 只出现一次（多出来会被 argparse 当 unrecognized arguments）
+    assert cmd.count(str(video)) == 1, cmd
+    assert cmd.count(str(chat)) == 1, cmd
+    assert cmd[:3] == ("--job", str(job), str(video)), cmd
+    assert str(chat) in cmd
+
+
 def test_wizard_maybe_clean_temp_after_run(tmp_path: Path, monkeypatch):
     import job_wizard as jw
     from process_util import make_job_dir

@@ -48,6 +48,7 @@ def test_expected_compose_duration_ignores_lead_in_padding():
     assert burn.expected_compose_duration(10.0) == pytest.approx(10.0)
 
 
+@pytest.mark.smoke
 def test_validate_accepts_source_length_when_expected_is_source_not_source_plus_leadin(
     make_test_video,
 ):
@@ -74,6 +75,7 @@ def test_validate_accepts_source_length_when_expected_is_source_not_source_plus_
     assert "shorter" in reason_bad
 
 
+@pytest.mark.smoke
 def test_validate_min_duration_still_rejects_truncated_tail(make_test_video):
     burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
     video = make_test_video(duration=2.0, fps=30)
@@ -88,6 +90,7 @@ def test_validate_min_duration_still_rejects_truncated_tail(make_test_video):
     assert "shorter" in reason
 
 
+@pytest.mark.smoke
 def test_resolve_source_av_timing_fields(make_test_video):
     burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
     video = make_test_video(duration=2.0, fps=30)

@@ -75,14 +75,21 @@ def isolate_environment():
         ("0", 0.0),
         ("0.0", 0.0),
         ("-0.0", -0.0),
+        ("+0", 0.0),
         ("12.5", 12.5),
         ("-12.5", -12.5),
         ("  3.14159  ", 3.14159),
         ("-3600", -3600.0),
         ("604800.0", 604800.0),
         ("-604800.0", -604800.0),
+        ("604800", 604800.0),
+        ("-604800", -604800.0),
+        ("604800.000", 604800.0),
+        ("-604800.000", -604800.0),
         ("0.000001", 0.000001),
         ("-0.000001", -0.000001),
+        ("0.0001", 0.0001),
+        ("-0.0001", -0.0001),
     ],
 )
 def test_adversarial_offset_valid_inputs(tmp_path: Path, offset_input: str, expected_float: float):
@@ -99,7 +106,7 @@ def test_adversarial_offset_valid_inputs(tmp_path: Path, offset_input: str, expe
     problems = draft.validate(check_api=False, check_environment=False)
     assert not problems, f"Valid offset {offset_input!r} caused validation error: {problems}"
     fields = draft.to_job_fields()
-    if offset_input.strip() in ("0", "0.0", "-0.0"):
+    if offset_input.strip() in ("0", "0.0", "-0.0", "+0"):
         assert "offset" in fields
         assert fields["offset"] == 0.0
     else:
@@ -118,12 +125,18 @@ def test_adversarial_offset_valid_inputs(tmp_path: Path, offset_input: str, expe
     [
         ("not_a_number", "数字"),
         ("12.5.6", "数字"),
+        (" --5 ", "数字"),
         ("NaN", "7 天"),
         ("Infinity", "7 天"),
         ("-Infinity", "7 天"),
+        ("inf", "7 天"),
+        ("-inf", "7 天"),
         ("604801.0", "7 天"),
         ("-604801.0", "7 天"),
+        ("604800.1", "7 天"),
+        ("-604800.1", "7 天"),
         ("1e10", "7 天"),
+        ("-1e20", "7 天"),
     ],
 )
 def test_adversarial_offset_invalid_inputs(tmp_path: Path, invalid_offset: str, expected_err_keyword: str):
@@ -263,6 +276,23 @@ def test_adversarial_save_dotenv_special_characters(tmp_path: Path):
     assert os.environ.get("OPENAI_COMPAT_API_KEY") == special_key
     assert os.environ.get("OPENAI_COMPAT_MODEL") == special_model
 
+    # Adversarial values in URL/key/model positions must survive verbatim
+    # (absorbed from the former dedicated special-characters save test).
+    adversarial_url = "https://api.example.com/v1/custom?query=test#frag"
+    adversarial_key = "sk-special_!@#$%^&*()_+-=[]{}|;:,.<>?"
+    adversarial_model = "deepseek/deepseek-chat-v3:latest"
+    ok2, msg2 = save_dotenv_api_config(
+        base_url=adversarial_url,
+        api_key=adversarial_key,
+        model=adversarial_model,
+        env_path=env_file,
+    )
+    assert ok2 is True
+    content = env_file.read_text(encoding="utf-8")
+    assert f"OPENAI_COMPAT_BASE_URL={adversarial_url}" in content
+    assert f"OPENAI_COMPAT_API_KEY={adversarial_key}" in content
+    assert f"OPENAI_COMPAT_MODEL={adversarial_model}" in content
+
 
 def test_adversarial_save_dotenv_multiline_and_comment_chaos(tmp_path: Path):
     env_file = tmp_path / ".env"
@@ -380,6 +410,9 @@ def test_adversarial_tui_job_load_corrupt_file_handling(tmp_path: Path):
             app._load_job()
             await pilot.pause()
             status_text = str(app.query_one("#status", Static).render())
-            assert "无法导入 YAML" in status_text or "YAML" in status_text
+            # Binary garbage and malformed YAML syntax must both land on the
+            # explicit import-failure message (absorbed from the former
+            # dedicated malformed-YAML-syntax test).
+            assert "无法导入 YAML" in status_text
 
     asyncio.run(exercise())

@@ -362,6 +362,14 @@ def _open_folder(path: Path) -> None:
         print(f"无法打开文件夹: {e}")
 
 
+def _safe_mtime(path: Path) -> float:
+    """stat 的 TOCTOU 安全版：glob 与 stat 之间文件消失时返回 0（排在最后）。"""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def _infer_output_from_job(job: dict, job_path: Path) -> Path | None:
     """Best-effort final output path from job fields."""
     out = job.get("output")
@@ -381,11 +389,53 @@ def _infer_output_from_job(job: dict, job_path: Path) -> Path | None:
             for pat in (f"{vp.stem}_chat.mp4", "*_chat.mp4"):
                 hits = list(wd.glob(pat)) if wd.is_dir() else []
                 if hits:
-                    return max(hits, key=lambda x: x.stat().st_mtime)
+                    return max(hits, key=_safe_mtime)
     # last resort: recent mp4 next to job
     parent = job_path.parent
-    hits = sorted(parent.glob("*_chat.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
+    hits = sorted(parent.glob("*_chat.mp4"), key=_safe_mtime, reverse=True)
     return hits[0] if hits else None
+
+
+# extra_cli 中"flag + 独立取值"形式的路径选项；其取值不会被误认成裸媒体路径。
+_EXTRA_VALUE_FLAGS = frozenset({"--output", "--workdir", "--translation-json"})
+_CHAT_EXTENSIONS = frozenset({".html", ".htm"})
+
+
+def _split_bare_media_paths(extra_cli: list[str] | None) -> tuple[dict[str, str], list[str]]:
+    """把 extra_cli 里的裸媒体路径剥离成本次 session 的 video/chat_html 覆盖。
+
+    拖放 job.yaml + 媒体文件时，裸路径若留在 extra_cli 会被原样转发给管线；
+    而管线位置参数 video/chat_html 已由 session 提供，argparse 会报
+    "unrecognized arguments" 并退出 2。这里沿用 run_drag_drop 的现有后缀约定
+    （_VIDEO_EXTENSIONS / .html+.htm），只把真实存在的裸文件识别为媒体；
+    返回 (覆盖字段, 其余参数)。
+    """
+    overrides: dict[str, str] = {}
+    remaining: list[str] = []
+    skip_value = False
+    for raw in list(extra_cli or []):
+        s = str(raw)
+        if skip_value:
+            skip_value = False
+            remaining.append(s)
+            continue
+        if s.startswith("-"):
+            # 已知 "flag 取值" 形式：跳过紧跟的取值 token，避免把 --output 的值当视频。
+            if "=" not in s and s in _EXTRA_VALUE_FLAGS:
+                skip_value = True
+            remaining.append(s)
+            continue
+        suffix = Path(s).suffix.lower()
+        target: str | None = None
+        if suffix in _VIDEO_EXTENSIONS and "video" not in overrides:
+            target = "video"
+        elif suffix in _CHAT_EXTENSIONS and "chat_html" not in overrides:
+            target = "chat_html"
+        if target is not None and Path(s).is_file():
+            overrides[target] = s
+            continue
+        remaining.append(s)
+    return overrides, remaining
 
 
 def _apply_extra_cli_path_overrides(
@@ -680,6 +730,9 @@ def _prompt_session_media(
 
 def _confirm_and_run_job(path: Path, extra_cli: list[str] | None = None) -> int:
     path = Path(path)
+    # 拖放 job.yaml + 媒体文件：先把裸媒体路径剥离进本次 session 字段，
+    # 否则它们会被原样转发，管线 argparse 报 unrecognized arguments 退出 2。
+    media_overrides, extra_cli = _split_bare_media_paths(extra_cli)
     print(f"\n将使用配置: {path.name}")
     print(f"  {summarize_job(path)}")
     try:
@@ -689,8 +742,9 @@ def _confirm_and_run_job(path: Path, extra_cli: list[str] | None = None) -> int:
         return 1
 
     # Paths: pinned in YAML → use file; missing/commented → ask for this run only (not written back).
+    # 剥离出的媒体路径作为 prior 传入，可跳过重复询问。
     try:
-        session = _prompt_session_media(job)
+        session = _prompt_session_media(job, prior=dict(media_overrides) or None)
     except (EOFError, FileNotFoundError) as e:
         print(f"[FAIL] {e}")
         print("  已取消本次运行（配置文件未改动）。")
@@ -703,6 +757,10 @@ def _confirm_and_run_job(path: Path, extra_cli: list[str] | None = None) -> int:
             return 1
         print("已取消")
         return 0
+
+    # 拖放的媒体文件是本次显式输入：与管线位置参数同权，覆盖配置固定路径。
+    if media_overrides:
+        session.update(media_overrides)
 
     # Apply CLI path overrides before the confirm screen so the plan matches the pipeline.
     if extra_cli:
@@ -756,6 +814,9 @@ def _confirm_and_run_job(path: Path, extra_cli: list[str] | None = None) -> int:
             print("已取消")
             return 1 if not _stdin_is_interactive() else 0
         session = session2
+        # 拖放媒体优先于编辑后新固定的 YAML 路径（与首次应用保持同权）。
+        if media_overrides:
+            session.update(media_overrides)
         if extra_cli:
             session = _apply_extra_cli_path_overrides(session, extra_cli)
 

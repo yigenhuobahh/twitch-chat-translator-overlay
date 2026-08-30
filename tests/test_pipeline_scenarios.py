@@ -332,6 +332,7 @@ class TestDoctorAndCliGuards:
         assert r.returncode == 0, out
         assert ("Doctor" in out) or ("诊断" in out) or ("[OK]" in out)
 
+    @pytest.mark.smoke
     def test_render_cn_chat_dry_run_export_only(self, make_test_video, tmp_path: Path):
         video = make_test_video(duration=2.0, fps=30)
         html = FIXTURES_DIR / "twitchdownloader_chat.html"
@@ -392,6 +393,7 @@ class TestTimingAndLeadIn:
             fps = float(rate)
         assert 29.0 <= fps <= 31.0, rate
 
+    @pytest.mark.smoke
     def test_validate_rejects_too_short_output(self, make_test_video, tmp_path: Path):
         import twitch_chat_burn as burn
 
@@ -402,6 +404,7 @@ class TestTimingAndLeadIn:
         assert not ok
         assert "shorter than expected" in reason
 
+    @pytest.mark.smoke
     def test_lead_in_expected_duration_is_render_window_not_source_plus_padding(self, tmp_path: Path):
         """
         Lead-in rewrites start times; published duration target is the render window
