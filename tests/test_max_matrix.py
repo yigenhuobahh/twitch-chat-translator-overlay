@@ -601,6 +601,60 @@ def test_mode_defaults_matrix():
     )
     assert "render_only_guard" in apply_mode_defaults(c)
 
+    # --review 不再豁免 --mode render 守卫（否则会走完整翻译路径、产生 API 费用）
+    e = SimpleNamespace(
+        mode="render",
+        render_original=False,
+        reuse_translation=False,
+        skip_translate=False,
+        manual_translation=False,
+        review=True,
+        review_done=False,
+        lint_translation=None,
+    )
+    with pytest.raises(PipelineError):
+        apply_mode_defaults(e)
+
+    # lint sentinel（--lint-translation 不带值）同样不能豁免守卫
+    f = SimpleNamespace(
+        mode="render",
+        render_original=False,
+        reuse_translation=False,
+        skip_translate=False,
+        manual_translation=False,
+        review=False,
+        review_done=False,
+        lint_translation="__PIPELINE__",
+    )
+    with pytest.raises(PipelineError):
+        apply_mode_defaults(f)
+
+    # 显式 lint 路径：短路为"仅质检"，不触发守卫错误
+    g = SimpleNamespace(
+        mode="render",
+        render_original=False,
+        reuse_translation=False,
+        skip_translate=False,
+        manual_translation=False,
+        review=False,
+        review_done=False,
+        lint_translation="given/translation.json",
+    )
+    assert "render_lint_only" in apply_mode_defaults(g)
+
+    # --review-done 被强制要求搭配 --reuse-translation，安全豁免保留
+    h = SimpleNamespace(
+        mode="render",
+        render_original=False,
+        reuse_translation=True,
+        skip_translate=False,
+        manual_translation=False,
+        review=False,
+        review_done=True,
+        lint_translation=None,
+    )
+    assert "render_only_guard" in apply_mode_defaults(h)
+
     d = SimpleNamespace(mode="translate")
     assert "stop_after_translate" in apply_mode_defaults(d)
 

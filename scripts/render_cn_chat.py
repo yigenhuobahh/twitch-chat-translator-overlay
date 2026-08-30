@@ -982,6 +982,27 @@ def publish_output(src_path: Path, dst_path: Path, *, backup_prev: bool = True):
     return dst_path
 
 
+def atomic_write_json(path: Path, data) -> None:
+    """原子写翻译 JSON：先写同目录唯一临时文件，成功后 os.replace 原子替换。
+
+    中断（Ctrl+C / 断电 / 崩溃）不会截断已有 JSON，避免丢掉已花的 LLM 译文
+    与人工复核结果。参考 translate_chat_openai.save_json 与 run_meta 的既有模式。
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            json.dump(data, file, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def normalize_translation(json_path: Path, rules_path: Path | None = None):
     if not rules_path:
         print("\n[规则清洗] 未指定 --rules，跳过规则清洗。")
@@ -1006,7 +1027,7 @@ def normalize_translation(json_path: Path, rules_path: Path | None = None):
                 changed.append((msg.get("index"), rule["name"], original, msg.get("translation"), rule["translation"]))
                 msg["translation"] = rule["translation"]
                 break
-    json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(json_path, data)
     if changed:
         print(f"\n[规则清洗] 已应用 {len(changed)} 条修改，规则文件: {rules_path}")
         for idx, rule_name, original, old, new in changed:
@@ -1230,7 +1251,7 @@ def import_review_xlsx(json_path: Path, review_path: Path):
         if by_index[idx].get("translation") != translation:
             by_index[idx]["translation"] = translation
             changed += 1
-    json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(json_path, data)
     print(f"\n[人工复核] 已从 XLSX 回写 {changed} 条修改到: {json_path}")
 
 
@@ -1276,14 +1297,19 @@ def import_review_tsv(json_path: Path, review_path: Path):
         if by_index[idx].get("translation") != translation:
             by_index[idx]["translation"] = translation
             changed += 1
-    json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(json_path, data)
     print(f"\n[人工复核] 已从 TSV 回写 {changed} 条修改到: {json_path}")
 
 
 LINT_URL_RE = re.compile(r"https?://\S+")
 LINT_MENTION_RE = re.compile(r"@[A-Za-z0-9_]+")
 LINT_BRACKET_TOKEN_RE = re.compile(r"\[[^\]]+\]")
-LINT_PURE_EMOTE_RE = re.compile(r"^(?:\s*\[[^\]]+\]\s*)+$")
+# 消歧空白：旧写法 (?:\s*\[[^\]]+\]\s*)+ 的 \s* 与 [^\]]+（可吞空格）存在歧义，
+# 对"尾部未闭合 token"的输入会灾难性回溯（n=26 约 5 秒、n=30 约 81 秒）。
+# 改为 token 之间必须出现显式分隔空白，回溯线性，语义不变（纯 [emote] 序列，
+# 含多空格分隔与首尾空白）。注意：此处与 translate_chat_openai 的 PURE_PRESERVE_RE
+# 规则不同，不要互相照抄。
+LINT_PURE_EMOTE_RE = re.compile(r"^\s*\[[^\]]+\](?:\s+\[[^\]]+\])*\s*$")
 
 
 def _lint_issue(issues, idx, code, message, severity="WARN", original="", translation=""):
@@ -1771,24 +1797,29 @@ def apply_mode_defaults(args) -> list[str]:
         return applied
 
     if mode == "render":
+        # 显式 lint 路径：只质检用户指定的翻译 JSON，不进入渲染流程（见 _main 短路）。
+        lint_target = getattr(args, "lint_translation", None)
+        if lint_target and lint_target != "__PIPELINE__":
+            args._mode_render_lint_only = True  # type: ignore[attr-defined]
+            applied.append("render_lint_only")
+            return applied
         # Allow paths that do not call the live translation API.
+        # 注意：review / lint sentinel 不豁免——它们在不带 --reuse-translation 时
+        # 仍会走"导出 JSON -> API probe -> LLM 翻译"的完整路径。review_done 安全：
+        # 它被强制要求搭配 --reuse-translation。
         needs_live_api = not (
             bool(getattr(args, "render_original", False))
             or bool(getattr(args, "reuse_translation", False))
             or bool(getattr(args, "skip_translate", False))
             or bool(getattr(args, "manual_translation", False))
-            or bool(getattr(args, "review", False))
             or bool(getattr(args, "review_done", False))
-            or (
-                getattr(args, "lint_translation", None)
-                and getattr(args, "lint_translation", None) != "__PIPELINE__"
-            )
         )
         if needs_live_api:
             raise PipelineError(
                 "错误: --mode render 不会调用翻译 API。"
                 "请使用 --reuse-translation（已有翻译 JSON）或 --render-original，"
-                "或改用 --mode full / --mode auto 做完整翻译出片。"
+                "或改用 --mode full / --mode auto 做完整翻译出片；"
+                "翻译后人工复核请用 --mode full --review。"
             )
         applied.append("render_only_guard")
         return applied
@@ -2287,6 +2318,14 @@ def _main():
     DRY_RUN = args.dry_run
     VERBOSE = args.verbose
     QUIET = args.quiet
+    if getattr(args, "_mode_render_lint_only", False):
+        # --mode render --lint-translation <路径>：只质检用户指定的翻译 JSON，
+        # 不导出、不翻译、不渲染；以质检结果（是否有 FAIL）作为退出码。
+        lint_path = Path(args.lint_translation).resolve()
+        report_path = Path(args.lint_report).resolve() if args.lint_report else None
+        log(f"[mode=render] 仅质检翻译 JSON，不渲染视频: {lint_path}")
+        issues = lint_translation(lint_path, report_path=report_path, max_chars=args.lint_max_chars)
+        raise SystemExit(1 if any(i["severity"] == "FAIL" for i in issues) else 0)
     if args.lint_translation and args.lint_translation != "__PIPELINE__" and not args.video and not args.chat_html:
         lint_path = Path(args.lint_translation).resolve()
         report_path = Path(args.lint_report).resolve() if args.lint_report else None
@@ -2546,8 +2585,11 @@ def _main():
             import_review_tsv(trans_json, review_tsv)
 
     if args.lint_translation:
+        # sentinel 表示"检查本次流水线产出的 trans_json"；显式路径则尊重用户指定，
+        # 不得忽略（否则用户拿到的质检报告对不上自己传的文件）。
+        lint_target = trans_json if args.lint_translation == "__PIPELINE__" else Path(args.lint_translation).resolve()
         report_path = Path(args.lint_report).resolve() if args.lint_report else None
-        issues = lint_translation(trans_json, report_path=report_path, max_chars=args.lint_max_chars)
+        issues = lint_translation(lint_target, report_path=report_path, max_chars=args.lint_max_chars)
         if any(issue["severity"] == "FAIL" for issue in issues):
             raise PipelineError("错误: 翻译质检存在 FAIL，请修复后再渲染；如需只查看报告，可单独运行 --lint-translation。")
 
@@ -2595,6 +2637,9 @@ def _main():
             burn=burn,
         )
         if action == "stop":
+            # 与 --review 相同契约：停在人工环节必须发布 manual_required 终态，
+            # 否则结果清单会误报 succeeded（看起来像出片成功）。
+            mark_manual_translation_required()
             return
         # If user edited XLSX during the pause, pull changes back into JSON.
         if review_xlsx.is_file() and not getattr(args, "yes", False) and _stdin_is_interactive():

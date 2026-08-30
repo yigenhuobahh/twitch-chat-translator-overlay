@@ -67,6 +67,9 @@ BATCH_SIZE = 10
 MAX_WORKERS = 4
 MAX_BATCH_CHARS = 16_000
 PROGRESS_SCHEMA_VERSION = 2
+# 进度写盘节流:距上次落盘超过该秒数、或累计满该批数,才允许下一次非强制落盘。
+PROGRESS_SAVE_MIN_INTERVAL_SEC = 30.0
+PROGRESS_SAVE_EVERY_N_BATCHES = 20
 TRANSLATION_PROVIDER = "openai-compatible"
 PROMPT_VERSION = 1
 DEFAULT_REQUEST_TIMEOUT = 300.0
@@ -328,7 +331,11 @@ def extract_json(text):
     return text.strip()
 
 
-PURE_PRESERVE_RE = re.compile(r"^(?:\s*\[[^\]]+\]\s*|\s*\d+\s*)+$")
+# 空白只归后一个 token 消费:若像旧写法那样每个分支两侧都带 \s*,
+# token 间空白的切分归属有歧义,整体失配时 fullmatch 会穷举 2^k 种
+# 组合(emote 刷屏即可触发灾难性回溯)。首尾 \s* 配合外层 strip 保留
+# 原有的宽松边界行为。
+PURE_PRESERVE_RE = re.compile(r"^\s*(?:\[[^\]]+\]|\d+)(?:\s+(?:\[[^\]]+\]|\d+))*\s*$")
 
 
 def should_preserve_original(text):
@@ -786,19 +793,39 @@ def main():
         with error_counts_lock:
             error_counts[kind] = error_counts.get(kind, 0) + 1
 
-    def persist_progress():
-        # Input fingerprints authenticate every row, including failed rows.
-        # JSON-value snapshots let resume recognize edits made after this save.
-        fps = {}
-        json_translation_fps = {}
-        for msg in data["messages"]:
-            if not isinstance(msg, dict):
-                continue
-            key = str(msg.get("index"))
-            fps[key] = fingerprint_message(msg)
-            json_translation_fps[key] = fingerprint_translation(
-                msg.get("translation", "")
+    # Input fingerprints authenticate every row, including failed rows.
+    # JSON-value snapshots let resume recognize edits made after this save.
+    # 指纹是输入哈希,批处理阶段不变:启动时算一次复用,避免每批对
+    # 全部消息重算指纹的 O(N²) 开销。JSON 快照在收尾清理循环改写
+    # translation 后、最终落盘前统一刷新一次。
+    message_fps = {}
+    json_translation_fps = {}
+    for msg in data["messages"]:
+        if not isinstance(msg, dict):
+            continue
+        key = str(msg.get("index"))
+        message_fps[key] = fingerprint_message(msg)
+        json_translation_fps[key] = fingerprint_translation(
+            msg.get("translation", "")
+        )
+
+    progress_save_state = {"last_save": None, "batches_since": 0}
+
+    def persist_progress(force: bool = False):
+        # 非强制落盘受时间/批次双阈值节流;失败、重试、收尾等关键
+        # 转换点由调用方传 force=True,保证进度不落后于关键状态。
+        if not force:
+            last_save = progress_save_state["last_save"]
+            due_by_time = last_save is None or (
+                time.monotonic() - last_save >= PROGRESS_SAVE_MIN_INTERVAL_SEC
             )
+            due_by_batches = (
+                progress_save_state["batches_since"] + 1
+                >= PROGRESS_SAVE_EVERY_N_BATCHES
+            )
+            if not (due_by_time or due_by_batches):
+                progress_save_state["batches_since"] += 1
+                return
         payload = {
             "schema_version": PROGRESS_SCHEMA_VERSION,
             "provider": TRANSLATION_PROVIDER,
@@ -808,11 +835,13 @@ def main():
             "target_language": args.target_language,
             "context": args.context,
             "translations": {str(k): v for k, v in translation_map.items()},
-            "fingerprints": fps,
+            "fingerprints": message_fps,
             "json_translation_fingerprints": json_translation_fps,
             "failed": sorted(failed_indexes),
         }
         save_progress(progress_file, payload)
+        progress_save_state["last_save"] = time.monotonic()
+        progress_save_state["batches_since"] = 0
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {}
@@ -847,13 +876,13 @@ def main():
                     with progress_lock:
                         for msg in batch:
                             failed_indexes.add(msg["index"])
-                        persist_progress()
+                        persist_progress(force=True)
             except Exception as e:
                 print(f"批次 {batch_num} 异常: {type(e).__name__}: {e}")
                 with progress_lock:
                     for msg in batch:
                         failed_indexes.add(msg["index"])
-                    persist_progress()
+                    persist_progress(force=True)
             completed_batches += 1
             emit_task_event(
                 "stage_progress",
@@ -902,7 +931,7 @@ def main():
             still_missing = [m["index"] for m in retry_batch if m["index"] not in translation_map]
             for idx in still_missing:
                 failed_indexes.add(idx)
-            persist_progress()
+            persist_progress(force=True)
 
     updated = 0
     preserved = 0
@@ -927,8 +956,16 @@ def main():
             missing += 1
             failed_indexes.add(idx)
 
+    # 收尾清理循环刚改写过 translation,最终落盘前刷新 JSON 快照指纹,
+    # 使 resume 能据此识别收尾后的人工复核改动。
+    for msg in data["messages"]:
+        if isinstance(msg, dict):
+            json_translation_fps[str(msg.get("index"))] = fingerprint_translation(
+                msg.get("translation", "")
+            )
+
     save_json(json_path, data)
-    persist_progress()
+    persist_progress(force=True)
     print()
     print(f"完成: 更新 {updated}/{total} 条翻译，保留原文 {preserved} 条")
     print(f"已保存: {json_path}")
@@ -943,7 +980,7 @@ def main():
         sys.exit(1)
     # Successful full run: keep progress file as audit trail, but clear failures.
     failed_indexes.clear()
-    persist_progress()
+    persist_progress(force=True)
 
 
 if __name__ == "__main__":

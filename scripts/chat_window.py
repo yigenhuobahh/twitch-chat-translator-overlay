@@ -208,6 +208,50 @@ def format_offset_diagnosis(diag: dict[str, Any] | None) -> str:
     return "\n".join(lines)
 
 
+def resolve_preview_frame_time(
+    preview_frame: float | None,
+    preview_clip: float | None,
+    video_duration: float | None,
+) -> tuple[float | None, str | None]:
+    """Clamp --preview-frame to the effective preview duration used by rendering.
+
+    The renderer clamps the preview instant to min(source_duration, preview_clip)
+    (OverlayScenePlan.preview_time). Chat filtering must use the same instant or
+    the kept messages all land past the rendered duration and the preview goes
+    empty (lanes) / misaligned (float).
+
+    Returns (preview_time, warning). warning is a Chinese one-liner when the
+    frame was clamped past the duration or when both --preview-frame and
+    --preview-clip are given; None means the instant is used as-is.
+    """
+    if preview_frame is None:
+        return None, None
+    t = max(0.0, float(preview_frame))
+    duration: float | None = None
+    if video_duration is not None and float(video_duration) > 0:
+        duration = float(video_duration)
+    clip_len: float | None = None
+    if preview_clip is not None and float(preview_clip) > 0:
+        clip_len = max(0.0, float(preview_clip))
+        duration = clip_len if duration is None else min(duration, clip_len)
+    warning = None
+    if duration is not None:
+        clamped = max(0.0, min(t, duration))
+        if clamped != t:
+            warning = (
+                f"--preview-frame {t:g}s 超出预览时长 {duration:g}s，"
+                f"已按 t={clamped:g}s 过滤聊天并渲染预览帧"
+            )
+        t = clamped
+        if clip_len is not None:
+            note = (
+                f"同时指定 --preview-clip 与 --preview-frame: "
+                f"聊天过滤与预览帧均取 t={t:g}s (预览时长 {duration:g}s)"
+            )
+            warning = f"{warning}；{note}" if warning else note
+    return t, warning
+
+
 def preview_window(
     preview_frame: float | None,
     preview_clip: float | None,

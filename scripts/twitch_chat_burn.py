@@ -90,6 +90,7 @@ from chat_window import (
     find_densest_preview_start,
     format_offset_diagnosis,
     preview_window,
+    resolve_preview_frame_time,
     trim_float_carry_in_messages,
 )
 from common_utils import (
@@ -3293,8 +3294,19 @@ def main():
         )
         config.preview_clip_start = clip_start
 
-    win_start, win_end = preview_window(
+    # REND-R1: filtering must use the same clamped instant the renderer uses
+    # (min(preview_frame, min(source_dur, clip))). Otherwise a frame past the
+    # preview duration keeps only messages the scheduler then drops → silent
+    # empty (lanes) / misaligned (float) preview.
+    preview_filter_t, preview_time_warning = resolve_preview_frame_time(
         args.preview_frame,
+        args.preview_clip,
+        video_dur,
+    )
+    if preview_time_warning:
+        print(f"  [WARN] {preview_time_warning}", flush=True)
+    win_start, win_end = preview_window(
+        preview_filter_t,
         args.preview_clip,
         window_life,
         clip_start=clip_start if args.preview_clip is not None else None,
@@ -3304,10 +3316,10 @@ def main():
     # Anchor the window at the frame instant so pre-window = history before t.
     if (
         stack_mode_cli == "float"
-        and args.preview_frame is not None
+        and preview_filter_t is not None
         and args.preview_clip is None
     ):
-        frame_t = max(0.0, float(args.preview_frame))
+        frame_t = max(0.0, float(preview_filter_t))
         win_start, win_end = frame_t, frame_t + 0.05
     if win_start is not None and win_end is not None and not args.export_translation:
         before_n = len(chat_data.get("messages") or [])
