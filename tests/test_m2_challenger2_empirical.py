@@ -188,7 +188,8 @@ def test_form_draft_custom_render_preset():
             app._populate_form_from_draft(draft)
             await pilot.pause(0.05)
 
-            preset_select = app.query_one("#render-preset", Select)
+            # Startup window: pane widgets mount asynchronously after run_test.
+            preset_select = await wait_for_widget(app, pilot, "#render-preset")
             assert preset_select.value == custom_preset
             assert app._read_form_draft().render_preset == custom_preset
 
