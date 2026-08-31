@@ -62,6 +62,17 @@ def test_yaml_syntax_error_is_wrapped_without_raw_parser_exception(tmp_path: Pat
         pipeline.load_yaml_rules(path)
 
 
+@pytest.mark.parametrize("label", ["规则", "Profile"])
+def test_missing_yaml_file_raises_pipeline_error_not_bare_system_exit(
+    tmp_path: Path, label: str
+) -> None:
+    """PARSE-N1: 上层 except PipelineError 必须能接住缺文件（PipelineError 继承
+    SystemExit，退出码链保持不变）。"""
+    missing = tmp_path / "nope.yaml"
+    with pytest.raises(pipeline.PipelineError, match="文件不存在"):
+        pipeline.load_yaml_file(missing, label)
+
+
 def test_valid_rules_yaml_still_loads(tmp_path: Path) -> None:
     path = _yaml(
         tmp_path,

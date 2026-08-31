@@ -579,10 +579,15 @@ def translate_batch(client, batch, batch_num, context, target_language, cache=No
     return cached_items or None
 
 
-def main():
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Twitch 弹幕翻译工具（OpenAI-compatible 后端）")
     parser.add_argument("json_path", help="twitch_chat_burn.py 导出的翻译 JSON 文件路径")
     parser.add_argument("--context", default="livestream chat", help="Background context for translation")
+    parser.add_argument(
+        "--context-file",
+        default=None,
+        help="UTF-8 文件，内容整体替代 --context（供超长 glossary/context 走文件传递，避开 Windows 32k 命令行上限；给出时优先于 --context）",
+    )
     parser.add_argument("--target-language", default="zh", help="Target language for translation (e.g. zh, ja, ko, en). Default: zh")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help=f"每批消息数（默认 {BATCH_SIZE}）")
     parser.add_argument("--workers", type=int, default=MAX_WORKERS, help=f"并发数（默认 {MAX_WORKERS}）")
@@ -629,8 +634,35 @@ def main():
         action="store_true",
         help="禁用磁盘缓存（即使设置了 --cache-dir）",
     )
+    return parser
 
+
+def resolve_translation_context(context: str, context_file: str | None) -> str:
+    """Return the effective translation context.
+
+    ``--context-file`` (UTF-8) entirely replaces ``--context``; it exists so
+    the pipeline can hand over glossary-sized contexts that would exceed the
+    Windows 32k-char CreateProcess command-line limit if passed via argv.
+    """
+    if context_file is None:
+        return context
+    path = Path(context_file)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise ValueError(f"--context-file 无法读取 {context_file}: {e}") from e
+    if not text.strip():
+        raise ValueError(f"--context-file 是空文件: {context_file}")
+    return text
+
+
+def main():
+    parser = build_arg_parser()
     args = parser.parse_args()
+    try:
+        args.context = resolve_translation_context(args.context, args.context_file)
+    except ValueError as e:
+        parser.error(str(e))
     resume = bool(args.resume) and (not args.no_resume)
 
     if args.batch_size < 1 or args.batch_size > 100:

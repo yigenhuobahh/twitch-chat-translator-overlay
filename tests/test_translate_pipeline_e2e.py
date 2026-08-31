@@ -221,6 +221,11 @@ def test_subprocess_translate_pipeline_against_stub_http_api(
     server_thread.start()
     try:
         port = server.server_address[1]
+        # PARSE-O5: glossary-sized context must reach the API through
+        # --context-file (argv would blow the Windows 32k-char limit).
+        context_file = tmp_path / "translation_context.txt"
+        context_marker = "游戏直播术语表标记E2E"
+        context_file.write_text((context_marker + "\n") + ("词条说明。" * 5000), encoding="utf-8")
         child_env = {
             **os.environ,
             "PYTHONIOENCODING": "utf-8",
@@ -233,6 +238,8 @@ def test_subprocess_translate_pipeline_against_stub_http_api(
             [
                 sys.executable, str(SCRIPTS_DIR / "translate_chat_openai.py"),
                 str(export_json),
+                "--context-file", str(context_file),
+                "--max-batch-chars", "200000",
                 "--workers", "2",
                 "--batch-size", "1",
                 "--target-language", "zh",
@@ -261,6 +268,8 @@ def test_subprocess_translate_pipeline_against_stub_http_api(
     assert all(req["auth"] == "Bearer stub-key" for req in requests)
     # flag propagation: --target-language zh is part of the prompt.
     assert all("zh" in req["prompt"] for req in requests)
+    # context propagation via --context-file: glossary marker reaches the API prompt.
+    assert all(context_marker in req["prompt"] for req in requests)
 
     translated = json.loads(export_json.read_text(encoding="utf-8"))
     rows = {m["index"]: m for m in translated["messages"]}

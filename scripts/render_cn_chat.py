@@ -768,6 +768,32 @@ def ensure_translate_api_or_fallback(
     raise PipelineError("错误: 翻译 API 多次重试仍不可用。")
 
 
+# Windows CreateProcess caps the *entire* command line at 32,767 chars; a
+# profile with a large glossary exceeds it before Python even starts. Above
+# this threshold the context travels via --context-file instead of argv
+# (8000 chars leaves a 4x margin for interpreter/script/JSON paths and flags).
+TRANSLATION_CONTEXT_ARGV_LIMIT = 8000
+TRANSLATION_MAX_BATCH_CHARS_CEILING = 200_000
+
+
+def _prepare_translation_context(context: str, workdir: Path | None) -> list[str]:
+    """Return the translator flags carrying *context* to the subprocess.
+
+    Context is part of every batch prompt, so a file-delivered context also
+    raises --max-batch-chars by its length — otherwise the translator's own
+    per-batch guard rejects the context right after we delivered it.
+    """
+    if len(context) <= TRANSLATION_CONTEXT_ARGV_LIMIT:
+        return ["--context", context]
+    base = Path(workdir) if workdir else Path.cwd()
+    base.mkdir(parents=True, exist_ok=True)
+    path = base / "translation_context.txt"
+    path.write_text(context, encoding="utf-8")
+    max_batch_chars = min(TRANSLATION_MAX_BATCH_CHARS_CEILING, len(context) + 16_000)
+    log(f"[info] 翻译 context 过长（{len(context)} 字符），改用文件传递: {path}")
+    return ["--context-file", str(path), "--max-batch-chars", str(max_batch_chars)]
+
+
 def handle_translate_run_failure(
     err: BaseException,
     *,
@@ -814,13 +840,13 @@ def handle_translate_run_failure(
     except EOFError:
         choice = "c"
     if choice in ("r", "retry", "重试"):
+        context_args = _prepare_translation_context(translation_context, workdir)
         run(
             [
                 sys.executable,
                 str(translator),
                 str(trans_json),
-                "--context",
-                translation_context,
+                *context_args,
                 "--target-language",
                 target_language,
                 "--batch-size",
@@ -849,10 +875,14 @@ def handle_translate_run_failure(
 def load_yaml_file(yaml_path: Path, label: str):
     try:
         import yaml
-    except ImportError:
-        raise SystemExit(f"错误: 使用 {label} 需要安装 PyYAML，请运行 pip install PyYAML")
+    except ImportError as e:
+        # PipelineError subclasses SystemExit, so CLI exit codes are unchanged
+        # while callers can catch every failure uniformly.
+        raise PipelineError(
+            f"错误: 使用 {label} 需要安装 PyYAML，请运行 pip install PyYAML"
+        ) from e
     if not yaml_path.is_file():
-        raise SystemExit(f"错误: {label} 文件不存在: {yaml_path}")
+        raise PipelineError(f"错误: {label} 文件不存在: {yaml_path}")
     try:
         data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, yaml.YAMLError) as e:
@@ -2630,9 +2660,10 @@ def _main():
 
         log(f"\n[2/3] 调用 OpenAI-compatible 翻译器: {trans_json}")
         try:
+            context_args = _prepare_translation_context(translation_context, workdir)
             run([
                 sys.executable, str(translator), str(trans_json),
-                "--context", translation_context,
+                *context_args,
                 "--target-language", args.target_language,
                 "--batch-size", str(args.batch_size),
                 "--workers", str(args.workers),
