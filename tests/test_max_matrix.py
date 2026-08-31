@@ -761,7 +761,12 @@ def test_gitignore_protects_user_jobs():
 
 
 def test_no_exec_burn_in_doctor_source():
-    text = (SCRIPTS / "render_cn_chat.py").read_text(encoding="utf-8")
+    # doctor 实现位于 doctor_check.py（自 render_cn_chat 搬出）；两处都不得
+    # exec 编译源码，且 doctor 侧仍保留对 chat_parser 的真实 import。
+    text = "\n".join(
+        (SCRIPTS / name).read_text(encoding="utf-8")
+        for name in ("render_cn_chat.py", "doctor_check.py")
+    )
     assert "exec(compile" not in text
     assert "from chat_parser import" in text or "import chat_parser" in text
 
