@@ -139,25 +139,70 @@ def parse_chat_html(html_path, out_dir):
     emote_count = 0
     emote_rules_seen = 0
     emote_bytes_written = 0
-    # Match content:url("data:image/...;base64,...") only — require base64 inside *this* url()
-    # so non-base64 data: URLs cannot steal a later rule's payload. Capture the full
-    # selector text immediately before the opening "{" of this rule.
-    # NOTE: avoid DOTALL over multi-MB CSS; rules are single-line or short in TD exports.
-    # Keep DOTALL but only on css_region (style body) to bound cost.
-    emote_rule_re = re.compile(
-        r"([^{}]+)\{[^{}]*?content\s*:\s*url\(\s*(['\"])data:image/[^'\"]*;base64,([^'\"]+)\2\s*\)",
-        re.IGNORECASE | re.DOTALL,
+    # ReDoS hardening: the old single-pass regex
+    #   ([^{}]+)\{[^{}]*?content\s*:\s*url\(\s*(['\"])data:image/[^'\"]*;base64,([^'\"]+)\2\s*\)
+    # backtracked quadratically on long brace-free text (measured 5KB→0.09s,
+    # 10KB→0.37s, 20KB→1.57s: input doubling costs ~4x), so a truncated export
+    # or one without <style> could hang the whole-file scan for hours with zero
+    # progress output. It is split into a linear anchor scan plus a bounded
+    # backward lookback that preserves the old match semantics:
+    #   1. anchor: every `content:url("data:image/...;base64,` is located by a
+    #      flat pattern with no nested/ambiguous quantifiers — the finditer
+    #      pass is linear regardless of braces;
+    #   2. lookback: the rule's opening "{" is the nearest brace before the
+    #      anchor (mirrors the old brace-free gap `[^{}]*?`), and the selector
+    #      is the brace-free text before it, bounded by the previous "}" and
+    #      by _CSS_LOOKBACK chars (matches must not start inside a previously
+    #      consumed rule, mirroring old finditer non-overlap);
+    #   3. payload: same-quote pairing (\2) plus the old `\2\s*\)` tail check.
+    emote_anchor_re = re.compile(
+        r"content\s*:\s*url\(\s*(['\"])data:image/[^'\"]*;base64,",
+        re.IGNORECASE,
     )
     emote_prog = _ParseProgress(every_n=20, every_sec=1.5)
     last_scan_pos = 0
     last_scan_print = time.perf_counter()
     css_chars = len(css_region) or 1
-    for m in emote_rule_re.finditer(css_region):
+    css_ws = " \t\n\r\f\v"  # what re \s* matched around the old closing paren
+    last_rule_brace = -1  # absolute "{" pos of the last structurally valid rule
+    for m in emote_anchor_re.finditer(css_region):
+        pos = m.start()
+        # Bounded lookback: never scan more than _CSS_LOOKBACK chars back.
+        win_start = max(0, pos - _CSS_LOOKBACK)
+        window = css_region[win_start:pos]
+        brace_rel = window.rfind("{")
+        if brace_rel == -1:
+            continue  # no rule opening within the lookback window
+        if window.rfind("}") > brace_rel:
+            continue  # nearest brace closes a previous rule: no open rule here
+        brace_abs = win_start + brace_rel
+        if brace_abs == last_rule_brace:
+            # A second content:url inside the same rule: the old finditer
+            # matched each rule exactly once — keep that behavior.
+            continue
+        # Selector = brace-free text between the nearest previous brace (the old
+        # [^{}]+ run) and this "{".
+        prev_brace = max(window.rfind("}", 0, brace_rel), window.rfind("{", 0, brace_rel))
+        selector_blob = window[prev_brace + 1 : brace_rel]
+        if not selector_blob:
+            continue  # the old selector part was [^{}]+ (non-empty)
+        # Payload runs to the next occurrence of the SAME quote char (the old
+        # \2 pairing); then the old regex required \2\s*\) — enforce that.
+        quote = m.group(1)
+        payload_end = css_region.find(quote, m.end())
+        if payload_end == -1:
+            continue  # unpaired quote (truncated export): old regex had no match
+        tail = payload_end + 1
+        region_len = len(css_region)
+        while tail < region_len and css_region[tail] in css_ws:
+            tail += 1
+        if tail >= region_len or css_region[tail] != ")":
+            continue
+        last_rule_brace = brace_abs
         emote_rules_seen += 1
-        # While the regex walks a multi-MB <style> blob, emit scan progress even
+        # While the scan walks a multi-MB <style> blob, emit scan progress even
         # before any class is accepted/written.
         now = time.perf_counter()
-        pos = m.end()
         if pos - last_scan_pos >= max(256 * 1024, css_chars // 20) or (now - last_scan_print) >= 2.0:
             pct = min(100.0, 100.0 * float(pos) / float(css_chars))
             print(
@@ -168,8 +213,7 @@ def parse_chat_html(html_path, out_dir):
             )
             last_scan_pos = pos
             last_scan_print = now
-        selector_blob = m.group(1)
-        b64_data = (m.group(3) or "").replace("\n", "").replace("\r", "").strip()
+        b64_data = css_region[m.end() : payload_end].replace("\n", "").replace("\r", "").strip()
         if not b64_data:
             continue
         if len(b64_data) > _MAX_EMOTE_BASE64_CHARS:

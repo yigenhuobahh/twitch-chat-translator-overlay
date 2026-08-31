@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 from common_utils import require_executable
+from env_bootstrap import prepend_tools_ffmpeg_to_path
 
 _DEMO_HTML = """<!DOCTYPE html>
 <html><head><meta charset=\"utf-8\"><title>Offline demo</title></head><body>
@@ -20,6 +21,8 @@ _DEMO_HTML = """<!DOCTYPE html>
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Activate only the trusted source/user-data portable FFmpeg directory.
+    prepend_tools_ffmpeg_to_path()
     parser = argparse.ArgumentParser(description="Generate an offline 6-second overlay demo")
     parser.add_argument("--output-dir", default="outputs/quick_demo")
     args = parser.parse_args(argv)

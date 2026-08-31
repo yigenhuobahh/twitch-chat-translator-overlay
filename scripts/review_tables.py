@@ -126,6 +126,7 @@ def export_review_tsv(
     lines = ["index\ttimestamp\tauthor\toriginal\ttranslation\tlint_severity\tlint_codes\tlint_notes"]
     for row in _review_rows(json_path, include_lint=True, data=data, issue_map=issue_map):
         lines.append("\t".join(map(str, row)))
+    review_path.parent.mkdir(parents=True, exist_ok=True)
     review_path.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
     print(f"\n[人工复核] 已导出中英对照 TSV: {review_path}")
 
