@@ -252,8 +252,43 @@ def test_history_write_waits_for_another_instance_lock(tmp_path: Path):
     assert {record["label"] for record in first.list_records()} == {"first", "second"}
 
 
-def test_history_lock_raises_after_bounded_retry_window(tmp_path: Path, monkeypatch):
-    """A wedged holder must surface an OSError instead of freezing the UI thread."""
+def test_history_read_paths_return_safely_after_bounded_retry_window(tmp_path: Path, monkeypatch):
+    """A wedged holder must not crash read entry points: reads degrade to []/None/False."""
+    path = tmp_path / "history.json"
+    first = TuiHistoryStore(path)
+    second = TuiHistoryStore(path)
+    record = first.start(None, label="first")
+    locked = threading.Event()
+    release = threading.Event()
+
+    def hold_lock() -> None:
+        with first._history_lock():
+            locked.set()
+            assert release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    assert locked.wait(timeout=5)
+    monkeypatch.setattr(tui_history_module, "LOCK_RETRY_INTERVAL_S", 0.01)
+    monkeypatch.setattr(tui_history_module, "LOCK_TIMEOUT_S", 0.2)
+    try:
+        # 读入口全部安全降级，绝不让另一个僵死实例打崩本实例的启动/点击。
+        assert second.list_records() == []
+        assert second.get(record["id"]) is None
+        assert second.has_unfinished_records() is False
+        assert second.recover_interrupted() == []
+        second.set_diagnostic(record["id"], tmp_path / "diag.txt")  # 不抛即通过
+    finally:
+        release.set()
+        holder.join(timeout=5)
+    # 锁释放后读写恢复正常，且没有任何数据被破坏。
+    assert [item["label"] for item in second.list_records()] == ["first"]
+    assert second.get(record["id"]) is not None
+    assert second.get(record["id"])["label"] == "first"
+
+
+def test_history_write_still_raises_after_bounded_retry_window(tmp_path: Path, monkeypatch):
+    """对照用例：写路径（start/clear）在锁超时时必须继续抛 OSError。"""
     path = tmp_path / "history.json"
     first = TuiHistoryStore(path)
     second = TuiHistoryStore(path)
@@ -273,10 +308,13 @@ def test_history_lock_raises_after_bounded_retry_window(tmp_path: Path, monkeypa
     monkeypatch.setattr(tui_history_module, "LOCK_TIMEOUT_S", 0.2)
     try:
         with pytest.raises(OSError, match="任务历史"):
-            second.list_records()
+            second.start(None, label="blocked")
+        with pytest.raises(OSError, match="任务历史"):
+            second.clear()
     finally:
         release.set()
         holder.join(timeout=5)
+    # 写路径失败没有留下半成品数据。
     assert [record["label"] for record in second.list_records()] == ["first"]
 
 

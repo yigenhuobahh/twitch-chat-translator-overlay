@@ -14,6 +14,8 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.css.query import NoMatches
+from textual.message import Message
+from textual.timer import Timer
 from textual.widgets import (
     Button,
     Checkbox,
@@ -31,6 +33,7 @@ from textual.widgets import (
 from textual.widgets._select import InvalidSelectValueError
 from textual.widgets.option_list import Option
 
+from common_utils import load_dotenv_if_present
 from env_bootstrap import (
     get_translate_api_config,
     probe_translate_api,
@@ -122,6 +125,29 @@ _MEDIA_CHECK_OPTIONS = (
 )
 
 
+class ApiProbeStarted(Message):
+    """API 探测 worker 回发的开始提示。
+
+    worker 线程通过 ``post_message`` 回发（Textual 官方跨线程正道）；
+    应用关闭期消息会被 Textual 安全丢弃，不会阻塞或抛 RuntimeError。
+    """
+
+    def __init__(self, message: str, status: str | None = None) -> None:
+        super().__init__()
+        self.message = message
+        self.status = status
+
+
+class ApiProbeFinished(Message):
+    """API 探测 worker 回发的最终结果（success/message 字段）。"""
+
+    def __init__(self, success: bool, message: str, status: str | None = None) -> None:
+        super().__init__()
+        self.success = success
+        self.message = message
+        self.status = status
+
+
 class OverlayTui(App[None]):
     """Beginner-first UI; rendering remains entirely in render_cn_chat.py."""
 
@@ -167,6 +193,9 @@ class OverlayTui(App[None]):
         self.download_duration_note = ""
         self.selected_history_id: str | None = None
         self._history_clear_confirmation_until = 0.0
+        # on_mount 保存的轮询定时器句柄；on_unmount 必须显式 stop，
+        # 否则 teardown 窗口期回调仍会触发、可能把任务状态二次改写。
+        self.poll_timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -241,7 +270,7 @@ class OverlayTui(App[None]):
                         yield Input(value="10", placeholder="预览时长（秒）", id="preview-clip")
                     with Horizontal(classes="field-row"):
                         yield Label("时间偏移（秒）", classes="field-label")
-                        yield Input(value="0.0", placeholder="0.0", id="offset")
+                        yield Input(value="", placeholder="留空或 0 自动对齐；示例 12.5 / -3.0", id="offset")
                     yield Static("时间偏移用于微调弹幕与视频的时间轴对齐（正数延后，负数提前；例如 0.0、12.5、-3.0；留空或 0 则自动按直播流时间戳对齐）。", classes="hint")
                     yield Static("", id="form-validation", classes="invalid")
                     yield Button("开始所选任务", id="run-mode", variant="primary")
@@ -349,7 +378,8 @@ class OverlayTui(App[None]):
         self._refresh_history()
         self._load_api_config_into_ui()
         self._refresh_form_validation()
-        self.set_interval(0.15, self._poll_session)
+        # 保留句柄，on_unmount 时显式 stop，避免 teardown 期回调继续触发。
+        self.poll_timer = self.set_interval(0.15, self._poll_session)
 
     def _load_api_config_into_ui(self) -> None:
         try:
@@ -379,6 +409,13 @@ class OverlayTui(App[None]):
             self._refresh_form_validation()
 
     def on_unmount(self) -> None:
+        # 先停轮询定时器，防止 teardown 窗口期回调触发把 interrupted 状态二次改写。
+        if getattr(self, "poll_timer", None) is not None:
+            try:
+                self.poll_timer.stop()
+            except Exception:
+                pass
+            self.poll_timer = None
         if self.session:
             if self.session.running:
                 self.session.cancel()
@@ -669,6 +706,17 @@ class OverlayTui(App[None]):
         base_url = self._input("#api-base-url").strip()
         api_key = self._input("#api-key").strip()
         model = self._input("#api-model").strip()
+        if not api_key:
+            # save_dotenv_api_config 会无条件覆写三键；密钥留空时改传 .env 中
+            # 已保存的密钥，避免把已有密钥抹成空（本方法不改动 env_bootstrap）。
+            try:
+                load_dotenv_if_present()
+                existing = get_translate_api_config().get("api_key") or ""
+            except Exception:
+                existing = ""
+            if existing:
+                api_key = existing
+                self._log("[提示] API 密钥输入留空，保留 .env 中已保存的密钥不覆盖。")
         ok, msg = save_dotenv_api_config(base_url, api_key, model)
         feedback = self.query_one("#api-status-feedback", Static)
         if ok:
@@ -685,18 +733,17 @@ class OverlayTui(App[None]):
         model = self._input("#api-model").strip()
         self._run_api_probe(base_url, api_key, model)
 
-    @work(thread=True)
+    @work(thread=True, exclusive=True, group="api-probe")
     def _run_api_probe(self, base_url: str, api_key: str, model: str) -> None:
-        try:
-            self.app.call_from_thread(
-                self._update_api_feedback,
+        # post_message 是 Textual 官方跨线程回发通道：应用关闭期消息被安全
+        # 丢弃（post_message 直接返回 False），不会像 call_from_thread 那样
+        # 在已停止的消息循环上阻塞或抛 RuntimeError 卡死非 daemon 线程。
+        self.post_message(
+            ApiProbeStarted(
                 "⏳ 正在连接翻译 API 接口进行鉴权与连通性测试，请稍候…",
                 status="正在测试 API 连通性…",
             )
-        except RuntimeError:
-            # textual 8.2.8 在窗口关闭期 _loop 仍非 None 但消息循环已停止，
-            # call_from_thread 此时可能阻塞或抛 RuntimeError；探测线程放弃回写即可。
-            return
+        )
         start_time = time.perf_counter()
         ok, msg = probe_translate_api(
             base_url=base_url or None,
@@ -706,18 +753,20 @@ class OverlayTui(App[None]):
         )
         latency_ms = int((time.perf_counter() - start_time) * 1000)
         if ok:
-            feedback_text = f"✅ API 连通性测试成功！模型: {model or '默认'}，响应延迟: {latency_ms}ms。接口正常可用。"
-            status_text = f"API 连通性测试成功（耗时 {latency_ms}ms）。"
+            message = f"✅ API 连通性测试成功！模型: {model or '默认'}，响应延迟: {latency_ms}ms。接口正常可用。"
+            status = f"API 连通性测试成功（耗时 {latency_ms}ms）。"
         else:
             # 服务端错误文本可能回显请求头/URL 凭据，进 UI 前先过脱敏规则。
             safe_msg = redact_text(msg)
-            feedback_text = f"❌ API 连通性测试失败：{safe_msg}（耗时 {latency_ms}ms）"
-            status_text = f"API 测试失败：{safe_msg}"
-        try:
-            self.app.call_from_thread(self._update_api_feedback, feedback_text, status=status_text)
-        except RuntimeError:
-            # 同上：应用已进入关闭期，无法回写 UI，安全丢弃本次结果。
-            return
+            message = f"❌ API 连通性测试失败：{safe_msg}（耗时 {latency_ms}ms）"
+            status = f"API 测试失败：{safe_msg}"
+        self.post_message(ApiProbeFinished(ok, message, status=status))
+
+    def on_api_probe_started(self, event: ApiProbeStarted) -> None:
+        self._update_api_feedback(event.message, status=event.status)
+
+    def on_api_probe_finished(self, event: ApiProbeFinished) -> None:
+        self._update_api_feedback(event.message, status=event.status)
 
     def _update_api_feedback(self, text: str, status: str | None = None) -> None:
         try:
@@ -1241,6 +1290,11 @@ class OverlayTui(App[None]):
             self._set_status("请先填写一个新的 job.yaml 路径。")
             return
         draft = self._draft()
+        # 落盘前先做与启动一致的轻量校验（不含 API/环境），避免把无效表单固化成 YAML。
+        problems = draft.validate(check_api=False, check_environment=False)
+        if problems:
+            self._set_status("无法保存 YAML，表单尚未就绪：" + " ".join(problems))
+            return
         try:
             saved = draft.save_job(path, pin_paths=self.query_one("#pin-paths", Checkbox).value)
         except (OSError, ValueError, FileExistsError) as exc:

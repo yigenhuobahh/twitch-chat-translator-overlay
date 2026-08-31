@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import getpass
 import os
 from pathlib import Path
 import re
@@ -100,6 +101,15 @@ def _prompt(msg: str, default: str | None = None) -> str:
     return raw
 
 
+def _prompt_secret(msg: str = "") -> str:
+    """Read a secret without terminal echo (getpass); falls back to input() when no TTY."""
+    try:
+        return getpass.getpass(f"{msg}: ")
+    except (OSError, EOFError):
+        # 非交互环境（如 pytest 捕获输出）getpass 不可用；退回普通输入保持可测试性。
+        return input(f"{msg}: ")
+
+
 def _normalize_user_path(value: str) -> str:
     """Clean pasted Windows paths (quotes, file://, accidental 'E:\\video:\\...')."""
     s = (value or "").strip().strip('"').strip("'").strip()
@@ -132,14 +142,20 @@ def _path_not_found_hints(p: Path) -> None:
     s = str(p)
     print(f"  文件不存在: {s}")
     if re.search(r"^[A-Za-z]:[\\/][^:\\/]+:[\\/]", s):
-        print("  提示: 路径里多了一个冒号（例如 E:\\video:\\文件.mp4）。")
-        print("        请改成 E:\\download\\文件.mp4 这种「盘符:\\目录\\文件」形式。")
+        print("  提示: 路径里多了一个冒号（例如 X:\\dir:\\文件.mp4）。")
+        print("        请改成「盘符:\\目录\\文件」这种形式（例如 X:\\dir\\文件.mp4）。")
     if "[" in s or "]" in s:
         print("  提示: 文件名含 [ ] 时请整段用英文引号包起来，或直接拖文件到窗口。")
-    # Suggest likely sibling if user used wrong folder but right filename
+    # Suggest likely sibling if user used wrong folder but right filename.
+    # 只启发当前工作目录、其常见相对位置和原路径同级目录，不假设任何个人盘符。
     name = p.name
     if name:
-        for folder in (Path("E:/download"), Path("E:/video"), Path.cwd()):
+        folders = [Path.cwd(), Path.cwd() / "downloads", p.parent]
+        seen: set[Path] = set()
+        for folder in folders:
+            if folder in seen:
+                continue
+            seen.add(folder)
             try:
                 cand = folder / name
                 if cand.is_file():
@@ -1249,7 +1265,10 @@ def _menu_download_and_continue() -> int:
         ddir = _prompt("下载目录（空=默认 downloads/…）", "").strip() or None
         # Optional: sub-only VODs. Empty = skip (do not log token).
         print("  OAuth：仅订阅限定 VOD 需要；公开内容直接回车跳过。")
-        oauth = _prompt("Twitch OAuth（可空=跳过）", "").strip() or None
+        print("  Twitch OAuth（可空=跳过）：输入不会回显。")
+        # OAuth 是敏感凭据：与 TUI 侧 password=True 输入一致，用 _prompt_secret（getpass）关闭回显。
+        # EOFError 沿用本函数既有的"已取消"处理分支。
+        oauth = _prompt_secret().strip() or None
     except TwitchDownloadError as e:
         print(f"[FAIL] {e}")
         return 2

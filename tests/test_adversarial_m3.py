@@ -106,16 +106,16 @@ def test_adversarial_offset_valid_inputs(tmp_path: Path, offset_input: str, expe
     problems = draft.validate(check_api=False, check_environment=False)
     assert not problems, f"Valid offset {offset_input!r} caused validation error: {problems}"
     fields = draft.to_job_fields()
+    cmd = draft.build_command("python", "render_cn_chat.py")
     if offset_input.strip() in ("0", "0.0", "-0.0", "+0"):
-        assert "offset" in fields
-        assert fields["offset"] == 0.0
-    else:
-        assert "offset" in fields
-        assert math.isclose(fields["offset"], expected_float, rel_tol=1e-5)
+        # 0（含 -0.0）视同未填：不写 offset 字段、不传 --offset，保持自动对齐。
+        assert "offset" not in fields, f"Zero offset {offset_input!r} must be dropped: {fields}"
+        assert "--offset" not in cmd, f"Zero offset {offset_input!r} must not emit --offset: {cmd}"
+        return
+    assert "offset" in fields
+    assert math.isclose(fields["offset"], expected_float, rel_tol=1e-5)
     restored = TuiJobDraft.from_fields(fields)
     assert str(restored.offset).strip() == str(fields["offset"])
-    cmd = draft.build_command("python", "render_cn_chat.py")
-    assert "--offset" in cmd
     idx = cmd.index("--offset")
     assert math.isclose(float(cmd[idx + 1]), expected_float, rel_tol=1e-5)
 

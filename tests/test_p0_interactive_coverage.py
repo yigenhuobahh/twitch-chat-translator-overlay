@@ -82,6 +82,8 @@ def test_download_menu_runs_original_preview_with_downloaded_paths(tmp_path: Pat
     seen: dict[str, object] = {}
     answers = iter(("2819850140", "auto", "1080p60", "1", "", "", "Safe", "fast", "audio", "", "token", "1"))
     monkeypatch.setattr(wizard, "_prompt", lambda *_args, **_kwargs: next(answers))
+    # OAuth 走 _prompt_secret(getpass 不回显);测试里与 _prompt 共用同一答案序列。
+    monkeypatch.setattr(wizard, "_prompt_secret", lambda *_args, **_kwargs: next(answers))
     monkeypatch.setattr(download, "find_twitchdownloader_cli", lambda: tmp_path / "TwitchDownloaderCLI.exe")
     monkeypatch.setattr(download, "tools_td_bin_dirs", lambda: [tmp_path])
     monkeypatch.setattr(

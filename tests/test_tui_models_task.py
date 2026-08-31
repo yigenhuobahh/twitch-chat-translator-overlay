@@ -692,12 +692,15 @@ def test_textual_import_then_save_preserves_mode_and_extra_fields(tmp_path: Path
 
     video = tmp_path / "source.mp4"
     chat = tmp_path / "chat.html"
+    translation = tmp_path / "source.json"
     video.write_text("x", encoding="utf-8")
     chat.write_text("x", encoding="utf-8")
+    translation.write_text("{}", encoding="utf-8")
     source = tmp_path / "source.yaml"
     target = tmp_path / "saved.yaml"
     source.write_text(
-        f"video: {video}\nchat_html: {chat}\nmode: render\nreuse_translation: true\nbg_alpha: 170\n",
+        f"video: {video}\nchat_html: {chat}\ntranslation_json: {translation}\n"
+        f"mode: render\nreuse_translation: true\nbg_alpha: 170\n",
         encoding="utf-8",
     )
 
@@ -717,6 +720,95 @@ def test_textual_import_then_save_preserves_mode_and_extra_fields(tmp_path: Path
     assert "mode: render" in saved
     assert "reuse_translation: true" in saved
     assert "bg_alpha: 170" in saved
+
+
+def test_textual_save_job_refuses_invalid_form_and_reports(tmp_path: Path):
+    """_save_job 落盘前校验：表单无效时不写文件，状态栏说明原因。"""
+    pytest.importorskip("textual")
+    from textual.widgets import Static
+
+    from tui_run import OverlayTui
+
+    video = tmp_path / "source.mp4"
+    chat = tmp_path / "chat.html"
+    video.write_text("x", encoding="utf-8")
+    chat.write_text("x", encoding="utf-8")
+    target = tmp_path / "blocked.yaml"
+
+    async def exercise() -> None:
+        app = OverlayTui()
+        async with app.run_test() as pilot:
+            app._set_input("#video", str(video))
+            app._set_input("#chat", str(chat))
+            # crf 超出 0..51 之外 → validate 必须失败 → 不落盘。
+            app._set_input("#crf", "99")
+            app._set_input("#job-path", str(target))
+            app._save_job()
+            await pilot.pause(0.05)
+            status_text = str(app.query_one("#status", Static).render())
+            assert "无法保存 YAML" in status_text
+            assert "CRF" in status_text
+            assert not target.exists()
+
+    import asyncio
+
+    asyncio.run(exercise())
+
+
+def test_crf_validation_enforces_0_to_51_range(tmp_path: Path):
+    """CRF 校验：0/负数/非整数保持原有错误，>51 报上界提示。"""
+    video = tmp_path / "source.mp4"
+    chat = tmp_path / "chat.html"
+    video.write_text("x", encoding="utf-8")
+    chat.write_text("x", encoding="utf-8")
+
+    def problems_for(crf: str) -> list[str]:
+        draft = TuiJobDraft(video=str(video), chat_html=str(chat), mode=MODE_ORIGINAL_PREVIEW, crf=crf)
+        return draft.validate(check_api=False, check_environment=False)
+
+    assert problems_for("0") == ["CRF 必须是正整数。"]
+    assert problems_for("-3") == ["CRF 必须是正整数。"]
+    assert problems_for("abc") == ["CRF 必须是整数。"]
+    upper = problems_for("52")
+    assert upper == ["CRF 需在 0..51 范围内。"]
+    assert problems_for("51") == []
+
+
+def test_textual_save_api_config_keeps_existing_key_when_field_blank(monkeypatch: pytest.MonkeyPatch):
+    """API 密钥输入留空时，不得把 .env/环境中已保存的密钥抹成空。"""
+    pytest.importorskip("textual")
+    from textual.widgets import Static
+
+    monkeypatch.setenv("OPENAI_COMPAT_BASE_URL", "https://keep.example/v1")
+    monkeypatch.setenv("OPENAI_COMPAT_API_KEY", "sk-existing-key")
+    monkeypatch.setenv("OPENAI_COMPAT_MODEL", "keep-model")
+
+    from tui_run import OverlayTui
+
+    captured: dict[str, str] = {}
+
+    def fake_save(base_url: str, api_key: str, model: str, env_path=None):
+        captured.update(base_url=base_url, api_key=api_key, model=model)
+        return True, "保存成功"
+
+    async def exercise() -> None:
+        app = OverlayTui()
+        monkeypatch.setattr("tui_run.save_dotenv_api_config", fake_save)
+        async with app.run_test() as pilot:
+            # on_mount 已把现有密钥预填进输入框；这里模拟用户清空密钥只改地址/模型。
+            app._set_input("#api-key", "")
+            app._set_input("#api-base-url", "https://new.example/v1")
+            app._set_input("#api-model", "new-model")
+            app._save_api_config()
+            await pilot.pause(0.05)
+            assert "配置已成功保存" in str(app.query_one("#api-status-feedback", Static).render())
+
+    import asyncio
+
+    asyncio.run(exercise())
+    assert captured["api_key"] == "sk-existing-key"
+    assert captured["base_url"] == "https://new.example/v1"
+    assert captured["model"] == "new-model"
 
 
 def test_tui_result_context_is_specific_to_task_mode(tmp_path: Path):

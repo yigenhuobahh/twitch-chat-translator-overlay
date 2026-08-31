@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -29,6 +30,23 @@ DEFAULT_HISTORY_LIMIT = 100
 # TUI instance cannot freeze this instance's UI thread forever.
 LOCK_TIMEOUT_S = 5.0
 LOCK_RETRY_INTERVAL_S = 0.05
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class HistoryLockTimeoutError(OSError):
+    """另一个 TUI 实例持有历史锁超过重试窗口时抛出。
+
+    仍继承 OSError：既有 ``except OSError`` 调用方（tui_run 的写路径收尾）
+    行为不变。读路径会把本异常归一为安全返回（[]/None/False），只有
+    start/clear 等写路径继续把它抛给调用方，避免一个僵死实例让本实例
+    启动或点击即崩。
+    """
+
+
+def _degrade_locked_read(exc: HistoryLockTimeoutError) -> None:
+    """读路径锁超时的统一降级说明（模块级 debug 级日志）。"""
+    _LOGGER.debug("任务历史锁被其他实例长期占用，读操作降级为安全返回: %s", exc)
 
 # Sensitive-key filtering shares one vocabulary with tui_models.
 _is_sensitive_key = _is_sensitive_field
@@ -119,7 +137,7 @@ class TuiHistoryStore:
                 deadline = time.monotonic() + LOCK_TIMEOUT_S
                 while not _try_lock_history(handle):
                     if time.monotonic() >= deadline:
-                        raise OSError(
+                        raise HistoryLockTimeoutError(
                             f"任务历史被其他实例长期占用（等待约 {LOCK_TIMEOUT_S:.0f} 秒）: {lock_path}"
                         )
                     time.sleep(LOCK_RETRY_INTERVAL_S)
@@ -207,28 +225,43 @@ class TuiHistoryStore:
                         pass
 
     def list_records(self) -> list[dict[str, Any]]:
-        with self._history_lock():
-            return list(reversed(self._load()))
+        try:
+            with self._history_lock():
+                return list(reversed(self._load()))
+        except HistoryLockTimeoutError as exc:
+            # 读路径：锁被另一实例长期占用时降级为空历史，而不是让 UI 崩溃。
+            _degrade_locked_read(exc)
+            return []
 
     def get(self, record_id: str) -> dict[str, Any] | None:
-        with self._history_lock():
-            return next((record for record in self._load() if record.get("id") == record_id), None)
+        try:
+            with self._history_lock():
+                return next((record for record in self._load() if record.get("id") == record_id), None)
+        except HistoryLockTimeoutError as exc:
+            _degrade_locked_read(exc)
+            return None
 
     def recover_interrupted(self) -> list[dict[str, Any]]:
-        with self._history_lock():
-            records = self._load()
-            changed: list[dict[str, Any]] = []
-            for record in records:
-                state = record.get("state")
-                if state == "running" and pid_is_alive(record.get("pid")) is True:
-                    continue
-                if state in {"queued", "running"}:
-                    record["state"] = "interrupted"
-                    record["finished_at"] = time.time()
-                    changed.append(record)
-            if changed:
-                self._save(records)
-            return changed
+        # 含状态改写，但入口在 on_mount；这里按读语义降级：锁被占时本实例
+        # 先正常启动，中断恢复留给下次启动重试。
+        try:
+            with self._history_lock():
+                records = self._load()
+                changed: list[dict[str, Any]] = []
+                for record in records:
+                    state = record.get("state")
+                    if state == "running" and pid_is_alive(record.get("pid")) is True:
+                        continue
+                    if state in {"queued", "running"}:
+                        record["state"] = "interrupted"
+                        record["finished_at"] = time.time()
+                        changed.append(record)
+                if changed:
+                    self._save(records)
+                return changed
+        except HistoryLockTimeoutError as exc:
+            _degrade_locked_read(exc)
+            return []
 
     def start(self, draft: TuiJobDraft | TuiDownloadDraft | None, *, label: str) -> dict[str, Any]:
         with self._history_lock():
@@ -322,19 +355,28 @@ class TuiHistoryStore:
             return None
 
     def set_diagnostic(self, record_id: str, path: str | Path) -> None:
-        with self._history_lock():
-            records = self._load()
-            for record in records:
-                if record.get("id") == record_id:
-                    record["diagnostic_path"] = str(Path(path).resolve())
-                    record["updated_at"] = time.time()
-                    self._save(records)
-                    return
+        try:
+            with self._history_lock():
+                records = self._load()
+                for record in records:
+                    if record.get("id") == record_id:
+                        record["diagnostic_path"] = str(Path(path).resolve())
+                        record["updated_at"] = time.time()
+                        self._save(records)
+                        return
+        except HistoryLockTimeoutError as exc:
+            # 诊断记录可以在下次导出时重写；锁被占时静默降级即可。
+            _degrade_locked_read(exc)
 
     def has_unfinished_records(self) -> bool:
         """Report whether another task still owns durable history state."""
-        with self._history_lock():
-            return any(record.get("state") in {"queued", "running"} for record in self._load())
+        try:
+            with self._history_lock():
+                return any(record.get("state") in {"queued", "running"} for record in self._load())
+        except HistoryLockTimeoutError as exc:
+            # 读路径：无法确认时按 False 返回（UI 层另有会话级运行判定兜底）。
+            _degrade_locked_read(exc)
+            return False
 
     def clear(self) -> bool:
         """Delete managed history only when no queued or running record exists."""
@@ -351,6 +393,7 @@ class TuiHistoryStore:
             return True
 
     def draft_for(self, record: dict[str, Any]) -> TuiJobDraft | None:
+        # 纯内存/文件读取，不取历史锁，天然不会受锁超时影响。
         draft = record.get("draft")
         if not isinstance(draft, dict):
             return None
@@ -362,5 +405,6 @@ class TuiHistoryStore:
 
     @staticmethod
     def download_for(record: dict[str, Any]) -> TuiDownloadDraft | None:
+        # 纯内存读取，不取历史锁，天然不会受锁超时影响。
         draft = record.get("draft")
         return TuiDownloadDraft.from_history_fields(draft) if isinstance(draft, dict) else None

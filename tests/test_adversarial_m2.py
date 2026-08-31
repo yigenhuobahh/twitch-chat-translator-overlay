@@ -190,10 +190,12 @@ def test_tui_offset_inputs_and_validation(tmp_path: Path):
             cmd = app._draft().build_command("python", "render_cn_chat.py")
             assert "--offset" in cmd and "-8.25" in cmd
 
-            # Valid zero and empty offset
+            # Valid zero and empty offset: both keep the form valid, and zero
+            # must be treated as "not filled" (auto-alignment) downstream.
             app._set_input("#offset", "0.0")
             assert app._draft().offset == "0.0"
             await wait_for_validation_state(app, pilot, absent="待处理")
+            assert "--offset" not in app._draft().build_command("python", "render_cn_chat.py")
 
             app._set_input("#offset", "")
             assert app._draft().offset == ""
@@ -225,13 +227,19 @@ def test_tui_offset_inputs_and_validation(tmp_path: Path):
 
             # Command propagation for representative values (absorbed from the
             # former parametrized propagation test). build_command serializes
-            # the offset as a float, so compare numerically.
-            for value, expected in (("0.0", 0.0), ("120.0", 120.0), ("  +5.2  ", 5.2), ("-0.0", 0.0)):
+            # the offset as a float, so compare numerically. Zero values are
+            # dropped entirely (auto-alignment), non-zero values propagate.
+            for value, expected in (("120.0", 120.0), ("  +5.2  ", 5.2), ("-0.000001", -0.000001)):
                 app._set_input("#offset", value)
                 assert app._draft().offset == value.strip()
                 cmd = app._draft().build_command("python", "render_cn_chat.py")
                 assert "--offset" in cmd
                 assert float(cmd[cmd.index("--offset") + 1]) == expected
+
+            # Zero-shaped inputs must omit the flag like a blank field.
+            for zero_value in ("0.0", "0", "+0", "-0.0"):
+                app._set_input("#offset", zero_value)
+                assert "--offset" not in app._draft().build_command("python", "render_cn_chat.py")
 
             # Blank offset must omit the flag from the generated command entirely.
             app._set_input("#offset", "")

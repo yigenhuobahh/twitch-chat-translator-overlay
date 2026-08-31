@@ -87,12 +87,7 @@ _MODE_JOB_FIELDS: dict[str, dict[str, Any]] = {
 _MODE_JOB_FIELDS_DEFAULT = {"mode": "full"}
 
 # Preview modes additionally carry the requested preview window.
-_PREVIEW_MODES = frozenset({
-    MODE_QUICK_PREVIEW_ORIGINAL,
-    MODE_QUICK_PREVIEW_TRANSLATED,
-    MODE_ORIGINAL_PREVIEW,
-    MODE_TRANSLATED_PREVIEW,
-})
+# （--preview-clip 已对任意任务模式无条件投影；见 to_job_fields。）
 
 # Modes that call the translation API unless a manual/render/reuse override
 # short-circuits it first (see TuiJobDraft.requires_translation).
@@ -288,8 +283,9 @@ class TuiJobDraft:
             "manual_translation": self.manual_translation,
         })
         fields.update(dict(_MODE_JOB_FIELDS.get(self.mode, _MODE_JOB_FIELDS_DEFAULT)))
-        if self.mode in _PREVIEW_MODES:
-            fields["preview_clip"] = self.preview_clip
+        # 管线对任意模式都支持 --preview-clip，因此无条件投影；
+        # 预览时长合法性仍由 validate 负责。
+        fields["preview_clip"] = self.preview_clip
         if self.render_original:
             fields["render_original"] = True
         if self.reuse_translation:
@@ -302,9 +298,12 @@ class TuiJobDraft:
             fields["workers"] = int(self.workers)
         if self.offset is not None and str(self.offset).strip():
             try:
-                fields["offset"] = float(str(self.offset).strip())
+                offset_value = float(str(self.offset).strip())
             except (TypeError, ValueError):
-                pass
+                offset_value = None
+            # 0（含 -0.0）视同未填：保持自动对齐，不写 offset 字段、不传 --offset。
+            if offset_value is not None and abs(offset_value) >= 1e-9:
+                fields["offset"] = offset_value
         return {key: value for key, value in fields.items() if value not in (None, "")}
 
     def requires_translation(self) -> bool:
@@ -332,13 +331,21 @@ class TuiJobDraft:
                 problems.append("预览时长必须大于 0。")
         except (TypeError, ValueError):
             problems.append("预览时长必须是数字。")
-        for name, value in (("CRF", self.crf), ("翻译并发", self.workers)):
-            if value.strip():
-                try:
-                    if int(value) <= 0:
-                        problems.append(f"{name} 必须是正整数。")
-                except ValueError:
-                    problems.append(f"{name} 必须是整数。")
+        if self.crf.strip():
+            try:
+                crf_value = int(self.crf)
+                if crf_value <= 0:
+                    problems.append("CRF 必须是正整数。")
+                elif crf_value > 51:
+                    problems.append("CRF 需在 0..51 范围内。")
+            except ValueError:
+                problems.append("CRF 必须是整数。")
+        if self.workers.strip():
+            try:
+                if int(self.workers) <= 0:
+                    problems.append("翻译并发 必须是正整数。")
+            except ValueError:
+                problems.append("翻译并发 必须是整数。")
         if self.offset is not None and str(self.offset).strip():
             try:
                 val = float(str(self.offset).strip())
