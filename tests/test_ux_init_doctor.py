@@ -311,7 +311,12 @@ def test_doctor_mentions_next_steps(pipeline, capsys, monkeypatch):
 
 
 def test_doctor_source_still_imports_chat_parser_not_exec():
-    text = (ROOT / "scripts" / "render_cn_chat.py").read_text(encoding="utf-8")
+    # doctor 实现位于 doctor_check.py（自 render_cn_chat 搬出）；编排层与其自身
+    # 都不得 exec 编译 burn 源码。
+    text = "\n".join(
+        (ROOT / "scripts" / name).read_text(encoding="utf-8")
+        for name in ("render_cn_chat.py", "doctor_check.py")
+    )
     assert "from chat_parser import parse_chat_html" in text
     assert 'exec(compile(code, str(burn_path), "exec"), glb)' not in text
 
