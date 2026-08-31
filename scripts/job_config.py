@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import tempfile
 from typing import Any
 
 try:
@@ -360,7 +362,12 @@ def load_job_file(path: str | Path) -> dict[str, Any]:
     p = Path(path)
     if not p.is_file():
         raise ValueError(f"job 文件不存在: {path}")
-    data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    try:
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as e:
+        # yaml.YAMLError 的 MRO 不经过 ValueError；不捕获会让用户的缩进/语法
+        # 错误直接变成原始堆栈（调用方只捕 OSError/ValueError）。
+        raise ValueError(f"job YAML 语法错误: {p}: {e}") from e
     if not isinstance(data, dict):
         raise ValueError(f"job 根节点必须是 mapping: {p}")
     # Structural wrapper only: ``job:`` holds the field map. Sibling top-level
@@ -632,9 +639,18 @@ def _yaml_quote(value: Any) -> str:
     s = str(value)
     if s == "":
         return '""'
-    # Quote if special YAML chars / leading special.
-    if any(c in s for c in (":", "#", "{", "}", "[", "]", ",", "&", "*", "?", "|", ">", "!", "%", "@", "`", "'", '"')) or s.strip() != s or s.lower() in ("null", "true", "false", "yes", "no"):
-        esc = s.replace("\\", "\\\\").replace('"', '\\"')
+    # Quote if special YAML chars / leading special / newline / "- " sequence
+    # indicator: bare `context: - note` parses as a block sequence and breaks
+    # safe_load, so those values must be double-quoted with escapes.
+    if (
+        "\n" in s
+        or "\r" in s
+        or s.startswith("- ")
+        or any(c in s for c in (":", "#", "{", "}", "[", "]", ",", "&", "*", "?", "|", ">", "!", "%", "@", "`", "'", '"'))
+        or s.strip() != s
+        or s.lower() in ("null", "true", "false", "yes", "no")
+    ):
+        esc = s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
         return f'"{esc}"'
     return s
 
@@ -811,5 +827,20 @@ def write_job_file(
         raise FileExistsError(f"job 已存在: {p}")
     p.parent.mkdir(parents=True, exist_ok=True)
     text = render_job_yaml(fields, title=title or p.stem, pin_paths=pin_paths)
-    p.write_text(text, encoding="utf-8")
+    # Atomic write (same pattern as run_meta/atomic_write_json, but for text):
+    # write a unique tmp file in the same dir, then os.replace over the target
+    # so a crash never leaves a truncated/half-written job YAML.
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".tmp", dir=str(p.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write(text)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(tmp_path, p)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
     return p.resolve()

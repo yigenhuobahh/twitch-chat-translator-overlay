@@ -9,6 +9,7 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import tempfile
 import time
 from typing import Any
 
@@ -133,9 +134,21 @@ def write_run_meta(job_dir: str | Path, payload: dict[str, Any]) -> Path:
     data.setdefault("pid", os.getpid())
     data.setdefault("started_at", time.strftime("%Y-%m-%dT%H:%M:%S"))
     data["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    # Unique tmp name + os.replace (mirrors common_utils.atomic_write_json):
+    # a fixed ".json.tmp" name let concurrent writers clobber each other.
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            json.dump(data, file, ensure_ascii=False, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
     return path
 
 

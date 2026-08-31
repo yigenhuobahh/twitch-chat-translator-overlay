@@ -316,6 +316,16 @@ def make_job_dir(parent: str | Path, prefix: str = "job_") -> Path:
         (job_dir / JOB_DIR_MARKER).write_text("twitch-chat-cn-overlay\n", encoding="utf-8")
     except OSError:
         pass
+    # Seed run_meta immediately (status=running + live pid) so a concurrent
+    # --clean / --clean-all in the window before the tool writes its own meta
+    # treats this fresh dir as live and skips it. Goes through run_meta's writer
+    # (function-local import: run_meta must stay independent of process_util).
+    try:
+        from run_meta import write_run_meta
+
+        write_run_meta(job_dir, {"status": "running"})
+    except OSError:
+        pass
     return job_dir
 
 

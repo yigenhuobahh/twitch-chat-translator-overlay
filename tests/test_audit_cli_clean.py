@@ -28,6 +28,23 @@ def _run(cmd, cwd=None, env=None):
     )
 
 
+def _mark_finished_dead(job_dir: Path) -> None:
+    """Overwrite the make_job_dir live seed with a dead-pid/stale running meta.
+
+    make_job_dir now writes a seed run_meta.json (status=running + live pid) so
+    clean treats the fresh dir as live. Tests that expect the dir to be
+    deletable must replace the seed with a dead-pid/stale stamp first (same
+    pattern as test_export_import_safety.py::test_clean_all_removes_stale_running_job).
+    """
+    import time
+
+    old = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 9 * 3600))
+    (job_dir / "run_meta.json").write_text(
+        json.dumps({"status": "running", "pid": 99999999, "updated_at": old}),
+        encoding="utf-8",
+    )
+
+
 def test_clean_temp_artifacts_skips_progress_by_default(tmp_path: Path):
     from process_util import clean_temp_artifacts, make_job_dir
 
@@ -36,6 +53,8 @@ def test_clean_temp_artifacts_skips_progress_by_default(tmp_path: Path):
     # Marked batch_* is cleaned with --clean-all; bare batch_exports must survive.
     batch = make_job_dir(tmp_path, prefix="batch_")
     (batch / "t.txt").write_text("b", encoding="utf-8")
+    _mark_finished_dead(job)
+    _mark_finished_dead(batch)
     bare_batch = tmp_path / "batch_exports"
     bare_batch.mkdir()
     (bare_batch / "keep.txt").write_text("keep", encoding="utf-8")
@@ -96,6 +115,7 @@ def test_clean_temp_artifacts_only_job_dir(tmp_path: Path):
     (job_b / "b.bin").write_bytes(b"b")
     partial = tmp_path / "x.partial.mp4"
     partial.write_bytes(b"zz")
+    _mark_finished_dead(job_a)
 
     count, _ = clean_temp_artifacts(tmp_path, only_job_dir=job_a, clean_all=False)
     assert not job_a.exists()
@@ -116,6 +136,38 @@ def test_clean_temp_artifacts_refuses_only_job_outside_out_base(tmp_path: Path):
     count, _ = clean_temp_artifacts(out, only_job_dir=job, clean_all=False)
     assert job.is_dir()
     assert count == 0
+
+
+def test_make_job_dir_seed_is_live_for_clean(tmp_path: Path, capsys):
+    """Regression: a fresh make_job_dir dir must be treated as live by clean.
+
+    make_job_dir seeds run_meta.json (running + live pid) so a concurrent
+    --clean/--clean-all cannot delete the dir in the window before the tool
+    writes its own meta.
+    """
+    import json as _json
+
+    from process_util import _is_live_tool_job, clean_temp_artifacts, make_job_dir
+
+    job = make_job_dir(tmp_path, prefix="job_")
+    (job / "a.bin").write_bytes(b"a")
+
+    # Seed meta: running + live pid.
+    seed = _json.loads((job / "run_meta.json").read_text(encoding="utf-8"))
+    assert seed.get("status") == "running"
+    assert isinstance(seed.get("pid"), int)
+    assert _is_live_tool_job(job) is True
+
+    count, _ = clean_temp_artifacts(tmp_path, clean_all=True)
+    assert job.is_dir(), "fresh seeded job dir must be skipped by --clean-all"
+    assert "skip live" in capsys.readouterr().out.lower()
+
+    # Only after a finished status does clean consider it deletable.
+    _mark_finished_dead(job)
+    assert _is_live_tool_job(job) is False
+    count2, _ = clean_temp_artifacts(tmp_path, clean_all=True)
+    assert not job.exists()
+    assert count2 >= 1
 
 
 def test_is_dangerous_publish_path_cross_platform():
@@ -142,6 +194,7 @@ def test_burn_clean_cli_real_newline_and_no_progress(tmp_path: Path):
     out.mkdir()
     job = make_job_dir(out, prefix="job_")
     (job / "a.bin").write_bytes(b"1234")
+    _mark_finished_dead(job)
     progress = out / "x.progress.json"
     progress.write_text("{}", encoding="utf-8")
     partial = out / "y.partial.mp4"
@@ -200,6 +253,7 @@ def test_burn_clean_only_job_dir_cli(tmp_path: Path):
     (job_a / "a.bin").write_bytes(b"a")
     job_b = make_job_dir(out, prefix="job_")
     (job_b / "b.bin").write_bytes(b"b")
+    _mark_finished_dead(job_a)
     dummy_video = tmp_path / "v.mp4"
     dummy_video.write_bytes(b"\x00")
     dummy_html = tmp_path / "c.html"
@@ -260,6 +314,7 @@ def test_render_cn_chat_clean_early_exit_no_pipeline(tmp_path: Path):
     temp.mkdir(parents=True)
     job = make_job_dir(temp, prefix="job_")
     (job / "junk").write_text("x", encoding="utf-8")
+    _mark_finished_dead(job)
     progress = temp / "t.progress.json"
     progress.write_text("{}", encoding="utf-8")
     partial = temp / "z.partial.mp4"

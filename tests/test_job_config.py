@@ -333,3 +333,47 @@ def test_generated_job_rules_comment_matches_post_translation_behavior(job_mod):
     text = job_mod.render_job_yaml({"rules": "configs/rules.example.yaml"})
     assert "翻译后" in text
     assert "翻译前规则" not in text
+
+
+def test_load_job_malformed_yaml_raises_value_error(tmp_path: Path, job_mod):
+    """yaml.YAMLError must surface as ValueError (callers only catch OSError/ValueError)."""
+    p = tmp_path / "broken.yaml"
+    p.write_text("a: [unclosed\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="语法错误"):
+        job_mod.load_job_file(p)
+
+
+def test_write_load_roundtrip_newline_and_dash_prefix(tmp_path: Path, job_mod):
+    """_yaml_quote must escape newlines / "- " prefixes so the file round-trips.
+
+    Regression: `context: - note` was written bare and yaml.safe_load then
+    raised ScannerError (block sequence instead of a scalar).
+    """
+    fields = {
+        "mode": "translate",
+        "context": "第一行\n第二行",
+        "target_language": "- note",
+    }
+    path = job_mod.write_job_file(tmp_path / "roundtrip.yaml", fields, title="rt")
+    # Atomic write: no tmp leftovers in the job dir.
+    assert not list(tmp_path.glob("*.tmp"))
+    text = path.read_text(encoding="utf-8")
+    assert '"- note"' in text
+    assert "\\n" in text
+    loaded = job_mod.load_job_file(path)
+    assert loaded["context"] == "第一行\n第二行"
+    assert loaded["target_language"] == "- note"
+
+
+def test_yaml_quote_plain_values_unchanged(job_mod):
+    """Existing plain path/number/bool quoting must stay byte-identical."""
+    assert job_mod._yaml_quote("path/to/video.mp4") == "path/to/video.mp4"
+    assert job_mod._yaml_quote("C:\\a b\\c.mp4") == '"C:\\\\a b\\\\c.mp4"'
+    assert job_mod._yaml_quote(10) == "10"
+    assert job_mod._yaml_quote(12.5) == "12.5"
+    assert job_mod._yaml_quote(True) == "true"
+    assert job_mod._yaml_quote("") == '""'
+    # Newlines and "- " prefixes must be quoted with escapes.
+    assert job_mod._yaml_quote("a\nb") == '"a\\nb"'
+    assert job_mod._yaml_quote("- note") == '"- note"'
+    assert job_mod._yaml_quote("-note") == "-note"  # no space: plain scalar stays
