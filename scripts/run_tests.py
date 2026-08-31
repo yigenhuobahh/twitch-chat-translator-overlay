@@ -306,6 +306,19 @@ def main() -> int:
             )
             return code
 
+    # Portable FFmpeg ships in tools/; surface it before PATH probes so the
+    # ffmpeg/ffprobe detection below sees it. run_tests may run from an
+    # installed wheel, so import defensively (no hard dependency).
+    try:
+        from env_bootstrap import prepend_tools_ffmpeg_to_path
+    except ImportError:
+        prepend_tools_ffmpeg_to_path = None  # type: ignore[assignment]
+    try:
+        if prepend_tools_ffmpeg_to_path is not None:
+            prepend_tools_ffmpeg_to_path()
+    except AttributeError:
+        pass
+
     ffmpeg_ok = safe_which("ffmpeg") is not None and safe_which("ffprobe") is not None
 
     # Marker selection

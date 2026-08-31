@@ -69,9 +69,13 @@ def test_resolve_encode_options_bitrate_mode():
     assert "-crf" not in args
 
 
-def test_nvenc_args_shape_even_if_encoder_missing():
+def test_nvenc_args_shape_even_if_encoder_missing(monkeypatch):
+    import encode_options
     from encode_options import build_video_encode_args, resolve_encode_options
 
+    # Explicit HW encoder + failing trial now aborts resolution; stub the trial
+    # as passing so this test only asserts argv shape on machines without a GPU.
+    monkeypatch.setattr(encode_options, "_trial_encode", lambda codec: True)
     # Force nvenc logical family; concrete codec may or may not exist on this machine.
     opts = resolve_encode_options(encoder="nvenc", crf=19, video_preset="p4")
     assert opts.resolved_encoder == "nvenc"

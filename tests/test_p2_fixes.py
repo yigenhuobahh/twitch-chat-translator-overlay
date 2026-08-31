@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 # ---------------------------------------------------------------------------
 # WebM duration validation in compose_video
 # ---------------------------------------------------------------------------
@@ -122,10 +124,25 @@ class TestGPUTrialEncode:
                 assert opts.resolved_encoder == "nvenc"
                 assert any("auto selected" in n for n in opts.notes)
 
-    def test_explicit_hw_warns_on_failure(self):
-        """When user explicitly requests HW encoder that fails trial, should warn."""
+    def test_explicit_hw_raises_on_failure_by_default(self):
+        """Explicit HW encoder that fails trial must abort before render (ValueError)."""
         from encode_options import resolve_encode_options
 
+        with mock.patch("encode_options.detect_hw_encoders") as mock_hw:
+            mock_hw.return_value = {"nvenc": "h264_nvenc", "x264": "libx264"}
+            with mock.patch("encode_options._trial_encode", return_value=False):
+                with pytest.raises(ValueError) as exc_info:
+                    resolve_encode_options(encoder="nvenc")
+                msg = str(exc_info.value)
+                assert "nvenc" in msg
+                assert "trial encode failed" in msg
+                assert "x264" in msg or "auto" in msg
+
+    def test_explicit_hw_warns_and_continues_with_risk_escape(self, monkeypatch):
+        """TWITCH_OVERLAY_ALLOW_ENCODER_RISK=1 keeps legacy warn-and-continue."""
+        from encode_options import resolve_encode_options
+
+        monkeypatch.setenv("TWITCH_OVERLAY_ALLOW_ENCODER_RISK", "1")
         with mock.patch("encode_options.detect_hw_encoders") as mock_hw:
             mock_hw.return_value = {"nvenc": "h264_nvenc", "x264": "libx264"}
             with mock.patch("encode_options._trial_encode", return_value=False):

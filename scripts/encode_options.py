@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
+import os
 import re
 import subprocess
 from typing import Any
@@ -207,13 +208,22 @@ def resolve_encode_options(
             concrete = {"nvenc": "h264_nvenc", "qsv": "h264_qsv", "amf": "h264_amf"}[encoder]
         else:
             concrete = available[encoder]
-            # Trial: if explicitly requested HW encoder doesn't actually work,
-            # warn early but still respect user's explicit choice.
+            # Trial: if the explicitly requested HW encoder doesn't actually work,
+            # abort before render starts (encode_options runs long before compose;
+            # failing here costs zero render time). Set
+            # TWITCH_OVERLAY_ALLOW_ENCODER_RISK=1 to keep the old warn-and-continue.
             if encoder in ("nvenc", "qsv", "amf") and not _trial_encode(concrete):
-                notes.append(
-                    f"warning: {encoder} ({concrete}) trial encode failed; "
-                    f"render may fail (driver/GPU issue?). Use --encoder x264 as fallback."
-                )
+                if os.getenv("TWITCH_OVERLAY_ALLOW_ENCODER_RISK") == "1":
+                    notes.append(
+                        f"warning: {encoder} ({concrete}) trial encode failed; "
+                        f"render may fail (driver/GPU issue?). Use --encoder x264 as fallback."
+                    )
+                else:
+                    raise ValueError(
+                        f"explicit encoder {encoder!r} ({concrete}) trial encode failed "
+                        f"(driver/GPU issue?); use --encoder x264 for a software fallback "
+                        f"or --encoder auto, or set TWITCH_OVERLAY_ALLOW_ENCODER_RISK=1 to proceed anyway"
+                    )
         resolved = encoder
 
     # Default presets differ by family.

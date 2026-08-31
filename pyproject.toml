@@ -41,6 +41,10 @@ dev = [
     "ruff==0.16.5",
     "bandit>=1.8",
     "pip-audit>=2.7",
+    # textual floor aligns with requirements-dev.txt's exact pin (textual==8.2.8):
+    # TabPane mount timing drifts across releases, so <9 keeps TUI behavior stable
+    # in production installs (requirements-dev pins the exact point version).
+    "textual>=8.2,<9",
     "tomli>=2.0; python_version < '3.11'",
 ]
 tui = []
@@ -160,7 +164,6 @@ source = ["scripts"]
 omit = [
   # These are process entrypoints. Their subprocess behavior is tested, but
   # cannot be attributed to the parent pytest coverage collector.
-  "scripts/fix_merge.py",
   "scripts/quick_demo.py",
   "scripts/run_tests.py",
 ]
@@ -220,6 +223,8 @@ known-first-party = [
   "chat_window",
   "common_utils",
   "cut_timeline",
+  "doctor_check",
+  "download_flow",
   "encode_options",
   "env_bootstrap",
   "job_config",
@@ -231,11 +236,20 @@ known-first-party = [
   "pipeline_plan",
   "pipeline_runner",
   "process_util",
+  "quick_demo",
   "render_cn_chat",
   "render_perf",
   "render_preset",
+  "review_tables",
   "run_meta",
   "run_tests",
+  "support_report",
+  "task_events",
+  "task_results",
+  "tui_history",
+  "tui_models",
+  "tui_run",
+  "tui_task",
   "translate_chat_openai",
   "translation_support",
   "twitch_chat_burn",

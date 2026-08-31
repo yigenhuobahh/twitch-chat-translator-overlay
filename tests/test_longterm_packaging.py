@@ -200,4 +200,4 @@ def test_coverage_gate_is_configured_for_core_scripts_only():
 
     assert coverage["run"]["source"] == ["scripts"]
     assert coverage["report"]["fail_under"] == 65
-    assert {"scripts/fix_merge.py", "scripts/quick_demo.py", "scripts/run_tests.py"} <= set(coverage["run"]["omit"])
+    assert {"scripts/quick_demo.py", "scripts/run_tests.py"} <= set(coverage["run"]["omit"])

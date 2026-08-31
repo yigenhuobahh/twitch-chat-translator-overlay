@@ -88,7 +88,15 @@ def doctor(args):
         "Pillow": "PIL",
         "beautifulsoup4": "bs4",
         "openai": "openai",
+        "openpyxl": "openpyxl",
         "PyYAML": "yaml",
+    }
+    # WARN-only packages: 与下方「翻译 API 三件套」口径一致——不装也能渲染，
+    # 只有对应功能需要（openai: 仅复用翻译；openpyxl: 仅导出 XLSX 复核表）。
+    optional_pkgs = {"openai", "openpyxl"}
+    optional_pkg_hints = {
+        "openai": "仅复用翻译需要；不使用翻译功能可忽略",
+        "openpyxl": "仅导出 XLSX 复核表需要",
     }
     missing_required_pkgs: list[str] = []
     for display, module in packages.items():
@@ -99,10 +107,14 @@ def doctor(args):
             present = module in sys.modules
         if not present and module in ("PIL", "bs4", "yaml"):
             missing_required_pkgs.append(display)
+        fix = f"pip install {display}\n      或: pip install -r requirements.txt"
+        if display in optional_pkg_hints:
+            fix += f"\n      {optional_pkg_hints[display]}"
         check(
             display,
             present,
-            fix=f"pip install {display}\n      或: pip install -r requirements.txt",
+            fix=fix,
+            required=display not in optional_pkgs,
         )
 
     # 系统字体探测代价高：detect_cjk_font() 返回 (regular, bold) 元组，只调用一次，
