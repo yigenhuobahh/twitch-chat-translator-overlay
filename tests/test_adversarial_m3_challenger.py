@@ -223,6 +223,7 @@ def test_tui_app_unmount_while_probe_thread_active():
     pytest.importorskip("textual")
     from textual.widgets import Button, TabbedContent
 
+    from helpers import wait_for_widget
     from tui_run import OverlayTui
 
     probe_started = threading.Event()
@@ -237,12 +238,17 @@ def test_tui_app_unmount_while_probe_thread_active():
         with patch("tui_run.probe_translate_api", side_effect=slow_probe):
             async with app.run_test(size=(140, 50)) as pilot:
                 app.query_one(TabbedContent).active = "advanced"
-                await pilot.pause(0.02)
+                await wait_for_widget(app, pilot, "#form-validation")
 
                 test_btn = app.query_one("#btn-test-api", Button)
                 await pilot.click(test_btn)
-                await pilot.pause(0.02)
-                # Ensure probe started
+                # The @work(thread=True) probe starts on an executor thread;
+                # pilot.pause does not cover that thread's startup, so poll
+                # the event instead of asserting after a fixed pause.
+                for _ in range(100):
+                    if probe_started.is_set():
+                        break
+                    await pilot.pause(0.02)
                 assert probe_started.is_set()
                 # App exits now while thread is still active
 
