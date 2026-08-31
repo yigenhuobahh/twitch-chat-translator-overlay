@@ -2033,12 +2033,18 @@ def render_overlay(chat_data, out_dir, video_path, config):
             safe_name = default_name
         preview_path = os.path.join(out_dir, safe_name)
         bg_path = os.path.join(out_dir, "preview_video_frame.png")
-        # Accurate single-frame extract (decode then seek) for preview alignment.
+        # Accurate single-frame extract for preview alignment. -ss MUST bind to
+        # the input (placed before -i): input seek jumps straight to the nearest
+        # keyframe at/before the target and decodes only from there. Output seek
+        # (-ss after -i) decodes the whole prefix first — O(t) work that reliably
+        # blew the 120s timeout on mid-VOD previews. compose_video's dense/mid
+        # preview seek uses the same input-seek ordering.
         try:
             r = subprocess.run(
                 [
-                    require_executable("ffmpeg"), "-y", "-i", video_path,
-                    "-ss", str(preview_t), "-frames:v", "1", bg_path,
+                    require_executable("ffmpeg"), "-y",
+                    "-ss", str(preview_t), "-i", video_path,
+                    "-frames:v", "1", bg_path,
                 ],
                 capture_output=True,
                 text=True,
@@ -2186,6 +2192,10 @@ def resolve_source_av_timing(video_path, source_has_audio=None):
 
     Returns dict:
       source_duration, video_start, audio_start, video_lead_in, has_audio
+      + audio_late: >=0 seconds by which the audio stream starts AFTER the
+        video (mirror of video_lead_in, which measures video after audio).
+        Compose uses it to re-insert the offset the audio branch's asetpts
+        erases (see compose_video).
     """
     source_summary = probe_media_summary(video_path)
     has_audio = (
@@ -2196,12 +2206,14 @@ def resolve_source_av_timing(video_path, source_has_audio=None):
     video_start = get_stream_start_time(video_path, "v:0")
     audio_start = get_stream_start_time(video_path, "a:0") if has_audio else 0.0
     video_lead_in = max(0.0, float(video_start) - float(audio_start)) if has_audio else 0.0
+    audio_late = max(0.0, float(audio_start) - float(video_start)) if has_audio else 0.0
     source_duration = float(source_summary.get("duration") or 0.0)
     return {
         "source_duration": source_duration,
         "video_start": float(video_start or 0.0),
         "audio_start": float(audio_start or 0.0),
         "video_lead_in": float(video_lead_in or 0.0),
+        "audio_late": float(audio_late or 0.0),
         "has_audio": has_audio,
         "summary": source_summary,
     }
@@ -2303,6 +2315,48 @@ def validate_rendered_output(
     if w < int(min_width) or h < int(min_height):
         return False, summary, f"video dimensions too small: {w}x{h}"
     return True, summary, ""
+
+
+def build_audio_encode_args_for_compose(
+    opts,
+    source_has_audio,
+    *,
+    video_lead_in=0.0,
+    audio_delay_ms=0,
+    notes=None,
+):
+    """Burn-side wrapper around build_audio_encode_args (encode_options.py).
+
+    encode_options builds audio args without knowing the source's audio-late
+    offset (audio_start > video_start): its re-encode branch rewrites the audio
+    stream to 0 via asetpts=PTS-STARTPTS, which plays audio that starts late
+    EARLY by that offset (A/V desync). This wrapper re-inserts the erased
+    offset with adelay AFTER asetpts in the -af value (asetpts stays first).
+    ``-c:a copy`` has no filter slot for adelay, so it falls back to AAC —
+    mirroring the copy→aac fallback encode_options already applies for lead-in.
+    Lives on the burn side only; encode_options is untouched.
+    """
+    args = list(build_audio_encode_args(
+        opts,
+        source_has_audio,
+        video_lead_in=video_lead_in,
+        notes=notes,
+    ))
+    if audio_delay_ms <= 0 or not args:
+        return args
+    af_idx = args.index("-af") if "-af" in args else -1
+    if af_idx >= 0 and af_idx + 1 < len(args):
+        args[af_idx + 1] = f"{args[af_idx + 1]},adelay={audio_delay_ms}:all=1"
+        return args
+    if notes is not None:
+        notes.append(
+            f"audio-codec copy 无法应用 adelay={audio_delay_ms}:all=1，已回退 aac 以恢复音画对齐"
+        )
+    return [
+        "-c:a", "aac",
+        "-b:a", getattr(opts, "audio_bitrate", "192k"),
+        "-af", f"asetpts=PTS-STARTPTS,adelay={audio_delay_ms}:all=1",
+    ]
 
 
 def compose_video(video_path, frames_dir, out_dir, config, duration):
@@ -2410,11 +2464,34 @@ def compose_video(video_path, frames_dir, out_dir, config, duration):
     # 例外：预览 seek 到片中（preview_clip_start > 0）时，输入已经过了源
     # 片头 A/V 错位，再 tpad 会把“当前 seek 到的画面”冻 1 秒，表现为卡顿。
     timing = resolve_source_av_timing(video_path)
-    source_has_audio = bool(timing["has_audio"])
-    source_lead_in = float(timing["video_lead_in"] or 0.0)
+    # Stubs/mocks may return only the original five keys — always .get so a
+    # missing newer field can never KeyError; fall back to the stream starts.
+    source_has_audio = bool(timing.get("has_audio"))
+    source_lead_in = float(timing.get("video_lead_in") or 0.0)
+    audio_late = float(timing.get("audio_late") or 0.0)
+    if source_has_audio and audio_late <= 0.0:
+        audio_late = max(
+            0.0,
+            float(timing.get("audio_start") or 0.0) - float(timing.get("video_start") or 0.0),
+        )
     seek_ss = float(getattr(config, "preview_clip_start", 0.0) or 0.0)
     # Only apply lead-in freeze when composing from the true start of the source.
     video_lead_in = 0.0 if seek_ss > 1e-6 else source_lead_in
+    # Audio-late compensation: the audio branch (encode_options) rewrites the
+    # audio stream to start at 0 (asetpts=PTS-STARTPTS). When the source audio
+    # starts LATER than the video, that erases the offset and plays the audio
+    # (audio_start - video_start) seconds early — A/V desync. Re-insert the
+    # offset with adelay AFTER asetpts (mirror of the lead-in freeze, opposite
+    # direction). Only from the true start: after a preview seek both streams
+    # rebase at the seek point and the head offset no longer exists.
+    audio_delay_ms = 0
+    if source_has_audio and seek_ss <= 1e-6 and audio_late > 0.001:
+        audio_delay_ms = int(round(audio_late * 1000.0))
+        print(
+            f"  检测到音频相对视频延后 {audio_late:.3f}s；"
+            f"音频滤镜 asetpts 后追加 adelay={audio_delay_ms}:all=1 恢复音画对齐",
+            flush=True,
+        )
     # Lead-in rewrites A/V start times (freeze first frame for editors).
     # Container duration target stays the render window (~source length),
     # not source+lead_in — otherwise validation false-fails complete encodes.
@@ -2446,8 +2523,11 @@ def compose_video(video_path, frames_dir, out_dir, config, duration):
         )
         # Pad main with frozen first frame for lead-in, then trim back to
         # output_duration so container length stays ~source (not source+lead_in).
-        # Chat is delayed by lead-in without padding its tail, so the full
-        # render window of chat remains visible after the freeze.
+        # Chat is delayed by lead-in (setpts+lead_in/TB), so its last lead_in
+        # seconds land past output_duration on the output timeline. The -t cap
+        # below is raised by video_lead_in so the muxer itself cannot clip that
+        # delayed region; streams still end naturally at ~output_duration, so
+        # the published length stays ~render/source.
         main_filter = (
             f"[0:v]setpts=PTS-STARTPTS,"
             f"tpad=start_duration={video_lead_in:.6f}:start_mode=clone,"
@@ -2498,17 +2578,21 @@ def compose_video(video_path, frames_dir, out_dir, config, duration):
         "-map", "0:a?",
         *build_video_encode_args(encode),
         "-r", fps_to_ffmpeg_rate(output_fps), "-fps_mode", "cfr",
-        *build_audio_encode_args(
+        *build_audio_encode_args_for_compose(
             encode,
             source_has_audio,
             video_lead_in=video_lead_in,
+            audio_delay_ms=audio_delay_ms,
             notes=encode.notes if hasattr(encode, "notes") else None,
         ),
         "-movflags", "+faststart",
         # MP4 的 make_zero 会引入 AAC priming / H.264 重排后的首帧偏移；
         # 保留重编码后从 0 开始的时间戳，对编辑器兼容性更好。
         "-avoid_negative_ts", "disabled",
-        "-t", str(output_duration),
+        # -t 是上限而非目标：lead-in 冻结把 chat 层延后 video_lead_in 秒，
+        # 其最后 lead_in 秒落在 output_duration 之后，若上限不含 lead-in，
+        # muxer 会截掉聊天时间线末尾的消息（流自然结束时实际时长不受影响）。
+        "-t", f"{output_duration + max(0.0, video_lead_in):.6f}",
         partial_path,
     ]
     log_path = os.path.join(out_dir, "ffmpeg-overlay.log")
