@@ -31,6 +31,7 @@ import re
 import shutil
 import sys
 import tempfile
+import uuid
 
 # Allow sibling imports when loaded as a script or via importlib from tests.
 _SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -661,11 +662,32 @@ def _prepare_translation_context(context: str, workdir: Path | None) -> list[str
         return ["--context", context]
     base = Path(workdir) if workdir else Path.cwd()
     base.mkdir(parents=True, exist_ok=True)
-    path = base / "translation_context.txt"
+    # 文件名带 pid+随机后缀：并发/重试不会互相覆盖，也不会以固定文件名
+    # 把敏感 glossary 长期留在 --workdir/cwd；写盘成功后登记到
+    # _translation_context_files，由调用方在翻译子进程结束后清理。
+    path = base / f"translation_context_{os.getpid()}_{uuid.uuid4().hex[:8]}.txt"
     path.write_text(context, encoding="utf-8")
+    _translation_context_files.append(path)
     max_batch_chars = min(TRANSLATION_MAX_BATCH_CHARS_CEILING, len(context) + 16_000)
     log(f"[info] 翻译 context 过长（{len(context)} 字符），改用文件传递: {path}")
     return ["--context-file", str(path), "--max-batch-chars", str(max_batch_chars)]
+
+
+# _prepare_translation_context 已写盘、待清理的 context 交接文件
+# （内容可能含敏感 glossary）。同一时刻可能存在多个（首次运行失败后的
+# 重试会再写一个）；清理函数删除全部并清空，幂等、失败静默。
+_translation_context_files: list[Path] = []
+
+
+def _cleanup_translation_context_file() -> None:
+    """Best-effort remove all pending context files; silent on failure."""
+    pending = list(_translation_context_files)
+    _translation_context_files.clear()
+    for path in pending:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def handle_translate_run_failure(
@@ -714,22 +736,26 @@ def handle_translate_run_failure(
     except EOFError:
         choice = "c"
     if choice in ("r", "retry", "重试"):
-        context_args = _prepare_translation_context(translation_context, workdir)
-        run(
-            [
-                sys.executable,
-                str(translator),
-                str(trans_json),
-                *context_args,
-                "--target-language",
-                target_language,
-                "--batch-size",
-                str(batch_size),
-                "--workers",
-                str(workers),
-            ],
-            error_hint="翻译重试仍失败。可改用人工表：--manual-translation 或修好 API 后再跑",
-        )
+        try:
+            context_args = _prepare_translation_context(translation_context, workdir)
+            run(
+                [
+                    sys.executable,
+                    str(translator),
+                    str(trans_json),
+                    *context_args,
+                    "--target-language",
+                    target_language,
+                    "--batch-size",
+                    str(batch_size),
+                    "--workers",
+                    str(workers),
+                ],
+                error_hint="翻译重试仍失败。可改用人工表：--manual-translation 或修好 API 后再跑",
+            )
+        finally:
+            # 重试的 context 交接文件（可能含敏感 glossary）用完即清。
+            _cleanup_translation_context_file()
         return "api"
     if choice in ("q", "quit", "exit"):
         raise err
@@ -1547,6 +1573,12 @@ def _main():
     if getattr(args, "download", None):
         raise SystemExit(_run_download_flow(args, runner=active_runner()))
 
+    # --doctor 是纯诊断：必须在 --job 加载与交互询问之前早退，否则
+    # `--doctor --job x.yaml` 会在 job 缺少 video/chat_html 时先进入
+    # 交互提问（或直接报错退出），诊断根本跑不到。
+    if args.doctor:
+        raise SystemExit(doctor(args))
+
     # --job fills only fields still at CLI default (explicit CLI wins).
     job_applied: list[str] = []
     if getattr(args, "job", None):
@@ -1646,9 +1678,7 @@ def _main():
             print(f"[render-preset] 加载失败: {e}")
             raise SystemExit(2)
 
-    # Doctor / clean early exits before mode guards (mode=render should not block doctor).
-    if args.doctor:
-        raise SystemExit(doctor(args))
+    # Clean early exit before mode guards; doctor 早退已前移至 --job 处理之前。
 
     companion_err = clean_companion_flags_error(args)
     if companion_err:
@@ -1958,6 +1988,11 @@ def _main():
             )
             if mid == "manual":
                 return
+        finally:
+            # context 交接文件（可能含敏感 glossary）只在翻译子进程运行期间
+            # 需要存在；成功、失败、重试返回后一律清理（重试的文件由
+            # handle_translate_run_failure 内部的 finally 清理，此处幂等）。
+            _cleanup_translation_context_file()
         if DRY_RUN:
             log("\n[dry-run] 跳过渲染步骤。")
             return

@@ -786,3 +786,106 @@ def test_default_resume_retries_unchanged_original_fallback(
     assert updated["messages"][0]["translation"] == "新译文"
     assert progress["translations"]["0"] == "新译文"
     assert progress["failed"] == []
+
+
+def test_progress_payload_does_not_store_plaintext_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """SEC: .progress.json 不得包含 context 明文（glossary 可能敏感）。"""
+    import translate_chat_openai as tr
+
+    json_path = tmp_path / "ctx-secret.json"
+    json_path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {"index": 0, "author": "alice", "original": "hello", "translation": ""}
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    secret_context = "机密 glossary：PogChamp -> 惊讶 secret-term-42 -> 绝密译名"
+    record: dict = {}
+    monkeypatch.setattr(tr, "OpenAI", _success_openai(record, "新译文"))
+    monkeypatch.setattr(tr, "BASE_URL", "https://provider.invalid/v1")
+    monkeypatch.setattr(tr, "API_KEY", "stub-key")
+    monkeypatch.setattr(tr, "MODEL", "stub-model")
+    monkeypatch.setattr(
+        tr.sys,
+        "argv",
+        [
+            "translate_chat_openai.py",
+            str(json_path),
+            "--context",
+            secret_context,
+            "--workers",
+            "1",
+        ],
+    )
+
+    tr.main()
+
+    raw = tr.progress_path_for(json_path).read_text(encoding="utf-8")
+    progress = json.loads(raw)
+    assert secret_context not in raw
+    assert "context" not in progress
+    assert progress["context_fingerprint"] == tr.context_fingerprint(secret_context)
+    assert progress["context_length"] == len(secret_context)
+
+
+def test_progress_compatibility_supports_fingerprinted_and_legacy_context():
+    """新格式按指纹判兼容；旧明文 context 相等即兼容（存量文件/手写种子）。"""
+    import translate_chat_openai as tr
+
+    identity = {
+        "schema_version": tr.PROGRESS_SCHEMA_VERSION,
+        "target_language": "zh",
+        "provider": tr.TRANSLATION_PROVIDER,
+        "base_url_fingerprint": tr.base_url_fingerprint("https://provider.invalid/v1"),
+        "model": "stub-model",
+        "prompt_version": tr.PROMPT_VERSION,
+    }
+    compat_kwargs = {
+        "target_language": "zh",
+        "context": "livestream chat",
+        "provider": tr.TRANSLATION_PROVIDER,
+        "base_url": "https://provider.invalid/v1",
+        "model": "stub-model",
+        "prompt_version": tr.PROMPT_VERSION,
+    }
+
+    # 旧格式：明文 context 相等 → 兼容；不等 → 报不兼容。
+    legacy = dict(identity)
+    legacy["context"] = "livestream chat"
+    assert tr.progress_compatibility_errors(legacy, **compat_kwargs) == []
+    legacy["context"] = "other context"
+    assert "context" in tr.progress_compatibility_errors(legacy, **compat_kwargs)
+
+    # 新格式：只存指纹与长度即可判兼容，无需明文落盘。
+    fingerprinted = dict(identity)
+    fingerprinted["context_fingerprint"] = tr.context_fingerprint("livestream chat")
+    fingerprinted["context_length"] = len("livestream chat")
+    assert tr.progress_compatibility_errors(fingerprinted, **compat_kwargs) == []
+    fingerprinted["context_fingerprint"] = tr.context_fingerprint("other")
+    assert "context" in tr.progress_compatibility_errors(fingerprinted, **compat_kwargs)
+
+
+def test_corrupt_progress_file_warns_to_stderr_and_starts_empty(
+    tmp_path: Path,
+    capsys,
+):
+    """损坏的进度文件必须告警，不得静默当作空进度。"""
+    import translate_chat_openai as tr
+
+    path = tmp_path / "broken.progress.json"
+    path.write_text("{not valid json", encoding="utf-8")
+
+    loaded = tr.load_progress(path)
+
+    assert loaded["translations"] == {}
+    err = capsys.readouterr().err
+    assert "[warn]" in err
+    assert "broken.progress.json" in err

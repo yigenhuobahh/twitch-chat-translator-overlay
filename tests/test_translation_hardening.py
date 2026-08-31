@@ -431,6 +431,111 @@ def test_progress_translation_with_dict_value_is_retranslated(
 
 
 # ---------------------------------------------------------------------------
+# Context auto-raise: file-delivered context must not trip the per-batch cap
+# ---------------------------------------------------------------------------
+
+
+def test_main_auto_raises_max_batch_chars_for_long_context_file(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """超长 context（--context-file）且未传 --max-batch-chars 时 main() 自动抬高上限。
+
+    默认 16000 对 4 万字符 context 会在 build_translation_batches 对第一条
+    消息抛"单条提示超过上限"；main() 必须按与管道侧 render_cn_chat 相同的
+    公式 min(200_000, len(context) + 16_000) 抬高后正常完成翻译。
+    """
+    import translate_chat_openai as tr
+
+    json_path = tmp_path / "long-ctx.json"
+    json_path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {"index": 0, "author": "alice", "original": "hello", "translation": ""}
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    ctx_file = tmp_path / "glossary.txt"
+    ctx_file.write_text("g" * 40_000, encoding="utf-8")
+    payload = json.dumps(
+        {"translations": [{"index": 0, "translation": "译"}]},
+        ensure_ascii=False,
+    )
+    record = {"calls": 0}
+    monkeypatch.setattr(tr, "OpenAI", _client_returning([payload], record))
+    monkeypatch.setattr(tr, "BASE_URL", "https://provider.invalid/v1")
+    monkeypatch.setattr(tr, "API_KEY", "stub-key")
+    monkeypatch.setattr(tr, "MODEL", "stub-model")
+    monkeypatch.setattr(
+        tr.sys,
+        "argv",
+        [
+            "translate_chat_openai.py",
+            str(json_path),
+            "--context-file",
+            str(ctx_file),
+            "--workers",
+            "1",
+        ],
+    )
+
+    tr.main()
+
+    assert record["calls"] == 1
+    updated = json.loads(json_path.read_text(encoding="utf-8"))
+    assert updated["messages"][0]["translation"] == "译"
+
+
+def test_prepare_translation_context_unique_filename_and_cleanup(tmp_path):
+    """context 交接文件带 pid+随机后缀（并发/重试不覆盖），用后即清（静默）。"""
+    pipe = load_module("render_cn_chat", "render_cn_chat.py")
+    context = "词" * 9000  # > argv 阈值 → 走文件传递
+
+    args_a = pipe._prepare_translation_context(context, tmp_path)
+    args_b = pipe._prepare_translation_context(context, tmp_path)
+
+    path_a, path_b = Path(args_a[1]), Path(args_b[1])
+    try:
+        assert path_a.parent.resolve() == tmp_path.resolve()
+        assert path_b.parent.resolve() == tmp_path.resolve()
+        assert path_a != path_b
+        assert path_a.is_file() and path_b.is_file()
+        assert path_a.name.startswith(f"translation_context_{os.getpid()}_")
+
+        # 清理：登记的全部文件被删除，注册表清空，重复调用幂等。
+        pipe._cleanup_translation_context_file()
+        assert not path_a.exists() and not path_b.exists()
+        assert pipe._translation_context_files == []
+        pipe._cleanup_translation_context_file()  # 幂等
+    finally:
+        pipe._cleanup_translation_context_file()
+
+
+def test_prepare_translation_context_cleanup_silences_oserror(tmp_path, monkeypatch):
+    """清理失败（如文件被占用）必须静默，不能打断翻译流水线。"""
+    pipe = load_module("render_cn_chat", "render_cn_chat.py")
+    context = "词" * 9000
+    args = pipe._prepare_translation_context(context, tmp_path)
+    path = Path(args[1])
+
+    def raise_oserror(self, missing_ok=False):
+        raise OSError("file in use")
+
+    monkeypatch.setattr(Path, "unlink", raise_oserror)
+    pipe._cleanup_translation_context_file()  # 不得抛异常
+    monkeypatch.undo()
+    assert pipe._translation_context_files == []
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # PARSE-N5: dotenv export prefix + inline comments
 # ---------------------------------------------------------------------------
 

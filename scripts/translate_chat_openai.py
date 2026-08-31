@@ -66,6 +66,9 @@ MODEL = os.getenv("OPENAI_COMPAT_MODEL") or os.getenv("AGNES_MODEL")
 BATCH_SIZE = 10
 MAX_WORKERS = 4
 MAX_BATCH_CHARS = 16_000
+# 单批完整提示字符上限的硬顶；与管道侧 render_cn_chat.py 的
+# TRANSLATION_MAX_BATCH_CHARS_CEILING 保持一致。
+MAX_BATCH_CHARS_CEILING = 200_000
 PROGRESS_SCHEMA_VERSION = 2
 # 进度写盘节流:距上次落盘超过该秒数、或累计满该批数,才允许下一次非强制落盘。
 PROGRESS_SAVE_MIN_INTERVAL_SEC = 30.0
@@ -175,6 +178,16 @@ def base_url_fingerprint(base_url: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
 
+def context_fingerprint(context: str) -> str:
+    """Fingerprint the translation context so progress never stores it verbatim.
+
+    context 可能包含用户的敏感 glossary，进度文件只落 sha256 指纹与长度，
+    不落明文（写法与 base_url_fingerprint 一致）。
+    """
+    normalized = str(context or "").strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
 def progress_compatibility_errors(
     progress: dict,
     *,
@@ -189,7 +202,6 @@ def progress_compatibility_errors(
     expected = {
         "schema_version": PROGRESS_SCHEMA_VERSION,
         "target_language": str(target_language or "").strip(),
-        "context": str(context or "").strip(),
         "provider": str(provider or "").strip().lower(),
         "base_url_fingerprint": base_url_fingerprint(base_url),
         "model": str(model or "").strip(),
@@ -209,6 +221,17 @@ def progress_compatibility_errors(
                 actual = actual.lower()
         if actual != expected_value:
             mismatches.append(key)
+
+    # context 兼容性：新格式进度只存 context_fingerprint/context_length
+    # （避免敏感 glossary 明文落盘），按指纹比较；旧格式只有明文 "context"
+    # 字段时保持原有的相等比较，向后兼容既有进度文件与手写种子测试。
+    expected_context = str(context or "").strip()
+    if "context_fingerprint" in progress:
+        actual_fingerprint = str(progress.get("context_fingerprint") or "").strip()
+        if actual_fingerprint != context_fingerprint(expected_context):
+            mismatches.append("context")
+    elif str(progress.get("context") or "").strip() != expected_context:
+        mismatches.append("context")
     return mismatches
 
 
@@ -217,7 +240,14 @@ def load_progress(path: Path) -> dict:
         return empty_progress()
     try:
         data = load_json(path)
-    except Exception:
+    except Exception as exc:
+        # 损坏进度必须显式告警：静默当作空进度会让用户误以为续传成功。
+        print(
+            f"[warn] 进度文件损坏/无法解析，已忽略并重新翻译: {path}"
+            f" ({type(exc).__name__})",
+            file=sys.stderr,
+            flush=True,
+        )
         return empty_progress()
     if not isinstance(data, dict):
         return empty_progress()
@@ -673,6 +703,15 @@ def main():
         parser.error("--max-batch-chars 必须在 1000..200000")
     if args.request_timeout < 1 or args.request_timeout > 600:
         parser.error("--request-timeout 必须在 1..600")
+    # context（可能来自 --context-file 的超长 glossary）会进入每批完整提示，
+    # 因此单批上限随 context 长度自动抬高；公式与管道侧
+    # render_cn_chat._prepare_translation_context 保持一致（封顶同为 200_000）。
+    # 空 context 时公式结果即默认值 16000，不会改变行为；放在范围校验之后，
+    # 用户显式传错（如 500）仍按原样报错，不会被 max() 掩盖。
+    args.max_batch_chars = max(
+        args.max_batch_chars,
+        min(MAX_BATCH_CHARS_CEILING, len(args.context) + MAX_BATCH_CHARS),
+    )
 
     # Re-read env at runtime so late dotenv / test env changes are honored.
     # If env is unset, keep module-level values (import-time load or test monkeypatch).
@@ -922,7 +961,9 @@ def main():
             "model": MODEL,
             "prompt_version": PROMPT_VERSION,
             "target_language": args.target_language,
-            "context": args.context,
+            # context 可能含敏感 glossary，进度文件只存指纹与长度，不存明文。
+            "context_fingerprint": context_fingerprint(args.context),
+            "context_length": len(args.context),
             "translations": {str(k): v for k, v in translation_map.items()},
             "fingerprints": message_fps,
             "json_translation_fingerprints": json_translation_fps,

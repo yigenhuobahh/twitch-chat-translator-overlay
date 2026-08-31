@@ -89,6 +89,9 @@ reviews/*_quality.json
 
 chat_data.json
 
+# Translator long-context handoff files (may contain private glossary)
+translation_context_*.txt
+
 emotes/
 
 # Optional portable FFmpeg (doctor --offer-fix / manual extract)
