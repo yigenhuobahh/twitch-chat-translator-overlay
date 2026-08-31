@@ -8,6 +8,26 @@ Notable changes to this project are documented in this file.
 
 - Started the next development cycle as `0.2.6.dev0` after the v0.2.5 release.
 - Added automatic GitHub issue creation when the scheduled max-suite or security-audit workflows fail, so nightly regressions are noticed instead of silently staying red.
+- Pinned all GitHub Actions to exact commit SHAs (with version comments) so a compromised action repository cannot move a tag under the release workflow's `contents: write` permission.
+- Split the review-table export/import pipeline and translation lint into `scripts/review_tables.py`, the `--download` flow into `scripts/download_flow.py`, and the `--doctor` environment check into `scripts/doctor_check.py`, shrinking the pipeline orchestrator from ~2900 to ~2100 lines; all moved code is verbatim and public signatures are unchanged.
+
+### Fixed
+
+- Fixed translation failing to start on glossary-heavy profiles: contexts longer than 8000 characters now travel to the translator subprocess via `--context-file` instead of the Windows 32,767-character command-line limit, and the per-batch character cap rises with the context so the translator's own guard accepts it.
+- Unified YAML loading errors onto `PipelineError` (which subclasses `SystemExit`, preserving exit codes) so callers can catch missing files, missing PyYAML, and invalid syntax uniformly.
+- Fixed catastrophic quadratic backtracking in the chat HTML emote-CSS regex: parsing now locates `content:url(...)` anchors linearly and only looks back a bounded window, so truncated HTML or brace-free multi-hundred-KB files parse in milliseconds instead of hanging for hours; covered by dedicated ReDoS regression tests.
+- Fixed audio lagging video (`audio_start > video_start`) producing A/V desync on the default AAC path: compose now re-inserts the source skew via `adelay` after `asetpts`, symmetric to the existing video lead-in freeze.
+- Fixed the chat timeline tail being silently cut during lead-in freeze: the compose duration cap now allows `duration + lead_in` so late messages can appear, and the contrary comment was corrected.
+- Fixed mid-video `--preview-frame` extraction using output seek (full decode up to the seek point, hitting the 120s timeout): `-ss` now precedes `-i` like the compose path.
+- Fixed `--clean-all` being able to delete an active job whose `run_meta.json` had not been written yet: `make_job_dir` now seeds a live `running` meta immediately, and `write_run_meta` uses a unique temp file + atomic replace.
+- Fixed explicit hardware encoder selection (`nvenc`/`qsv`/`amf`) failing its trial encode silently and only blowing up hours later at compose: it now fails fast with a suggested fallback, escape hatch via `TWITCH_OVERLAY_ALLOW_ENCODER_RISK=1`.
+- Fixed the TUI default offset `0.0` silently disabling auto alignment: the field now starts empty and zero is treated as unset, matching the "leave empty or 0 for auto" hint.
+- Fixed TUI API-probe worker and history-lock reads: probe feedback uses `post_message` (no more unbounded `call_from_thread` blocking on shutdown), the poll timer is stopped on unmount, and history read paths degrade gracefully when another instance holds the lock.
+- Fixed job YAML syntax errors raising raw tracebacks (`yaml.YAMLError` is now wrapped as a friendly `ValueError`), `_yaml_quote` producing unparseable YAML for newline/`- `-prefixed values, and `write_job_file` now writing atomically.
+- Fixed TSV review-table export failing when the parent directory does not exist (now created, matching the XLSX path), and `quick_demo`/`run_tests` now see the portable `tools/ffmpeg` install.
+- Fixed manual `--context-file` runs rejecting their own context when `--max-batch-chars` is left default (cap now auto-raises with context length, same formula as the pipeline), stopped persisting glossary plaintext in `.progress.json` (fingerprint instead), warn on corrupt progress files, and clean up per-run `translation_context_*.txt` handoff files.
+- Fixed `--doctor` entering the job media prompts when combined with `--job`, doctor treating a missing `openai` package as a hard failure (now WARN, plus an `openpyxl` WARN check), and `_save_api_config` wiping a stored API key when the field is left empty; added a `crf 0..51` bound to TUI validation.
+- Fixed packaging metadata drift: removed the deprecated `fix_merge` shim (superseded by `--segment`/`--cut`, and importing it exits by design), added the 11 missing modules to isort `known-first-party`, and pinned `textual>=8.2,<9` in the dev extra to match the pinned dev environment.
 
 ## [0.2.5] - 2026-08-31
 
