@@ -2,6 +2,13 @@
 
 Notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- Started the next development cycle as `0.2.6.dev0` after the v0.2.5 release.
+- Added automatic GitHub issue creation when the scheduled max-suite or security-audit workflows fail, so nightly regressions are noticed instead of silently staying red.
+
 ## [0.2.5] - 2026-08-31
 
 ### Added

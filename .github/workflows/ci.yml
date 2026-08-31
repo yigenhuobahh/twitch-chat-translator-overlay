@@ -258,6 +258,8 @@ jobs:
   scheduled-max:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      issues: write
 
     steps:
       - uses: actions/checkout@v7
@@ -282,9 +284,27 @@ jobs:
           PYTHONUTF8: "1"
         run: python scripts/run_tests.py --max --coverage
 
+      - name: Open issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_NAME: scheduled-max
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="[CI] Scheduled job failed: $JOB_NAME"
+          body="$(printf 'Scheduled job `%s` failed at %s (UTC).\nRun: %s\n\nClose this issue after the failure is fixed; the next failure will open a new one.' "$JOB_NAME" "$(date -u '+%Y-%m-%d %H:%M')" "$RUN_URL")"
+          number=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number')
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
+
   security-audit:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      issues: write
 
     steps:
       - uses: actions/checkout@v7
@@ -304,3 +324,19 @@ jobs:
 
       - name: Scan application code with Bandit
         run: python -m bandit -r scripts -q -ll
+
+      - name: Open issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_NAME: security-audit
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="[CI] Scheduled job failed: $JOB_NAME"
+          body="$(printf 'Scheduled job `%s` failed at %s (UTC).\nRun: %s\n\nClose this issue after the failure is fixed; the next failure will open a new one.' "$JOB_NAME" "$(date -u '+%Y-%m-%d %H:%M')" "$RUN_URL")"
+          number=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number')
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
