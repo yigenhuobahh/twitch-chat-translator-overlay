@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import shlex
 import site
 import sys
 import sysconfig
+import tempfile
 
 _DISTRIBUTION_SHARE = Path("share") / "twitch-chat-translator-overlay"
 _CONSOLE_ENTRY_NAMES = {
@@ -147,6 +149,27 @@ def require_executable(command: str) -> str:
 def env_loaded_from_dotenv(key: str) -> bool:
     """Whether this process variable was populated by load_dotenv_if_present."""
     return str(key) in _DOTENV_LOADED_KEYS
+
+
+def atomic_write_json(path: str | Path, data) -> None:
+    """原子写 JSON：先写同目录唯一临时文件，成功后 os.replace 原子替换。
+
+    中断（Ctrl+C / 断电 / 崩溃）不会截断已有 JSON，避免丢掉已花的 LLM 译文
+    与人工复核结果。参考 translate_chat_openai.save_json 与 run_meta 的既有模式。
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            json.dump(data, file, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def stdin_is_interactive() -> bool:
