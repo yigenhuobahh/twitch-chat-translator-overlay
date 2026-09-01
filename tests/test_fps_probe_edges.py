@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+import media_probe  # noqa: E402
 import twitch_chat_burn as burn  # noqa: E402
 
 
@@ -23,7 +24,7 @@ def test_apply_relative_layout_resolves_source_scaled_values(monkeypatch):
         x_ratio=0.016, y_ratio=0.55, width_ratio=0.58, height_ratio=0.30,
         font_size_ratio=0.034,
     )
-    monkeypatch.setattr(burn, "probe_video_dimensions", lambda _path: (1920, 1080))
+    monkeypatch.setattr(media_probe, "probe_video_dimensions", lambda _path: (1920, 1080))
     burn.apply_relative_layout(cfg, "video.mp4")
     assert (cfg.x, cfg.y, cfg.width, cfg.height, cfg.font_size) == (31, 594, 1114, 324, 37)
     assert cfg.emote_h == 40
@@ -34,7 +35,7 @@ def test_apply_relative_layout_geometry_ratio_keeps_explicit_emote_h(monkeypatch
         x=15, y=327, width=497, height=363, font_size=15, emote_h=40,
         width_ratio=0.3,
     )
-    monkeypatch.setattr(burn, "probe_video_dimensions", lambda _path: (1920, 1080))
+    monkeypatch.setattr(media_probe, "probe_video_dimensions", lambda _path: (1920, 1080))
     burn.apply_relative_layout(cfg, "video.mp4")
     assert cfg.width == 576
     assert cfg.font_size == 15
@@ -43,7 +44,7 @@ def test_apply_relative_layout_geometry_ratio_keeps_explicit_emote_h(monkeypatch
 
 def test_layout_bounds_warnings_detects_default_box_outside_360p(monkeypatch):
     cfg = burn.OverlayConfig(x=15, y=327, width=497, height=363, font_size=15)
-    monkeypatch.setattr(burn, "probe_video_dimensions", lambda _path: (640, 360))
+    monkeypatch.setattr(media_probe, "probe_video_dimensions", lambda _path: (640, 360))
     warns = burn.layout_bounds_warnings(cfg, "video.mp4")
     assert warns
     assert "画面外" in warns[0] or "画面内" in warns[0]
@@ -51,7 +52,7 @@ def test_layout_bounds_warnings_detects_default_box_outside_360p(monkeypatch):
 
 def test_layout_bounds_warnings_silent_when_box_fits(monkeypatch):
     cfg = burn.OverlayConfig(x=13, y=126, width=352, height=223, font_size=14)
-    monkeypatch.setattr(burn, "probe_video_dimensions", lambda _path: (640, 360))
+    monkeypatch.setattr(media_probe, "probe_video_dimensions", lambda _path: (640, 360))
     assert burn.layout_bounds_warnings(cfg, "video.mp4") == []
 
 
@@ -60,7 +61,7 @@ def test_adapt_absolute_layout_scales_default_box_for_360p(monkeypatch):
     cfg = burn.OverlayConfig(
         x=15, y=327, width=497, height=363, font_size=15, emote_h=22,
     )
-    monkeypatch.setattr(burn, "probe_video_dimensions", lambda _path: (640, 360))
+    monkeypatch.setattr(media_probe, "probe_video_dimensions", lambda _path: (640, 360))
     note = burn.adapt_absolute_layout_to_source(cfg, "video.mp4")
     assert note is not None
     assert cfg.x >= 0 and cfg.y >= 0
@@ -77,7 +78,7 @@ def test_adapt_absolute_layout_skips_when_ratios_set(monkeypatch):
         x=15, y=327, width=497, height=363, font_size=15,
         x_ratio=0.02, y_ratio=0.35, width_ratio=0.55, height_ratio=0.62,
     )
-    monkeypatch.setattr(burn, "probe_video_dimensions", lambda _path: (640, 360))
+    monkeypatch.setattr(media_probe, "probe_video_dimensions", lambda _path: (640, 360))
     before = (cfg.x, cfg.y, cfg.width, cfg.height)
     assert burn.adapt_absolute_layout_to_source(cfg, "video.mp4") is None
     assert (cfg.x, cfg.y, cfg.width, cfg.height) == before
@@ -86,7 +87,7 @@ def test_adapt_absolute_layout_skips_when_ratios_set(monkeypatch):
 def test_adapt_absolute_layout_skips_fully_inside_custom_crop(monkeypatch):
     """A user-authored box already inside a non-1080p frame must not be rewritten."""
     cfg = burn.OverlayConfig(x=10, y=40, width=200, height=120, font_size=12, emote_h=16)
-    monkeypatch.setattr(burn, "probe_video_dimensions", lambda _path: (640, 360))
+    monkeypatch.setattr(media_probe, "probe_video_dimensions", lambda _path: (640, 360))
     before = (cfg.x, cfg.y, cfg.width, cfg.height, cfg.font_size, cfg.emote_h)
     assert burn.adapt_absolute_layout_to_source(cfg, "video.mp4") is None
     assert (cfg.x, cfg.y, cfg.width, cfg.height, cfg.font_size, cfg.emote_h) == before
@@ -105,6 +106,9 @@ def test_probe_video_fps_parses_ntsc_fraction():
         args=["ffprobe"], returncode=0, stdout=json.dumps(payload), stderr=""
     )
     with mock.patch("twitch_chat_burn.subprocess.run", return_value=fake):
+        # Probe results are lru-cached per path+stat in media_probe; reset so the
+        # fake ffprobe response (not a sibling test's cached result) is exercised.
+        media_probe.cache_clear()
         fps = burn.probe_video_fps("dummy.mp4")
     assert fps is not None
     assert abs(fps - (30000 / 1001)) < 1e-6
@@ -123,13 +127,14 @@ def test_resolve_output_fps_preserves_ntsc_fraction():
         args=["ffprobe"], returncode=0, stdout=json.dumps(payload), stderr=""
     )
     with mock.patch("twitch_chat_burn.subprocess.run", return_value=fake):
+        media_probe.cache_clear()
         fps = burn.resolve_output_fps("dummy.mp4", explicit=None, fallback=24)
         assert abs(fps - (30000 / 1001)) < 1e-6
         assert burn.fps_to_ffmpeg_rate(fps) == "30000/1001"
 
 
 def test_resolve_output_fps_prefers_explicit_over_probe():
-    with mock.patch("twitch_chat_burn.probe_video_fps", return_value=59.94):
+    with mock.patch("media_probe.probe_video_fps", return_value=59.94):
         assert burn.resolve_output_fps("dummy.mp4", explicit=24, fallback=30) == 24.0
         # NTSC 59.94 explicit stays fractional
         fps = burn.resolve_output_fps("dummy.mp4", explicit=59.94, fallback=30)
@@ -140,6 +145,7 @@ def test_resolve_output_fps_prefers_explicit_over_probe():
 def test_probe_video_fps_invalid_returns_none():
     fake = subprocess.CompletedProcess(args=["ffprobe"], returncode=1, stdout="", stderr="boom")
     with mock.patch("twitch_chat_burn.subprocess.run", return_value=fake):
+        media_probe.cache_clear()
         assert burn.probe_video_fps("dummy.mp4") is None
 
 

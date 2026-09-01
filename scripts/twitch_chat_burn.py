@@ -22,7 +22,6 @@ Twitch Chat Overlay Tool
 """
 
 import argparse
-import bisect
 from collections import Counter, OrderedDict
 import json
 import math
@@ -33,9 +32,7 @@ import shutil
 import subprocess
 import sys
 import time
-import unicodedata
 
-_PROBE_TIMEOUT_SECONDS = 15.0
 _PREVIEW_FRAME_TIMEOUT_SECONDS = 120.0
 _MAX_EMOTE_ANIMATION_FRAMES = 300
 _MAX_EMOTE_SOURCE_PIXELS = 4_000_000
@@ -102,7 +99,6 @@ from chat_window import (
 from common_utils import (
     current_cli_invocation,
     ensure_utf8_stdio,
-    hex_to_rgb_soft,
     positive_float_arg,
     quote_cli_arg,
     require_executable,
@@ -149,7 +145,6 @@ from render_perf import (
 )
 from render_preset import apply_render_preset_to_namespace, load_render_preset
 from run_meta import mark_run_status, write_run_meta
-from translation_support import clean_translation_text as clean_imported_translation
 
 # Compatibility exports for existing scripts and tests.  Scene planning owns
 # their definitions, while this module remains the established render facade.
@@ -159,378 +154,63 @@ expected_overlay_frame_count = _overlay_scene.expected_overlay_frame_count
 resolve_message_image_cache_policy = _overlay_scene.resolve_message_image_cache_policy
 
 # ============================================================
-# 中文换行辅助函数
+# Extracted modules: media probe / text layout / scheduling / translation IO
 # ============================================================
+# These regions moved to dedicated modules; this facade re-exports every
+# moved symbol so scripts and tests keep the flat ``twitch_chat_burn``
+# namespace. Internal callers address probes via ``media_probe.<symbol>``
+# attribute access so monkeypatching the owner module keeps working.
 
-def is_cjk_char(ch):
-    """判断字符是否为 CJK 字符（中文/日文假名/韩文谚文）"""
-    cp = ord(ch)
-    if (0x4E00 <= cp <= 0x9FFF or      # CJK Unified Ideographs
-        0x3400 <= cp <= 0x4DBF or      # CJK Extension A
-        0x20000 <= cp <= 0x2A6DF or    # CJK Extension B
-        0xFF00 <= cp <= 0xFFEF or      # Fullwidth Forms
-        0x3000 <= cp <= 0x303F or      # CJK Symbols & Punctuation
-        0x3040 <= cp <= 0x30FF or      # Hiragana + Katakana (日文假名)
-        0xAC00 <= cp <= 0xD7AF):       # Hangul Syllables (韩文谚文)
-        return True
-    return False
+import chat_schedule
+import chat_text_layout
+import media_probe
+import translation_io
 
-def split_text_for_wrap(text, text_width_fn, max_w):
-    """
-    将文本拆分为可在 max_w 宽度内显示的行。
-    支持中文（逐字换行）和英文（按词换行）混合文本。
-    返回 list[str]，每个元素是一行文本。
-    """
-    lines = []
-    cur = ""
-    cur_w = 0
-    space_w = text_width_fn(" ")
-    
-    i = 0
-    while i < len(text):
-        ch = text[i]
-        ch_w = text_width_fn(ch)
-        
-        if ch == " ":
-            if cur_w + space_w > max_w and cur:
-                lines.append(cur)
-                cur = ""
-                cur_w = 0
-            else:
-                cur += ch
-                cur_w += space_w
-            i += 1
-            continue
-        
-        if is_cjk_char(ch):
-            # CJK 字符：可以任意位置断行
-            if cur_w + ch_w > max_w and cur:
-                lines.append(cur.rstrip())
-                cur = ch
-                cur_w = ch_w
-            else:
-                cur += ch
-                cur_w += ch_w
-            i += 1
-            continue
-        else:
-            # ASCII/拉丁字符：按词拆分
-            word_end = i
-            while word_end < len(text) and text[word_end] != " " and not is_cjk_char(text[word_end]):
-                word_end += 1
-            word = text[i:word_end]
-            word_w = text_width_fn(word)
-            
-            if cur_w + (space_w if cur and not cur.endswith(" ") else 0) + word_w > max_w and cur:
-                lines.append(cur.rstrip())
-                cur = word
-                cur_w = word_w
-            else:
-                if cur and not cur.endswith(" "):
-                    cur += " "
-                    cur_w += space_w
-                cur += word
-                cur_w += word_w
-            i = word_end
-    
-    if cur:
-        lines.append(cur.rstrip())
-    
-    return lines if lines else [""]
+# media_probe: ffprobe wrappers (lru-cached per absolute path + stat signature).
+_PROBE_TIMEOUT_SECONDS = media_probe._PROBE_TIMEOUT_SECONDS
+probe_video_dimensions = media_probe.probe_video_dimensions
+probe_video_duration = media_probe.probe_video_duration
+probe_video_fps = media_probe.probe_video_fps
+probe_media_summary = media_probe.probe_media_summary
+_quantize_fps = media_probe._quantize_fps
+fps_to_ffmpeg_rate = media_probe.fps_to_ffmpeg_rate
+resolve_output_fps = media_probe.resolve_output_fps
 
-def wrap_fragments(frag_list, header_w, max_w, padding, indent, gap, text_width_fn):
-    """
-    将 fragments 列表按宽度拆分成多行（支持中文换行）。
-    frag_list: [("text", text_str, width) | ("emote", class_name, width)]
-    返回: list[list[tuple]] — 每行是 (type, content, width) 的列表
-    """
-    lines = []
-    cur_line = []
-    cur_x = header_w  # 第一行从 header 之后开始
-    
-    for ftype, fcontent, fwidth in frag_list:
-        if ftype == "text":
-            # 当前可用宽度
-            avail = max_w - cur_x
-            if avail < 20:
-                # 换行
-                if cur_line:
-                    lines.append(cur_line)
-                cur_line = []
-                cur_x = padding + indent
-                avail = max_w - cur_x
-            
-            sub_lines = split_text_for_wrap(fcontent, text_width_fn, avail)
-            
-            for si, sl in enumerate(sub_lines):
-                if si > 0:
-                    if cur_line:
-                        lines.append(cur_line)
-                    cur_line = []
-                    cur_x = padding + indent
-                
-                sl_stripped = sl.strip()
-                if not sl_stripped:
-                    continue
-                sl_w = text_width_fn(sl_stripped)
-                limit = max_w - cur_x
-                
-                if sl_w <= limit:
-                    cur_line.append(("text", sl_stripped, sl_w))
-                    cur_x += sl_w
-                else:
-                    # 逐字/逐词添加
-                    for ci in range(len(sl_stripped)):
-                        ch = sl_stripped[ci]
-                        ch_w = text_width_fn(ch)
-                        if cur_x + ch_w > max_w and cur_line:
-                            lines.append(cur_line)
-                            cur_line = []
-                            cur_x = padding + indent
-                        cur_line.append(("text", ch, ch_w))
-                        cur_x += ch_w
-        elif ftype == "emote":
-            ew = fwidth
-            if cur_x + ew + gap > max_w and cur_line:
-                lines.append(cur_line)
-                cur_line = []
-                cur_x = padding + indent
-            cur_line.append(("emote", fcontent, ew))
-            cur_x += ew + gap
-    
-    if cur_line:
-        lines.append(cur_line)
-    
-    return lines if lines else [[]]
+# chat_text_layout: pure CJK-aware wrapping / badge / message-line layout.
+is_cjk_char = chat_text_layout.is_cjk_char
+split_text_for_wrap = chat_text_layout.split_text_for_wrap
+wrap_fragments = chat_text_layout.wrap_fragments
+normalize_text = chat_text_layout.normalize_text
+hex_to_rgb = chat_text_layout.hex_to_rgb
+MESSAGE_PAD = chat_text_layout.MESSAGE_PAD
+MESSAGE_BADGE_SIZE = chat_text_layout.MESSAGE_BADGE_SIZE
+MESSAGE_GAP = chat_text_layout.MESSAGE_GAP
+MESSAGE_INDENT = chat_text_layout.MESSAGE_INDENT
+BADGE_COLORS = chat_text_layout.BADGE_COLORS
+BADGE_FALLBACK_COLOR = chat_text_layout.BADGE_FALLBACK_COLOR
+badge_color_for = chat_text_layout.badge_color_for
+compute_message_header_width = chat_text_layout.compute_message_header_width
+build_message_frag_list = chat_text_layout.build_message_frag_list
+truncate_wrapped_lines_with_ellipsis = chat_text_layout.truncate_wrapped_lines_with_ellipsis
+layout_message_lines = chat_text_layout.layout_message_lines
 
-# ============================================================
-# 1. 解析 HTML 聊天记录
-# ============================================================
+# chat_schedule: arrival throttling + lane/float scheduling.
+admit_timestamp = chat_schedule.admit_timestamp
+schedule_messages = chat_schedule.schedule_messages
+schedule_messages_float = chat_schedule.schedule_messages_float
+_FloatEventList = chat_schedule._FloatEventList
+active_float_stack = chat_schedule.active_float_stack
+_LaneVisibilityCursor = chat_schedule._LaneVisibilityCursor
 
-# parse_chat_html lives in chat_parser.py (re-exported above for compatibility).
-# ============================================================
-# 2. 渲染 Overlay PNG 帧序列
-# ============================================================
-
-def normalize_text(t):
-    """Normalize compatibility glyphs without destroying supplementary Unicode."""
-    # Keep emoji, ZWJ sequences and supplementary CJK whenever the font supports
-    # them; NFKC still simplifies mathematical compatibility letters.
-    return unicodedata.normalize("NFKC", str(t or ""))
-
-
-def hex_to_rgb(hex_color):
-    """Compat wrapper: author colors fall back to white (shared implementation)."""
-    return hex_to_rgb_soft(hex_color, default=(255, 255, 255))
-
-
-# Layout defaults shared by line-count prepass and message bitmap render.
-# Keep these in one place so schedule capacity and drawn height cannot drift.
-MESSAGE_PAD = 5
-MESSAGE_BADGE_SIZE = 9
-MESSAGE_GAP = 3
-MESSAGE_INDENT = 12
-
-# Badge title -> display color. Twitch badge titles arrive with arbitrary
-# casing ("Broadcaster", "Moderator"), so lookups normalize via badge_color_for.
-BADGE_COLORS = {
-    "broadcaster": (255, 50, 50),
-    "moderator": (0, 160, 0),
-    "vip": (213, 0, 213),
-    "subscriber": (100, 100, 255),
-    "premium": (0, 169, 255),
-    "verified": (0, 169, 255),
-}
-BADGE_FALLBACK_COLOR = (85, 85, 85)
-
-
-def badge_color_for(title) -> tuple[int, int, int]:
-    """Map a badge title to its color, case/whitespace-insensitive, else gray."""
-    key = str(title or "").split("-")[0].strip().lower()
-    return BADGE_COLORS.get(key, BADGE_FALLBACK_COLOR)
-
-
-def compute_message_header_width(msg, *, padding, badge_size, gap, font, font_bold):
-    """Width of badges + author + colon on the first line (before body fragments)."""
-    badge_count = len(msg.get("badges") or [])
-    badge_total_w = badge_count * (badge_size + gap) if badge_count else 0
-    author = msg.get("author") or ""
-    ab = font_bold.getbbox(author)
-    author_w = ab[2] - ab[0]
-    cb = font.getbbox(":")
-    colon_w = cb[2] - cb[0]
-    header_w = padding + badge_total_w + author_w + gap + colon_w + gap
-    return {
-        "header_w": header_w,
-        "author_w": author_w,
-        "colon_w": colon_w,
-        "badge_count": badge_count,
-        "badge_total_w": badge_total_w,
-        "author": author,
-    }
-
-
-def build_message_frag_list(msg, *, text_width_fn, emote_width_fn, emote_available_fn):
-    """Normalize message fragments into (type, content, width) for wrap/render.
-
-    Text fragments drop the leading ": " TwitchDownloader often prepends.
-    Missing emote images become ``[title]`` text placeholders so pure-emote
-    rows still occupy width during layout.
-    """
-    frag_list = []
-    for frag in msg.get("fragments") or []:
-        if frag.get("type") == "text":
-            t = frag.get("text") or ""
-            if t.startswith(": "):
-                t = t[2:]
-            elif t == ":":
-                continue
-            t = normalize_text(t).strip()
-            if not t:
-                continue
-            frag_list.append(("text", t, text_width_fn(t)))
-        elif frag.get("type") == "emote":
-            cls = frag.get("class", "")
-            if emote_available_fn(cls):
-                frag_list.append(("emote", cls, emote_width_fn(cls)))
-            else:
-                t = f'[{frag.get("title", "")}]'
-                frag_list.append(("text", t, text_width_fn(t)))
-    return frag_list
-
-
-def truncate_wrapped_lines_with_ellipsis(
-    lines,
-    *,
-    max_message_lines,
-    max_w,
-    padding,
-    indent,
-    gap,
-    text_width_fn,
-):
-    """Cap wrapped lines and append '...' so truncation is visible (not silent crop)."""
-    if not max_message_lines or len(lines) <= max_message_lines:
-        return lines
-    lines = lines[:max_message_lines]
-    ellipsis = "..."
-    ellipsis_w = text_width_fn(ellipsis)
-    last_is_first_line = len(lines) == 1
-    last_limit = (max_w - padding) if last_is_first_line else (max_w - padding - indent)
-    while lines[-1] and sum(
-        item[2] + (gap if item[0] == "emote" else 0) for item in lines[-1]
-    ) + ellipsis_w > last_limit:
-        kind, content, width = lines[-1][-1]
-        if kind == "text" and len(content) > 1:
-            content = content[:-1]
-            lines[-1][-1] = (kind, content, text_width_fn(content))
-        else:
-            lines[-1].pop()
-    lines[-1].append(("text", ellipsis, ellipsis_w))
-    return lines
-
-
-def layout_message_lines(
-    msg,
-    *,
-    max_w,
-    font,
-    font_bold,
-    text_width_fn,
-    emote_width_fn,
-    emote_available_fn,
-    max_message_lines=0,
-    truncate_with_ellipsis=False,
-    padding=MESSAGE_PAD,
-    badge_size=MESSAGE_BADGE_SIZE,
-    gap=MESSAGE_GAP,
-    indent=MESSAGE_INDENT,
-):
-    """Shared schedule/render layout: header metrics + wrapped fragment lines.
-
-    When ``truncate_with_ellipsis`` is False (line-count prepass), only the
-    returned ``num_lines`` is capped by ``max_message_lines``. When True
-    (bitmap render), lines are actually truncated and get a visible ellipsis.
-    """
-    header = compute_message_header_width(
-        msg, padding=padding, badge_size=badge_size, gap=gap, font=font, font_bold=font_bold
-    )
-    frag_list = build_message_frag_list(
-        msg,
-        text_width_fn=text_width_fn,
-        emote_width_fn=emote_width_fn,
-        emote_available_fn=emote_available_fn,
-    )
-    lines = wrap_fragments(
-        frag_list, header["header_w"], max_w, padding, indent, gap, text_width_fn
-    )
-    if truncate_with_ellipsis:
-        lines = truncate_wrapped_lines_with_ellipsis(
-            lines,
-            max_message_lines=max_message_lines,
-            max_w=max_w,
-            padding=padding,
-            indent=indent,
-            gap=gap,
-            text_width_fn=text_width_fn,
-        )
-        if not lines:
-            lines = [[]]
-        num_lines = len(lines)
-    else:
-        num_lines = max(1, len(lines))
-        if max_message_lines:
-            num_lines = min(num_lines, max_message_lines)
-    return lines, header, num_lines
-
-
-def probe_video_duration(video_path):
-    """Read media duration via ffprobe. Returns float seconds or raises RuntimeError."""
-    try:
-        probe = subprocess.run(
-            [require_executable("ffprobe"), "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", video_path],
-            capture_output=True,
-            text=True,
-            timeout=_PROBE_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as e:
-        raise RuntimeError(f"读取视频时长超时 ({_PROBE_TIMEOUT_SECONDS:g}s): {video_path}") from e
-    raw = (probe.stdout or "").strip().splitlines()
-    if probe.returncode != 0 or not raw:
-        err = (probe.stderr or probe.stdout or "ffprobe failed").strip()[:400]
-        raise RuntimeError(f"无法读取视频时长: {video_path}: {err}")
-    try:
-        duration = float(raw[0].strip() or 0.0)
-    except ValueError as e:
-        raise RuntimeError(f"无法解析视频时长 {raw[0]!r}: {e}") from e
-    if not math.isfinite(duration) or duration <= 0:
-        raise RuntimeError(f"视频时长无效 ({duration}): {video_path}")
-    return duration
-
-
-
-def probe_video_dimensions(video_path):
-    """Read the first video stream dimensions via ffprobe, or return None."""
-    try:
-        probe = subprocess.run(
-            [
-                require_executable("ffprobe"), "-v", "error", "-select_streams", "v:0",
-                "-show_entries", "stream=width,height", "-of", "json", video_path,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=_PROBE_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired:
-        return None
-    if probe.returncode != 0:
-        return None
-    try:
-        stream = (json.loads(probe.stdout or "{}").get("streams") or [{}])[0]
-        width, height = int(stream.get("width") or 0), int(stream.get("height") or 0)
-        return (width, height) if width > 0 and height > 0 else None
-    except (ValueError, TypeError, json.JSONDecodeError):
-        return None
+# translation_io: translation JSON export / identity-checked import.
+clean_imported_translation = translation_io.clean_imported_translation
+_normalize_import_identity_text = translation_io._normalize_import_identity_text
+message_export_original = translation_io.message_export_original
+_message_stream_timestamp = translation_io._message_stream_timestamp
+translation_json_nonempty_count = translation_io.translation_json_nonempty_count
+build_export_translation_payload = translation_io.build_export_translation_payload
+write_export_translation_json = translation_io.write_export_translation_json
+apply_imported_translations = translation_io.apply_imported_translations
 
 
 # Absolute layout presets (layout_default / layout_mobile / CLI defaults) are
@@ -550,7 +230,7 @@ def apply_relative_layout(config, video_path):
     """Resolve optional source-video-relative layout values into pixel fields."""
     if not _layout_uses_any_ratio(config):
         return
-    dimensions = probe_video_dimensions(video_path)
+    dimensions = media_probe.probe_video_dimensions(video_path)
     if not dimensions:
         raise RuntimeError("无法读取源视频分辨率，不能使用 *-ratio 布局参数")
     video_w, video_h = dimensions
@@ -589,7 +269,7 @@ def adapt_absolute_layout_to_source(config, video_path) -> str | None:
     """
     if _layout_uses_any_ratio(config):
         return None
-    dimensions = probe_video_dimensions(video_path)
+    dimensions = media_probe.probe_video_dimensions(video_path)
     if not dimensions:
         return None
     video_w, video_h = int(dimensions[0]), int(dimensions[1])
@@ -653,79 +333,6 @@ def adapt_absolute_layout_to_source(config, video_path) -> str | None:
     )
 
 
-def probe_video_fps(video_path):
-    """Best-effort source video FPS via ffprobe. Returns float or None."""
-    try:
-        probe = subprocess.run(
-            [
-                require_executable("ffprobe"), "-v", "error", "-select_streams", "v:0",
-                "-show_entries", "stream=r_frame_rate,avg_frame_rate",
-                "-of", "json", video_path,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=_PROBE_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired:
-        return None
-    if probe.returncode != 0:
-        return None
-    try:
-        data = json.loads(probe.stdout or "{}")
-        stream = (data.get("streams") or [{}])[0]
-    except (json.JSONDecodeError, IndexError, TypeError):
-        return None
-
-    def _parse_rate(rate):
-        if not rate or rate in ("0/0", "N/A"):
-            return None
-        try:
-            if "/" in str(rate):
-                num, den = str(rate).split("/", 1)
-                den_f = float(den)
-                if den_f <= 0:
-                    return None
-                return float(num) / den_f
-            return float(rate)
-        except (TypeError, ValueError, ZeroDivisionError):
-            return None
-
-    # Prefer r_frame_rate for constant sources, then avg.
-    for key in ("r_frame_rate", "avg_frame_rate"):
-        val = _parse_rate(stream.get(key))
-        if val and 1.0 <= val <= 240.0:
-            return val
-    return None
-
-
-def _quantize_fps(value: float) -> float:
-    """Keep common NTSC rates exact; leave other floats; clamp to [1, 240]."""
-    v = float(value)
-    if v < 1.0:
-        return 1.0
-    if v > 240.0:
-        return 240.0
-    # Known broadcast rates (within 0.02 of nominal).
-    known = (
-        24000 / 1001,  # ~23.976
-        24.0,
-        25.0,
-        30000 / 1001,  # ~29.970
-        30.0,
-        50.0,
-        60000 / 1001,  # ~59.940
-        60.0,
-        120.0,
-    )
-    for k in known:
-        if abs(v - k) < 0.02:
-            return k
-    # Near-integer CFR
-    if abs(v - round(v)) < 1e-3:
-        return float(int(round(v)))
-    return v
-
-
 def parse_output_fps_arg(text: str) -> float:
     """argparse type for --output-fps: decimal ("29.97") or exact rational ("30000/1001").
 
@@ -758,36 +365,6 @@ def parse_output_fps_arg(text: str) -> float:
     return parsed
 
 
-def fps_to_ffmpeg_rate(fps) -> str:
-    """Format fps for ffmpeg -r / -framerate (prefer exact NTSC rationals)."""
-    v = _quantize_fps(float(fps))
-    rationals = {
-        24000 / 1001: "24000/1001",
-        30000 / 1001: "30000/1001",
-        60000 / 1001: "60000/1001",
-    }
-    for k, s in rationals.items():
-        if abs(v - k) < 1e-6:
-            return s
-    if abs(v - round(v)) < 1e-6:
-        return str(int(round(v)))
-    return f"{v:.6f}".rstrip("0").rstrip(".")
-
-
-def resolve_output_fps(video_path, explicit=None, fallback=30):
-    """Resolve final encode FPS: explicit > source probe > fallback.
-
-    Returns a float (may be fractional, e.g. 30000/1001). Use fps_to_ffmpeg_rate()
-    when passing to ffmpeg -r so NTSC sources are not rounded to 30.
-    """
-    if explicit is not None:
-        return _quantize_fps(float(explicit))
-    probed = probe_video_fps(video_path)
-    if probed is not None:
-        return _quantize_fps(probed)
-    return _quantize_fps(fallback)
-
-
 def layout_bounds_warnings(config, video_path) -> list[str]:
     """Warn when the chat box is mostly/fully outside the source frame.
 
@@ -796,7 +373,7 @@ def layout_bounds_warnings(config, video_path) -> list[str]:
     ``adapt_absolute_layout_to_source`` first so run.bat defaults auto-scale;
     this remains a safety net for custom absolute crops that still overflow.
     """
-    dimensions = probe_video_dimensions(video_path)
+    dimensions = media_probe.probe_video_dimensions(video_path)
     if not dimensions:
         return []
     video_w, video_h = int(dimensions[0]), int(dimensions[1])
@@ -825,654 +402,6 @@ def layout_bounds_warnings(config, video_path) -> list[str]:
         )
     return warns
 
-
-def admit_timestamp(
-    source_t: float,
-    last_admitted_at,
-    min_arrival: float,
-    *,
-    throttle_from: float | None = None,
-) -> float:
-    """Apply optional arrival_interval throttling to a message timestamp.
-
-    Messages with source_t < throttle_from (e.g. already-on-screen carry-in after
-    rebase) keep their original timestamp so rate limiting does not empty the
-    stack at preview t=0.
-    """
-    src = float(source_t)
-    if throttle_from is not None and src < float(throttle_from):
-        return src
-    if last_admitted_at is None:
-        return src
-    return max(src, float(last_admitted_at) + max(0.0, float(min_arrival)))
-
-
-def schedule_messages(
-    messages,
-    msg_line_count,
-    duration,
-    max_visible,
-    msg_lifetime,
-    min_visible_seconds=0.0,
-    arrival_interval=0.0,
-    *,
-    auto_capacity: int | None = None,
-):
-    """
-    Assign lanes for messages that intersect [0, duration).
-
-    Returns list of (start, end, lane, msg_index, num_lines).
-    Caps multi-line messages so they never request more lanes than max_visible.
-
-    max_visible:
-      - >0: fixed lane budget (legacy desktop)
-      - <=0: auto — use auto_capacity (from box height / font) or default 10
-
-    When seizing a lane range, any active schedule row whose lane span overlaps
-    is truncated to t, and *all* of that row's sublanes are freed in lane_ends
-    (multi-line parents are one row but occupy nl consecutive lanes).
-    """
-    msg_schedule = []
-    lane_ends = {}
-    lane_owners = {}
-    life = float(msg_lifetime or 0.0)
-    if life <= 0:
-        # Avoid zero/negative lifetimes that make every message permanently occupy
-        # a lane or produce zero-length visibility windows.
-        life = 0.1
-    if int(max_visible) <= 0:
-        max_visible = max(1, int(auto_capacity or 10))
-    else:
-        max_visible = max(1, int(max_visible))
-    min_visible = min(max(0.0, float(min_visible_seconds or 0.0)), life)
-    min_arrival_interval = max(0.0, float(arrival_interval or 0.0))
-    last_admitted_at = None
-
-    def _evict_overlapping(base_lane: int, need_nl: int, t: float) -> bool:
-        """Evict current lane owners without scanning all historical rows."""
-        victims = {
-            lane_owners[lane]
-            for lane in range(base_lane, base_lane + need_nl)
-            if lane_ends.get(lane, 0) > t and lane in lane_owners
-        }
-        # Check every victim first so min_visible rejection is atomic.
-        for si in sorted(victims):
-            s_start, s_end, s_lane, s_idx, s_nl = msg_schedule[si]
-            if not (s_start <= t < s_end):
-                continue
-            if t - s_start < min_visible:
-                return False
-        for si in sorted(victims):
-            s_start, s_end, s_lane, s_idx, s_nl = msg_schedule[si]
-            if not (s_start <= t < s_end):
-                continue
-            msg_schedule[si] = (s_start, t, s_lane, s_idx, s_nl)
-            for sub in range(max(1, int(s_nl))):
-                lane = s_lane + sub
-                if lane_owners.get(lane) == si:
-                    lane_ends[lane] = t
-                    lane_owners.pop(lane, None)
-        return True
-
-    dropped_past_duration = 0
-    dropped_min_visible = 0
-    dropped_before_start = 0
-    for i, m in enumerate(messages):
-        source_t = float(m.get("timestamp", 0) or 0)
-        # Rate limiting delays on-screen start; lifetime is measured from admit
-        # time (t+life) so delayed rows still get a full visibility window.
-        # Using source_t+life with delayed t can invent inverted windows when
-        # arrival_interval > remaining life.
-        t = admit_timestamp(
-            source_t,
-            last_admitted_at,
-            min_arrival_interval,
-            throttle_from=0.0 if min_arrival_interval > 0 else None,
-        )
-        # Keep messages that can still be visible inside the render window,
-        # not only those that start before duration.
-        if (source_t + life) <= 0:
-            # Ends before the render window opens (e.g. a large negative
-            # --offset); counted and reported below instead of dropped silently.
-            dropped_before_start += 1
-            continue
-        if t >= duration:
-            dropped_past_duration += 1
-            if source_t >= 0.0:
-                last_admitted_at = t if last_admitted_at is None else max(float(last_admitted_at), t)
-            continue
-
-        nl = int(msg_line_count.get(i, 1) or 1)
-        if nl < 1:
-            nl = 1
-        if nl > max_visible:
-            # Prevent max_lane < 0 / empty range / ValueError on max().
-            nl = max_visible
-
-        # lane + nl - 1 < max_visible  =>  lane <= max_visible - nl
-        max_lane = max_visible - nl
-        end = t + life
-
-        assigned = False
-        for lane in range(max_lane + 1):
-            all_free = True
-            for sub in range(nl):
-                if lane_ends.get(lane + sub, 0) > t:
-                    all_free = False
-                    break
-            if all_free:
-                schedule_idx = len(msg_schedule)
-                msg_schedule.append((t, end, lane, i, nl))
-                for sub in range(nl):
-                    occupied_lane = lane + sub
-                    lane_ends[occupied_lane] = end
-                    lane_owners[occupied_lane] = schedule_idx
-                assigned = True
-                last_admitted_at = t
-                break
-
-        if not assigned:
-            best_lane = 0
-            best_max_end = float("inf")
-            # max_lane is always >= 0 after the nl clamp above.
-            for lane in range(max_lane + 1):
-                max_end = max(lane_ends.get(lane + sub, 0) for sub in range(nl))
-                if max_end < best_max_end:
-                    best_max_end = max_end
-                    best_lane = lane
-            if not _evict_overlapping(best_lane, nl, t):
-                # min_visible protection refused to evict in-progress messages;
-                # the new arrival is dropped. Count it instead of failing silently.
-                dropped_min_visible += 1
-                continue
-            schedule_idx = len(msg_schedule)
-            msg_schedule.append((t, end, best_lane, i, nl))
-            for sub in range(nl):
-                occupied_lane = best_lane + sub
-                lane_ends[occupied_lane] = end
-                lane_owners[occupied_lane] = schedule_idx
-            last_admitted_at = t
-
-    if dropped_before_start:
-        if not msg_schedule and dropped_before_start * 2 > len(messages):
-            print(
-                f"  [WARN] lanes 调度: {dropped_before_start}/{len(messages)} 条消息时间戳早于 0s "
-                f"且无任何消息上屏，成片将没有弹幕；建议检查 --offset 是否设置过大",
-                flush=True,
-            )
-        else:
-            print(
-                f"  [WARN] lanes 调度: {dropped_before_start} 条消息时间戳早于 0s 未上屏",
-                flush=True,
-            )
-    if dropped_past_duration:
-        print(
-            f"  [WARN] lanes 调度: {dropped_past_duration} 条因 arrival_interval 延后超出 "
-            f"时长 {float(duration):.2f}s 未上屏",
-            flush=True,
-        )
-    if dropped_min_visible:
-        print(
-            f"  [WARN] lanes 调度: {dropped_min_visible} 条因场上消息未达 "
-            f"min_visible_seconds={min_visible:.2f}s 不可顶替、且无空闲 lane 被丢弃",
-            flush=True,
-        )
-    return msg_schedule
-
-
-
-def schedule_messages_float(
-    messages,
-    msg_line_count,
-    duration,
-    capacity_lines,
-    arrival_interval=0.0,
-    *,
-    throttle_from: float = 0.0,
-):
-    """Twitch-style bottom-up stack: newest at bottom, older pushed upward.
-
-    No time-based lifetime: messages leave only when capacity pushes them off the top.
-    Returns (start, end, _lane, msg_index, nl) with end far past duration so render
-    treats them as alive until active_float_stack drops them for height.
-
-    throttle_from: only delay admissions with source_t >= this value (default 0).
-    Carry-in (negative rebased timestamps) keeps original times so previews open full.
-    Messages delayed past duration are counted and skipped with a log when any drop.
-    """
-    events = []
-    capacity = max(1, int(capacity_lines or 1))
-    min_arrival = max(0.0, float(arrival_interval or 0.0))
-    last_admitted_at = None
-    forever = max(float(duration) + 3600.0, 1e9)
-    dropped_past_duration = 0
-    origin = float(throttle_from)
-
-    for i, m in enumerate(messages):
-        source_t = float(m.get("timestamp", 0) or 0)
-        t = admit_timestamp(
-            source_t,
-            last_admitted_at,
-            min_arrival,
-            throttle_from=origin if min_arrival > 0 else None,
-        )
-        if t >= duration:
-            dropped_past_duration += 1
-            # Still advance throttle cursor so later in-window bursts stay paced.
-            if source_t >= origin:
-                last_admitted_at = t if last_admitted_at is None else max(float(last_admitted_at), t)
-            continue
-        nl = int(msg_line_count.get(i, 1) or 1)
-        if nl < 1:
-            nl = 1
-        if nl > capacity:
-            nl = capacity
-        events.append((t, forever, 0, i, nl))
-        # Only pace future arrivals against other in-window admits; carry-in
-        # must not push the first in-window message later than its source time.
-        if source_t >= origin:
-            last_admitted_at = t
-    if dropped_past_duration:
-        print(
-            f"  [WARN] float 调度: {dropped_past_duration} 条因 arrival_interval 延后超出 "
-            f"时长 {float(duration):.2f}s 未上屏",
-            flush=True,
-        )
-    # Keep events chronological so active_float_stack can skip re-sorting.
-    events.sort(key=lambda e: (e[0], e[3]))
-    # List subclass carries precomputed starts for O(1) bisect keys across CPs.
-    out = _FloatEventList(events)
-    out.starts = [e[0] for e in out]
-    out.sorted_by_start = True
-    return out
-
-
-class _FloatEventList(list):
-    """Schedule list with optional .starts cache for active_float_stack."""
-
-    starts: list[float]
-    sorted_by_start: bool = False
-
-
-def active_float_stack(events, current_t, capacity_lines):
-    """Build bottom-up visible stack at current_t.
-
-    events: (start, end, _lane, msg_index, nl)
-    Returns list of (lane_from_bottom, msg_index, start, end, nl) with lane 0 = bottom.
-    Keeps the newest messages that fit in capacity_lines (oldest dropped from the top).
-
-    Performance: scan candidates newest-first and stop at the capacity wall
-    (typically O(capacity) work after a bisect, not O(all history)) so long VODs
-    stay usable under float mode.
-    """
-    capacity = max(1, int(capacity_lines or 1))
-    if not events:
-        return []
-
-    # Product schedules carry a validated starts cache. Trust that marker instead
-    # of re-scanning all VOD history at every change point.
-    cached_starts = getattr(events, "starts", None)
-    known_sorted = (
-        isinstance(events, _FloatEventList)
-        and bool(getattr(events, "sorted_by_start", False))
-        and cached_starts is not None
-        and len(cached_starts) == len(events)
-    )
-    needs_sort = False
-    if not known_sorted:
-        for i in range(1, len(events)):
-            if (events[i][0], events[i][3]) < (events[i - 1][0], events[i - 1][3]):
-                needs_sort = True
-                break
-    ordered = sorted(events, key=lambda e: (e[0], e[3])) if needs_sort else events
-
-    # Candidates with start <= current_t (float ends are far future / open).
-    # Prefer precomputed starts from schedule_messages_float (full-render hot path).
-    starts = cached_starts if known_sorted else None
-    if starts is None or len(starts) != len(ordered) or needs_sort:
-        starts = [e[0] for e in ordered]
-    hi = bisect.bisect_right(starts, current_t)
-    selected = []  # newest-first
-    used = 0
-    for j in range(hi - 1, -1, -1):
-        start, end, _lane, idx, nl = ordered[j]
-        if not (start <= current_t < end):
-            continue
-        nl = max(1, int(nl))
-        if used + nl > capacity:
-            # Stop at the capacity wall. Skipping would resurrect older smaller
-            # messages under a newer multi-line one — not Twitch bottom-up.
-            break
-        selected.append((start, end, idx, nl))
-        used += nl
-    out = []
-    lane = 0
-    for start, end, idx, nl in selected:  # newest first => lane 0 at bottom
-        out.append((lane, idx, start, end, nl))
-        lane += nl
-    return out
-
-class _LaneVisibilityCursor:
-    """Incrementally resolve visible lane rows for monotonically increasing times."""
-
-    def __init__(self, schedule):
-        self._events = sorted(
-            enumerate(schedule),
-            key=lambda item: (item[1][0], item[0]),
-        )
-        self._cursor = 0
-        self._active = {}
-        self._last_t = float("-inf")
-
-    def _reset(self):
-        self._cursor = 0
-        self._active.clear()
-        self._last_t = float("-inf")
-
-    def at(self, current_t):
-        t = float(current_t)
-        if t < self._last_t:
-            self._reset()
-        while (
-            self._cursor < len(self._events)
-            and self._events[self._cursor][1][0] <= t
-        ):
-            schedule_i, row = self._events[self._cursor]
-            self._cursor += 1
-            if row[1] > t:
-                self._active[schedule_i] = row
-        expired = [i for i, row in self._active.items() if row[1] <= t]
-        for schedule_i in expired:
-            self._active.pop(schedule_i, None)
-        self._last_t = t
-        visible = [
-            (row[2], row[3], row[0], row[1], row[4])
-            for row in self._active.values()
-        ]
-        visible.sort(key=lambda row: row[0])
-        return visible
-
-
-def _normalize_import_identity_text(text):
-    """Collapse whitespace for import identity comparisons."""
-    text = str(text or "").replace("\r", " ").replace("\n", " ")
-    return re.sub(r"[ \t]{2,}", " ", text).strip()
-
-
-def message_export_original(message):
-    """Rebuild the export-time original text for one chat message."""
-    parts = []
-    for frag in message.get("fragments") or []:
-        if frag.get("type") == "text":
-            parts.append(str(frag.get("text", "") or ""))
-        else:
-            parts.append(f'[{frag.get("title", "emote")}]')
-    original_text = " ".join(parts)
-    if original_text.startswith(": "):
-        original_text = original_text[2:]
-    return original_text
-
-
-def _message_stream_timestamp(message: dict) -> float:
-    """Stream-absolute timestamp for export/import identity (pre-offset when available)."""
-    if message.get("stream_timestamp") is not None:
-        try:
-            return float(message["stream_timestamp"])
-        except (TypeError, ValueError):
-            pass
-    try:
-        return float(message.get("timestamp", 0) or 0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def translation_json_nonempty_count(path: str | Path) -> int:
-    """How many rows already have a non-empty translation field (0 if missing/unreadable)."""
-    p = Path(path)
-    if not p.is_file():
-        return 0
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return 0
-    items = data.get("messages") if isinstance(data, dict) else None
-    if not isinstance(items, list):
-        return 0
-    n = 0
-    for item in items:
-        if isinstance(item, dict) and str(item.get("translation", "") or "").strip():
-            n += 1
-    return n
-
-
-def build_export_translation_payload(
-    chat_data: dict,
-    *,
-    offset_info: dict | None = None,
-) -> dict:
-    """Build export JSON using stream-absolute timestamps for stable identity."""
-    offset_info = offset_info or {}
-    try:
-        applied_offset = float(offset_info.get("offset") or 0.0)
-    except (TypeError, ValueError):
-        applied_offset = 0.0
-    items = []
-    for i, m in enumerate(chat_data.get("messages") or []):
-        original_text = message_export_original(m)
-        stream_ts = _message_stream_timestamp(m)
-        items.append({
-            "index": i,
-            # Stream-absolute time (broadcast timeline). Import matches this field
-            # so changing --offset between export and burn does not mass-skip rows.
-            "timestamp": round(stream_ts, 1),
-            "stream_timestamp": round(stream_ts, 1),
-            "author": m.get("author"),
-            "original": original_text,
-            "translation": "",
-        })
-    return {
-        "schema_version": 2,
-        "time_base": "stream",
-        "export_offset": applied_offset,
-        "offset_mode": offset_info.get("mode"),
-        "messages": items,
-    }
-
-
-def write_export_translation_json(
-    export_path: str | Path,
-    chat_data: dict,
-    *,
-    offset_info: dict | None = None,
-    force: bool = False,
-) -> dict:
-    """Write translation export JSON. Refuses to wipe non-empty translations unless force."""
-    export_path = Path(export_path)
-    existing_n = translation_json_nonempty_count(export_path)
-    if existing_n > 0 and not force:
-        raise FileExistsError(
-            f"翻译 JSON 已有 {existing_n} 条非空 translation，拒绝覆盖以免丢失译文: {export_path}\n"
-            f"  复用请加 --reuse-translation；确需重新导出请加 --force-export"
-        )
-    payload = build_export_translation_payload(chat_data, offset_info=offset_info)
-    export_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = export_path.with_suffix(export_path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, export_path)
-    return payload
-
-
-def apply_imported_translations(chat_data, trans_data, strict=False):
-    """
-    Apply translation JSON onto parsed chat messages by stable export index.
-
-    Export uses list position at export time as index. Import matches that
-    index field (not a re-enumerate of a possibly reordered list), and when
-    available cross-checks author/timestamp/original to catch silent mismatch.
-
-    Timestamp identity uses stream-absolute time when available (export schema
-    v2 / stream_timestamp), so re-burning with a different --offset does not
-    mass-skip translations.
-
-    On identity mismatch: skip applying that row by default; with strict=True
-    raise ValueError after collecting mismatches.
-    Returns (replaced, stripped_placeholders, warnings).
-    """
-    messages = chat_data.get("messages") or []
-    items = trans_data.get("messages") if isinstance(trans_data, dict) else None
-    if not isinstance(items, list):
-        raise ValueError("翻译 JSON 缺少 messages 数组")
-
-    trans_map = {}
-    dup_indexes: list[int] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        try:
-            idx = int(item["index"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if idx in trans_map:
-            dup_indexes.append(idx)
-        trans_map[idx] = item
-
-    warnings = []
-    if dup_indexes:
-        uniq = sorted(set(dup_indexes))
-        preview = uniq[:20]
-        more = "" if len(uniq) <= 20 else f" ... (+{len(uniq) - 20} more)"
-        warnings.append(
-            f"翻译 JSON 含重复 index（后写覆盖先写）: {preview}{more}"
-        )
-    if len(messages) != len(trans_map) and len(trans_map) > 0:
-        warnings.append(
-            f"翻译条数 ({len(trans_map)}) 与当前解析消息数 ({len(messages)}) 不一致；"
-            f"将按 index 对齐，可能有漏贴/错贴风险"
-        )
-
-    replaced = 0
-    stripped_placeholders = 0
-    mismatch_count = 0
-    dropped_empty_translations = 0
-    for i, m in enumerate(messages):
-        item = trans_map.get(i)
-        if not item:
-            continue
-        raw_tr = str(item.get("translation", "") or "").strip()
-        if not raw_tr:
-            continue
-
-        # Identity checks: author / stream timestamp / original (normalized whitespace).
-        mismatch_reasons = []
-        exp_author = item.get("author")
-        if exp_author is not None and str(exp_author) != str(m.get("author", "")):
-            mismatch_reasons.append(
-                f"作者不一致: 翻译 JSON={exp_author!r} HTML={m.get('author')!r}"
-            )
-        # Prefer stream-absolute times (schema v2) so offset changes do not break identity.
-        # Legacy exports stored post-offset video-relative timestamps only.
-        exp_stream = item.get("stream_timestamp")
-        exp_ts = exp_stream if exp_stream is not None else item.get("timestamp")
-        if exp_ts is not None:
-            time_base = ""
-            if isinstance(trans_data, dict):
-                time_base = str(trans_data.get("time_base") or "").strip().lower()
-            use_stream = time_base == "stream" or exp_stream is not None
-            if use_stream:
-                html_ts = _message_stream_timestamp(m)
-            else:
-                try:
-                    html_ts = float(m.get("timestamp", 0) or 0)
-                except (TypeError, ValueError):
-                    html_ts = 0.0
-            try:
-                if abs(float(exp_ts) - float(html_ts)) > 0.51:
-                    label = "stream" if use_stream else "video-relative"
-                    mismatch_reasons.append(
-                        f"时间戳不一致({label}): 翻译 JSON={exp_ts} HTML={html_ts}"
-                    )
-            except (TypeError, ValueError):
-                mismatch_reasons.append(
-                    f"时间戳无法解析: 翻译 JSON={exp_ts!r}"
-                )
-        exp_original = item.get("original")
-        if exp_original is not None:
-            html_original = message_export_original(m)
-            if _normalize_import_identity_text(exp_original) != _normalize_import_identity_text(
-                html_original
-            ):
-                mismatch_reasons.append(
-                    f"original 不一致: 翻译 JSON={exp_original!r} HTML={html_original!r}"
-                )
-
-        if mismatch_reasons:
-            mismatch_count += 1
-            for reason in mismatch_reasons:
-                warnings.append(f"index={i} {reason}")
-            warnings.append(
-                f"index={i} 跳过导入（身份不一致，避免错贴译文）"
-            )
-            continue
-
-        translation = clean_imported_translation(raw_tr, m.get("author"))
-        emote_titles = [
-            str(f.get("title", "")).strip()
-            for f in m.get("fragments") or []
-            if f.get("type") == "emote" and str(f.get("title", "")).strip()
-        ]
-        for title in set(emote_titles):
-            placeholder = f"[{title}]"
-            count = translation.count(placeholder)
-            if count:
-                translation = translation.replace(placeholder, "")
-                stripped_placeholders += count
-        translation = re.sub(r"[ \t]{2,}", " ", translation).strip()
-
-        emote_frags = [f for f in (m.get("fragments") or []) if f.get("type") == "emote"]
-        text_frags = [f for f in (m.get("fragments") or []) if f.get("type") == "text"]
-
-        if not translation and emote_frags:
-            # Pure-emote after placeholder strip: keep image fragments only.
-            m["fragments"] = list(emote_frags)
-            replaced += 1
-        elif not translation and not emote_frags:
-            # Cleaned translation ended up empty with no emote to keep. Skip the
-            # row (original fragments stay) instead of writing a {"text": ""}
-            # fragment that layout must filter out again.
-            dropped_empty_translations += 1
-        elif not emote_frags:
-            # Text-only: single translated text fragment (merge multi-text).
-            m["fragments"] = [{"type": "text", "text": translation}]
-            replaced += 1
-        else:
-            # Mixed text+emote: put full translation as one leading text block,
-            # then original emote fragments in order. Avoids stuffing only the
-            # first text slot and leaving trailing empty texts mid-layout.
-            m["fragments"] = [{"type": "text", "text": translation}] + list(emote_frags)
-            replaced += 1
-            if len(text_frags) > 1:
-                # Informational only; layout is intentionally simplified.
-                pass
-
-    missing_idx = [i for i in range(len(messages)) if i not in trans_map]
-    if missing_idx and len(missing_idx) <= 20:
-        warnings.append(f"以下 index 在翻译 JSON 中缺失: {missing_idx[:20]}")
-    elif missing_idx:
-        warnings.append(f"{len(missing_idx)} 个 index 在翻译 JSON 中缺失")
-
-    if mismatch_count:
-        warnings.append(f"身份不一致跳过 {mismatch_count} 条翻译")
-        if strict:
-            raise ValueError(
-                f"严格导入失败: {mismatch_count} 条翻译与 HTML 身份不一致"
-                f"（作者/时间戳/原文），已拒绝错贴译文"
-            )
-    if dropped_empty_translations:
-        warnings.append(
-            f"{dropped_empty_translations} 条译文清洗后为空且无 emote，已跳过该行（保留原消息碎片）"
-        )
-
-    return replaced, stripped_placeholders, warnings
 
 def _store_message_image(msg_images, msg_lines, idx, image, nl, *, lazy, cache_cap):
     msg_lines[idx] = nl
@@ -1580,7 +509,7 @@ def render_overlay(chat_data, out_dir, video_path, config):
     # Build the immutable scene budget before the line-count prepass, scheduling,
     # or generating frames (its duration drives the prepass skip below).
     scene = OverlayScenePlan.from_config(
-        source_duration=probe_video_duration(video_path),
+        source_duration=media_probe.probe_video_duration(video_path),
         config=config,
         message_count=len(messages),
     )
@@ -2191,63 +1120,6 @@ def get_stream_start_time(video_path, stream_selector):
         return 0.0
 
 
-def probe_media_summary(path):
-    """Return basic stream/duration info for publish validation."""
-    summary = {
-        "ok": False,
-        "duration": 0.0,
-        "has_video": False,
-        "has_audio": False,
-        "width": 0,
-        "height": 0,
-        "error": "",
-    }
-    try:
-        probe = subprocess.run(
-            [
-                require_executable("ffprobe"), "-v", "error",
-                "-show_entries", "format=duration:stream=index,codec_type,width,height",
-                "-of", "json", path,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=_PROBE_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired:
-        summary["error"] = f"ffprobe timed out after {_PROBE_TIMEOUT_SECONDS:g}s"
-        return summary
-    if probe.returncode != 0:
-        summary["error"] = (probe.stderr or probe.stdout or "ffprobe failed").strip()[:400]
-        return summary
-    try:
-        data = json.loads(probe.stdout or "{}")
-    except json.JSONDecodeError as e:
-        summary["error"] = f"ffprobe json parse failed: {e}"
-        return summary
-
-    try:
-        summary["duration"] = float((data.get("format") or {}).get("duration") or 0.0)
-    except (TypeError, ValueError):
-        summary["duration"] = 0.0
-
-    for stream in data.get("streams") or []:
-        codec_type = stream.get("codec_type")
-        if codec_type == "video":
-            summary["has_video"] = True
-            try:
-                summary["width"] = int(stream.get("width") or 0)
-                summary["height"] = int(stream.get("height") or 0)
-            except (TypeError, ValueError):
-                pass
-        elif codec_type == "audio":
-            summary["has_audio"] = True
-
-    summary["ok"] = summary["duration"] > 0 and summary["has_video"]
-    if not summary["ok"] and not summary["error"]:
-        summary["error"] = "missing video stream or non-positive duration"
-    return summary
-
-
 def resolve_source_av_timing(video_path, source_has_audio=None):
     """Probe container/audio/video timing used by compose + validation.
 
@@ -2258,7 +1130,7 @@ def resolve_source_av_timing(video_path, source_has_audio=None):
         Compose uses it to re-insert the offset the audio branch's asetpts
         erases (see compose_video).
     """
-    source_summary = probe_media_summary(video_path)
+    source_summary = media_probe.probe_media_summary(video_path)
     has_audio = (
         bool(source_has_audio)
         if source_has_audio is not None
@@ -2329,7 +1201,7 @@ def validate_rendered_output(
     which previously made min_duration dead when expected was also set).
     When only expected is set, expected is the short floor.
     """
-    summary = probe_media_summary(path)
+    summary = media_probe.probe_media_summary(path)
     if not summary["ok"]:
         return False, summary, summary.get("error") or "output validation failed"
     if require_audio and not summary["has_audio"]:
@@ -2482,7 +1354,7 @@ def compose_video(video_path, frames_dir, out_dir, config, duration):
         print(f"  WebM 完成: {stage_timings['webm_encode']:.1f}s", flush=True)
         # Validate WebM duration: if the intermediate overlay is shorter than
         # expected, the final compose will silently lack chat in the tail.
-        webm_summary = probe_media_summary(webm_path)
+        webm_summary = media_probe.probe_media_summary(webm_path)
         if webm_summary["ok"]:
             webm_dur = float(webm_summary.get("duration") or 0.0)
             # Allow small encoder margin (VP9 often ±0.1s). Short WebM used to only
@@ -2564,7 +1436,7 @@ def compose_video(video_path, frames_dir, out_dir, config, duration):
     )
     # Final CFR for the published video. Keep chat overlay at config.fps;
     # do not force the whole encode down to overlay sampling rate.
-    output_fps = resolve_output_fps(
+    output_fps = media_probe.resolve_output_fps(
         video_path,
         explicit=getattr(config, "output_fps", None),
         fallback=max(1, int(getattr(config, "fps", 30) or 30)),
@@ -2638,7 +1510,7 @@ def compose_video(video_path, frames_dir, out_dir, config, duration):
         "-map", "[outv]",
         "-map", "0:a?",
         *build_video_encode_args(encode),
-        "-r", fps_to_ffmpeg_rate(output_fps), "-fps_mode", "cfr",
+        "-r", media_probe.fps_to_ffmpeg_rate(output_fps), "-fps_mode", "cfr",
         *build_audio_encode_args_for_compose(
             encode,
             source_has_audio,
@@ -2811,6 +1683,7 @@ def _validate_runtime_args(args) -> None:
 def _main(status_sink=None):
     """Full CLI pipeline. ``status_sink`` (dict) receives the resolved job out_dir
     so the public main() wrapper can mark run_meta failed on unexpected crashes."""
+    media_probe.cache_clear()
     from env_bootstrap import prepend_tools_ffmpeg_to_path
 
     prepend_tools_ffmpeg_to_path()
@@ -3250,7 +2123,7 @@ def _main(status_sink=None):
     print(f"区域: x={config.x} y={config.y} w={config.width} h={config.height}")
     for warn in layout_bounds_warnings(config, video_path):
         print(f"[WARN] {warn}", flush=True)
-    resolved_out_fps = resolve_output_fps(video_path, explicit=config.output_fps, fallback=30)
+    resolved_out_fps = media_probe.resolve_output_fps(video_path, explicit=config.output_fps, fallback=30)
     config.output_fps = resolved_out_fps
     print(
         f"字体: {config.font_size}px, 弹幕帧率: {config.fps}fps, "
@@ -3278,7 +2151,7 @@ def _main(status_sink=None):
     if (not args.export_translation) or args.offset is None:
         if os.path.isfile(video_path):
             try:
-                video_dur = probe_video_duration(video_path)
+                video_dur = media_probe.probe_video_duration(video_path)
             except RuntimeError as e:
                 print(f"  [WARN] {e}", flush=True)
                 video_dur = None
@@ -3781,6 +2654,7 @@ def main():
     records a failed status at the job directory first, then re-raises so the
     caller still sees the real error and non-zero exit code.
     """
+    media_probe.cache_clear()
     status_sink: dict[str, str | None] = {"out_dir": None}
     try:
         return _main(status_sink=status_sink)

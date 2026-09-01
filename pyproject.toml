@@ -68,6 +68,8 @@ Changelog = "https://github.com/yigenhuobahh/twitch-chat-translator-overlay/blob
 package-dir = {"" = "scripts"}
 py-modules = [
   "chat_parser",
+  "chat_schedule",
+  "chat_text_layout",
   "chat_window",
   "cli_spec",
   "common_utils",
@@ -80,6 +82,7 @@ py-modules = [
   "job_wizard",
   "layout_preset",
   "media_health",
+  "media_probe",
   "overlay_config",
   "overlay_scene",
   "pipeline_plan",
@@ -100,6 +103,7 @@ py-modules = [
   "tui_run",
   "tui_task",
   "translate_chat_openai",
+  "translation_io",
   "translation_support",
   "twitch_chat_burn",
   "twitch_download",
@@ -221,6 +225,8 @@ ignore = [
 [tool.ruff.lint.isort]
 known-first-party = [
   "chat_parser",
+  "chat_schedule",
+  "chat_text_layout",
   "chat_window",
   "cli_spec",
   "common_utils",
@@ -233,6 +239,7 @@ known-first-party = [
   "job_wizard",
   "layout_preset",
   "media_health",
+  "media_probe",
   "overlay_config",
   "overlay_scene",
   "pipeline_plan",
@@ -253,6 +260,7 @@ known-first-party = [
   "tui_run",
   "tui_task",
   "translate_chat_openai",
+  "translation_io",
   "translation_support",
   "twitch_chat_burn",
   "twitch_download",

@@ -28,6 +28,8 @@ COVERAGE_FAIL_UNDER = 65
 # Keep compile-check in sync with pyproject py-modules / critical scripts.
 COMPILE_SCRIPTS = [
     "chat_parser.py",
+    "chat_schedule.py",
+    "chat_text_layout.py",
     "chat_window.py",
     "cli_spec.py",
     "common_utils.py",
@@ -43,6 +45,7 @@ COMPILE_SCRIPTS = [
     "twitch_download_types.py",
     "layout_preset.py",
     "media_health.py",
+    "media_probe.py",
     "overlay_config.py",
     "overlay_scene.py",
     "pipeline_plan.py",
@@ -63,6 +66,7 @@ COMPILE_SCRIPTS = [
     "tui_run.py",
     "tui_task.py",
     "translate_chat_openai.py",
+    "translation_io.py",
     "translation_support.py",
     "twitch_chat_burn.py",
     "ux_setup.py",

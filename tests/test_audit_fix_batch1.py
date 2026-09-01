@@ -13,6 +13,7 @@ from PIL import Image
 import pytest
 
 from helpers import load_module
+import media_probe
 
 
 def test_expand_frame_sequence_fails_on_missing_middle_frame(tmp_path: Path):
@@ -328,7 +329,7 @@ def test_compose_publish_restores_bak_on_replace_failure(tmp_path: Path, make_te
             "summary": {},
         }
     ), mock.patch.object(
-        burn, "resolve_output_fps", return_value=10
+        media_probe, "resolve_output_fps", return_value=10
     ), mock.patch.object(
         burn, "build_video_encode_args", return_value=["-c:v", "libx264"]
     ), mock.patch.object(

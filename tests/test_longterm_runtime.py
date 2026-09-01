@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from helpers import load_module
+import media_probe
 
 
 @pytest.fixture(scope="module")
@@ -335,8 +336,8 @@ def _configure_fake_main(
     monkeypatch.setattr(burn, "apply_relative_layout", lambda *_args: None)
     monkeypatch.setattr(burn, "adapt_absolute_layout_to_source", lambda *_args: None)
     monkeypatch.setattr(burn, "layout_bounds_warnings", lambda *_args: [])
-    monkeypatch.setattr(burn, "resolve_output_fps", lambda *_args, **_kwargs: 29.97)
-    monkeypatch.setattr(burn, "probe_video_duration", lambda *_args: 5.0)
+    monkeypatch.setattr(media_probe, "resolve_output_fps", lambda *_args, **_kwargs: 29.97)
+    monkeypatch.setattr(media_probe, "probe_video_duration", lambda *_args: 5.0)
 
     messages = [] if empty_chat else [
         {
@@ -430,6 +431,9 @@ def test_publish_copy_failure_is_nonzero_and_retains_job_artifact(
 
 
 def test_short_media_probes_handle_timeout(burn, monkeypatch):
+    # Probes are lru-cached per path+stat in media_probe; reset so this test's
+    # timeout response is exercised even if a sibling test probed "video.mp4".
+    media_probe.cache_clear()
     seen_timeouts = []
 
     def timed_out(_cmd, **kwargs):

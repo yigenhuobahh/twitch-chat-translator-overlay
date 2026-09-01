@@ -40,7 +40,7 @@ class TestWebMDurationCheck:
         )
         short_summary = {"ok": True, "duration": 1.0, "has_video": True, "has_audio": False}
 
-        with mock.patch("twitch_chat_burn.probe_media_summary", return_value=short_summary):
+        with mock.patch("media_probe.probe_media_summary", return_value=short_summary):
             with mock.patch("twitch_chat_burn.resolve_source_av_timing") as mock_timing:
                 mock_timing.return_value = {
                     "has_audio": False,
@@ -49,7 +49,7 @@ class TestWebMDurationCheck:
                     "video_start": 0.0,
                     "audio_start": 0.0,
                 }
-                with mock.patch("twitch_chat_burn.resolve_output_fps", return_value=30):
+                with mock.patch("media_probe.resolve_output_fps", return_value=30):
                     with mock.patch("twitch_chat_burn.run_tracked") as mock_run:
                         mock_run.return_value = mock.Mock(returncode=0)
                         with mock.patch("twitch_chat_burn.build_webm_encode_args", return_value=[]):
