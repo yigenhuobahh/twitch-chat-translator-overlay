@@ -130,6 +130,7 @@ def test_failed_ffmpeg_archive_does_not_replace_existing_install(
 def test_failed_td_archive_does_not_replace_existing_install(
     tmp_path: Path, monkeypatch
 ):
+    import td_cli_install
     import twitch_download as td
 
     root = tmp_path / "root"
@@ -140,8 +141,10 @@ def test_failed_td_archive_does_not_replace_existing_install(
     payload = make_zip({"../escape.exe": b"bad"})
 
     monkeypatch.setattr(td, "find_twitchdownloader_cli", lambda root=None: None)
+    # W3-A1: fetch_latest_td_cli_release_asset moved to td_cli_install; the
+    # patch must target the defining module so try_portable_td_cli sees it.
     monkeypatch.setattr(
-        td,
+        td_cli_install,
         "fetch_latest_td_cli_release_asset",
         lambda timeout=30.0: ("test", "asset.zip", "https://example.test/asset.zip"),
     )
@@ -266,6 +269,7 @@ def test_valid_ffmpeg_archive_atomically_replaces_previous_install(
 def test_release_metadata_rejects_untrusted_asset_url(monkeypatch):
     import json
 
+    import td_cli_install
     import twitch_download as td
 
     metadata = {
@@ -277,7 +281,9 @@ def test_release_metadata_rejects_untrusted_asset_url(monkeypatch):
             }
         ],
     }
-    monkeypatch.setattr(td, "platform_td_asset_token", lambda: "Windows-x64")
+    # W3-A1: platform_td_asset_token moved to td_cli_install and is called
+    # internally by fetch/pick there — patch the defining module.
+    monkeypatch.setattr(td_cli_install, "platform_td_asset_token", lambda: "Windows-x64")
     monkeypatch.setattr(
         urllib.request,
         "urlopen",
@@ -366,6 +372,7 @@ def test_deep_td_archive_layout_does_not_replace_existing_install(
     tmp_path: Path,
     monkeypatch,
 ):
+    import td_cli_install
     import twitch_download as td
 
     root = tmp_path / "root"
@@ -378,8 +385,9 @@ def test_deep_td_archive_layout_does_not_replace_existing_install(
     )
 
     monkeypatch.setattr(td, "find_twitchdownloader_cli", lambda root=None: None)
+    # W3-A1: fetch_latest_td_cli_release_asset moved to td_cli_install.
     monkeypatch.setattr(
-        td,
+        td_cli_install,
         "fetch_latest_td_cli_release_asset",
         lambda timeout=30.0: (
             "test",

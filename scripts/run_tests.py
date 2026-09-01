@@ -24,6 +24,12 @@ from common_utils import safe_which
 
 ROOT = Path(__file__).resolve().parents[1]
 COVERAGE_FAIL_UNDER = 65
+# G-#10 per-module floor: a big module (>= COVERAGE_FLOOR_STATEMENTS statements)
+# whose line coverage falls below COVERAGE_FLOOR_PERCENT fails the --coverage
+# run even when the global --cov-fail-under average passes, so refactors cannot
+# strand large untested code paths behind a healthy total.
+COVERAGE_FLOOR_STATEMENTS = 500
+COVERAGE_FLOOR_PERCENT = 60.0
 
 # Keep compile-check in sync with pyproject py-modules / critical scripts.
 COMPILE_SCRIPTS = [
@@ -61,6 +67,7 @@ COMPILE_SCRIPTS = [
     "support_report.py",
     "task_events.py",
     "task_results.py",
+    "td_cli_install.py",
     "tui_history.py",
     "tui_models.py",
     "tui_run.py",
@@ -70,6 +77,7 @@ COMPILE_SCRIPTS = [
     "translation_support.py",
     "twitch_chat_burn.py",
     "ux_setup.py",
+    "vod_merge.py",
 ]
 
 
@@ -166,6 +174,111 @@ def lint_check() -> int:
     return run([sys.executable, "-m", "ruff", "check", "scripts", "tests"])
 
 
+def coverage_floor_check() -> int:
+    """G-#10: per-module coverage floor for --coverage runs.
+
+    Modules with >= COVERAGE_FLOOR_STATEMENTS statements must keep line
+    coverage >= COVERAGE_FLOOR_PERCENT. Reads the ``.coverage`` data file that
+    pytest-cov just wrote (cwd=ROOT) via ``coverage json`` and prints an
+    actionable module/coverage listing on failure. Infrastructure problems
+    (missing data file, broken coverage CLI) only warn and pass: the global
+    ``--cov-fail-under`` gate already ran inside pytest.
+    """
+    import json as _json
+
+    data_file = ROOT / ".coverage"
+    if not data_file.is_file():
+        print("[WARN] 覆盖率下限检查跳过: 未找到 .coverage 数据文件", flush=True)
+        return 0
+    report_file = ROOT / ".coverage-floor.json"
+    try:
+        # ``coverage json`` exits 2 when the configured global fail_under
+        # ([tool.coverage.report] fail_under=65) is not met by this run — the
+        # JSON report is still written and valid, so parse it regardless of rc
+        # and only skip when the report itself is unusable.
+        proc = subprocess.run(
+            [sys.executable, "-m", "coverage", "json", "-o", str(report_file)],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+        )
+        if not report_file.is_file():
+            print(
+                f"[WARN] 覆盖率下限检查跳过: coverage json 未生成报告 (exit {proc.returncode})\n"
+                f"  {(proc.stderr or proc.stdout or '').strip()[-400:]}",
+                flush=True,
+            )
+            return 0
+        report = _json.loads(report_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"[WARN] 覆盖率下限检查跳过: 无法生成/解析 coverage json: {exc}", flush=True)
+        return 0
+    finally:
+        try:
+            report_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    scripts_root = (ROOT / "scripts").resolve()
+    modules: list[tuple[str, int, float]] = []
+    for path, payload in (report or {}).get("files", {}).items():
+        file_path = Path(path)
+        if not file_path.is_absolute():
+            file_path = ROOT / file_path
+        try:
+            file_path = file_path.resolve()
+        except OSError:
+            continue
+        if file_path.parent != scripts_root or file_path.suffix != ".py":
+            continue
+        summary = (payload or {}).get("summary") or {}
+        statements = int(summary.get("num_statements") or 0)
+        covered = int(summary.get("covered_lines") or 0)
+        if statements <= 0:
+            continue
+        modules.append((file_path.stem, statements, covered * 100.0 / statements))
+
+    big = [m for m in modules if m[1] >= COVERAGE_FLOOR_STATEMENTS]
+    if not big:
+        print(
+            f"[info] 覆盖率下限: 没有语句数 >= {COVERAGE_FLOOR_STATEMENTS} 的模块，无需分模块下限",
+            flush=True,
+        )
+        return 0
+
+    print(
+        f"\n[coverage-floor] 语句数 >= {COVERAGE_FLOOR_STATEMENTS} 的模块行覆盖率"
+        f"（下限 {COVERAGE_FLOOR_PERCENT:.0f}%）:",
+        flush=True,
+    )
+    offenders: list[tuple[str, int, float]] = []
+    for name, statements, pct in sorted(big, key=lambda item: item[2]):
+        marker = ""
+        if pct < COVERAGE_FLOOR_PERCENT:
+            offenders.append((name, statements, pct))
+            marker = "  [FAIL]"
+        print(f"  {name}.py: {pct:.1f}% (statements={statements}){marker}", flush=True)
+
+    if not offenders:
+        print("[OK] 覆盖率分模块下限通过", flush=True)
+        return 0
+
+    print(
+        f"\n[FAIL] 覆盖率分模块下限未达标（G-#10）: 以下模块语句数 >= {COVERAGE_FLOOR_STATEMENTS}"
+        f" 但行覆盖率 < {COVERAGE_FLOOR_PERCENT:.0f}%:",
+        flush=True,
+    )
+    for name, statements, pct in offenders:
+        print(f"  - scripts/{name}.py: {pct:.1f}% (statements={statements})", flush=True)
+    print(
+        "  可操作: 为上述模块补充 tests/ 用例（先 `python -m coverage report --show-missing`"
+        " 看未覆盖行）;\n"
+        "  若该模块体积已不合理，优先拆分/瘦身后再达标。",
+        flush=True,
+    )
+    return 1
+
+
 def packaging_smoke() -> int:
     """Lightweight packaging / entrypoint checks for --max (no network)."""
     print("\n[max] packaging / entrypoint smoke", flush=True)
@@ -254,7 +367,9 @@ def main() -> int:
     parser.add_argument(
         "--coverage",
         action="store_true",
-        help=f"with --max, require core scripts coverage >= {COVERAGE_FAIL_UNDER}%%",
+        help=f"with --max, require core scripts coverage >= {COVERAGE_FAIL_UNDER}%% "
+        f"and >= {COVERAGE_FLOOR_PERCENT:.0f}%% line coverage for modules with "
+        f">= {COVERAGE_FLOOR_STATEMENTS} statements (G-#10)",
     )
     parser.add_argument("-k", dest="keyword", default=None, help="pytest -k expression")
     parser.add_argument("-q", "--quiet", action="store_true")
@@ -375,6 +490,11 @@ def main() -> int:
     code = run(pytest_cmd)
     if code != 0:
         return code
+
+    if args.coverage:
+        floor_code = coverage_floor_check()
+        if floor_code != 0:
+            return floor_code
 
     if args.max:
         pack_code = packaging_smoke()

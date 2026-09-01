@@ -98,6 +98,7 @@ py-modules = [
   "support_report",
   "task_events",
   "task_results",
+  "td_cli_install",
   "tui_history",
   "tui_models",
   "tui_run",
@@ -110,6 +111,7 @@ py-modules = [
   "twitch_download_transaction",
   "twitch_download_types",
   "ux_setup",
+  "vod_merge",
 ]
 # Ship public YAML assets with the wheel without converting scripts/ into a package.
 # Wheel data-files install under the interpreter's sysconfig data prefix, usually:
@@ -255,6 +257,7 @@ known-first-party = [
   "support_report",
   "task_events",
   "task_results",
+  "td_cli_install",
   "tui_history",
   "tui_models",
   "tui_run",
@@ -267,6 +270,7 @@ known-first-party = [
   "twitch_download_transaction",
   "twitch_download_types",
   "ux_setup",
+  "vod_merge",
 ]
 force-sort-within-sections = true
 

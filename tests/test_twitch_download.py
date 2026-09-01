@@ -168,7 +168,9 @@ def test_readiness_includes_twitchdownloader_key():
 
 
 def test_pick_td_cli_asset_windows_and_linux():
-    import twitch_download as td
+    # W3-A1: pick_td_cli_asset / platform_td_asset_token live in td_cli_install;
+    # patching the defining module keeps the internal call site observable.
+    import td_cli_install as td
 
     assets = [
         {"name": "TwitchDownloaderCLI-1.56.4-Linux-x64.zip", "browser_download_url": "http://x/linux"},
@@ -209,12 +211,15 @@ def test_try_portable_td_cli_extracts_zip(tmp_path: Path, monkeypatch):
     import io
     import zipfile as zfmod
 
+    import td_cli_install
     import twitch_download as td
 
     root = tmp_path / "repo"
     root.mkdir()
+    # W3-A1: fetch_latest_td_cli_release_asset moved to td_cli_install; the
+    # patch must target the defining module so try_portable_td_cli sees it.
     monkeypatch.setattr(
-        td,
+        td_cli_install,
         "fetch_latest_td_cli_release_asset",
         lambda timeout=30.0: ("1.56.4", "TwitchDownloaderCLI-fake.zip", "http://example.test/cli.zip"),
     )
@@ -284,7 +289,10 @@ def test_try_portable_td_cli_signature_has_no_assume_yes(tmp_path: Path, monkeyp
     def fake_fetch(*, timeout: float = 30.0):
         raise td.TwitchDownloadError("无法连接 GitHub releases: offline")
 
-    monkeypatch.setattr(td, "fetch_latest_td_cli_release_asset", fake_fetch)
+    # W3-A1: fetch_latest_td_cli_release_asset moved to td_cli_install.
+    import td_cli_install
+
+    monkeypatch.setattr(td_cli_install, "fetch_latest_td_cli_release_asset", fake_fetch)
     ok = td.try_portable_td_cli(root=tmp_path / "fresh-root")
     assert ok is False
 
