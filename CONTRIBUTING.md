@@ -85,12 +85,12 @@ python -m pytest tests/ -v -m max
 | `tests/test_perf_encode.py` | 编码选项 / 静态帧复用 |
 | `tests/test_render_preset.py` | `--render-preset` YAML |
 | `tests/test_fps_probe_edges.py` | 29.97 分数帧率探测 / 长序列 sparse 补帧 |
-| `tests/test_batch_b.py` | HTML 解析变体、布局预设、移动模式 |
+| `tests/test_parser_layout_burn.py` | HTML 解析变体、布局预设、移动模式 |
 | `tests/test_bugfix_regressions.py` | 历史修复回归（帧采样、duration、fade 等） |
-| `tests/test_audit_*.py` | 审计修复：CLI/clean、HTML parser、deep fixes、P0/P1/P2 |
+| `tests/test_chat_parser_regressions.py`、`tests/test_cli_clean_and_contracts.py`、`tests/test_render_perf_burn_publish.py`、`tests/test_deep_audit_fixes.py` | 审计修复回归：HTML parser、CLI/clean、deep fixes、性能/烧录/发布 |
 | `tests/test_html_variants.py` | HTML 格式兼容性（单引号、多 class、legacy） |
 | `tests/test_validate_and_offset_edges.py` | duration/offset 边界 |
-| `tests/test_p2_hardening.py` | validate/hex/emote classes 等加固 |
+| `tests/test_burn_hardening.py` | validate/hex/emote classes 等加固 |
 | `tests/test_font_resolve.py` | 跨平台 CJK 字体检测 |
 | `tests/test_doctor_import.py` | `--doctor` 不依赖 .env/API |
 

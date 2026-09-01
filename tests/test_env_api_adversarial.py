@@ -5,10 +5,10 @@ Covers:
 1. Mock isolation and environment variable leakage prevention across test runs.
 2. Robustness of save_dotenv_api_config under adversarial file formats (CRLF, BOM,
    malformed lines, duplicates, whitespace, Unicode). The dedicated special-characters
-   value test was deduplicated into test_adversarial_m3.py.
+   value test was deduplicated into test_tui_adversarial.py.
 3. Robustness of probe_translate_api under adverse error conditions (SSLError, ConnectionReset, 429 RateLimit, 500 ServerError, invalid response).
 4. Offset propagation through PipelinePlan. The boundary/adversarial --offset parsing
-   parametrization was deduplicated into test_adversarial_m3.py.
+   parametrization was deduplicated into test_tui_adversarial.py.
 5. Async Textual UI stress testing (rapid input typing, tab switching during probe, unmounting while probe thread is active).
 6. Deterministic reproduction of DOM query safety failure in _refresh_form_validation.
 """
@@ -120,9 +120,9 @@ def test_save_dotenv_api_config_handles_crlf_and_utf8_bom(tmp_path: Path):
 
 
 # NOTE: the former dedicated special-characters/spaces save test was merged
-# into test_adversarial_m3.py::test_adversarial_save_dotenv_special_characters,
+# into test_tui_adversarial.py::test_adversarial_save_dotenv_special_characters,
 # and the former 19-case offset boundary parametrization was merged into
-# test_adversarial_m3.py::test_adversarial_offset_valid_inputs /
+# test_tui_adversarial.py::test_adversarial_offset_valid_inputs /
 # ::test_adversarial_offset_invalid_inputs.
 
 
@@ -174,7 +174,7 @@ def test_probe_translate_api_simulated_network_failures():
 # 3. Time Offset (--offset) Extreme Values and Boundary Conditions
 # ============================================================================
 # NOTE: the former 19-case parametrized offset boundary test lives on in
-# test_adversarial_m3.py (valid-input and invalid-input parametrizations,
+# test_tui_adversarial.py (valid-input and invalid-input parametrizations,
 # extended with the boundary and beyond-bound values unique to this file).
 
 

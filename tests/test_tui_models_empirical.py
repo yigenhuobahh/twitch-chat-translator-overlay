@@ -2,7 +2,7 @@
 """Empirical test suite for M2 Textual GUI implementation (Challenger 2).
 
 Coverage kept in this file after deduplication against the shared suites
-(test_adversarial_m3.py, test_tui_api_config.py, test_adversarial_m2.py):
+(test_tui_adversarial.py, test_tui_api_config.py, test_tui_stress.py):
 1. Non-standard and legacy mode handling in form populate and read.
 2. Draft edge cases (extra_fields offset fallback, invalid preview clip).
 3. Select dropdown reactivity driving the validation widget.
@@ -11,13 +11,13 @@ Coverage kept in this file after deduplication against the shared suites
 6. Non-blocking nature of @work(thread=True) API probe with wall-clock checks.
 
 Deduplicated cases now covered elsewhere:
-- custom preset populate -> test_adversarial_m3.py::test_adversarial_tui_custom_select_options_and_offset
-  and test_adversarial_m2.py::test_tui_select_controls_and_custom_options
+- custom preset populate -> test_tui_adversarial.py::test_adversarial_tui_custom_select_options_and_offset
+  and test_tui_stress.py::test_tui_select_controls_and_custom_options
 - API save/test/probe UI flows -> test_tui_api_config.py (tab save/test buttons)
-- 6-tab widget inventory and navigation -> test_adversarial_m2.py::test_tui_tab_switching_stress
-- mode -> CLI contracts -> test_adversarial_m3.py::test_adversarial_all_modes_projection_and_cli
-- offset propagation / blank omission -> test_adversarial_m2.py::test_tui_offset_inputs_and_validation
-- manual_required guidance -> test_adversarial_m2.py::test_tui_task_dispatch_and_manual_required_lifecycle
+- 6-tab widget inventory and navigation -> test_tui_stress.py::test_tui_tab_switching_stress
+- mode -> CLI contracts -> test_tui_adversarial.py::test_adversarial_all_modes_projection_and_cli
+- offset propagation / blank omission -> test_tui_stress.py::test_tui_offset_inputs_and_validation
+- manual_required guidance -> test_tui_stress.py::test_tui_task_dispatch_and_manual_required_lifecycle
 """
 
 from __future__ import annotations

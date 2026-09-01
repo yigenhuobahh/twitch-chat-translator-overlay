@@ -432,7 +432,7 @@ def test_build_audio_encode_args_for_compose_adelay_postprocessing():
 
 
 def test_compose_timing_reads_defensive_gets():
-    """Old stubs (test_p2_fixes, test_audit_fix_batch1) return only 5 keys.
+    """Old stubs (test_burn_compose_and_encode, test_render_perf_burn_publish) return only 5 keys.
 
     compose_video must read the new timing fields via .get with defaults, never
     via [] — a missing audio_late/audio_start/video_start key must not KeyError.

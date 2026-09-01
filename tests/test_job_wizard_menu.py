@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """In-process coverage for job_wizard interactive menu loops and command routing.
 
-Follows the monkeypatch pattern proven in test_p0_interactive_coverage.py:
+Follows the monkeypatch pattern proven in test_job_wizard_interactive.py:
 answer iterators are fed through ``wizard._prompt`` (and friends), every
 collaborator is patched on the job_wizard module, and assertions target the
 interaction sequence / return codes rather than implementation details.
