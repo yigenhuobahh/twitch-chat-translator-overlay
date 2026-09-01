@@ -26,10 +26,8 @@
 import json
 import os
 from pathlib import Path
-import re
-import shutil
+import shutil  # noqa: F401 - 测试按模块属性 patch pipeline.shutil.copy2；publish_output 实现居 review_tables，双方共享同一 shutil 模块对象，patch 仍然生效
 import sys
-import tempfile
 import uuid
 
 # Allow sibling imports when loaded as a script or via importlib from tests.
@@ -39,7 +37,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from chat_window import apply_preview_first_defaults
 from common_utils import (
-    atomic_write_json,
+    atomic_write_json,  # noqa: F401 - 门面 re-export（tests 经 pipe.atomic_write_json 消费；实现单源在 common_utils，review_tables 直接引用）
     current_cli_invocation,
     ensure_utf8_stdio,
     load_dotenv_if_present,
@@ -76,6 +74,30 @@ from process_util import (
     run_tracked,
 )
 from render_preset import apply_render_preset_to_namespace, load_render_preset
+
+# 复核表 / 翻译质检（lint）+ YAML/发布/规则清洗簇：实现单源在 review_tables.py
+# （刀四/刀五原样搬运）。这里保留同名 re-export，`from render_cn_chat import
+# PipelineError / load_yaml_rules / publish_output ...` 等历史消费者不断；
+# 依赖 DRY_RUN/log 的函数另留薄包装（见下方"门面"区）。
+import review_tables as review_tables
+from review_tables import (  # noqa: F401 - re-exported for tests/CLI compatibility
+    LINT_BRACKET_TOKEN_RE,
+    LINT_MENTION_RE,
+    LINT_PURE_EMOTE_RE,
+    LINT_URL_RE,
+    PipelineError,
+    _lint_issue,
+    _review_issue_map,
+    _review_rows,
+    load_profile,
+    load_yaml_file,
+    load_yaml_rules,
+    publish_output,
+)
+
+# C-O8：非空译文计数单源在 translation_io.py，经 twitch_chat_burn 门面
+# re-export 引入；render_cn_chat 不再保留 _translation_nonempty_count 本地副本。
+from twitch_chat_burn import translation_json_nonempty_count
 from ux_setup import run_init
 
 ensure_utf8_stdio()
@@ -115,8 +137,8 @@ VERBOSE = False
 QUIET = False
 
 
-class PipelineError(SystemExit):
-    pass
+# PipelineError 单源已迁至 review_tables.py（刀五），文件头 re-export 同一个
+# 类对象：`except PipelineError` / `pytest.raises(pipe.PipelineError)` 语义不变。
 
 
 def mark_manual_translation_required() -> None:
@@ -386,18 +408,9 @@ def run(cmd, cwd=None, error_hint=""):
         raise PipelineError(f"错误: {hint} (exit code {p.returncode})")
 
 
-def _translation_nonempty_count(path: Path) -> int:
-    """Count non-empty translation fields in a translation JSON (0 if missing)."""
-    if not path.is_file():
-        return 0
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return 0
-    items = data.get("messages") if isinstance(data, dict) else None
-    if not isinstance(items, list):
-        return 0
-    return sum(1 for it in items if isinstance(it, dict) and str(it.get("translation", "") or "").strip())
+# C-O8：_translation_nonempty_count 本地副本已删除；调用点统一改用
+# twitch_chat_burn 门面的 translation_json_nonempty_count（实现居
+# translation_io.py，行为一致：缺文件/不可解析均计 0）。
 
 
 def _post_download_next_steps(video: Path, chat_html: Path, *, download_only: bool, yes: bool) -> int:
@@ -493,7 +506,7 @@ def _export_translation_json(
     Forward ``offset`` so export_offset metadata matches the pipeline's intended
     timeline diagnosis (identity still uses stream timestamps either way).
     """
-    existing_n = _translation_nonempty_count(trans_json)
+    existing_n = translation_json_nonempty_count(trans_json)
     if existing_n > 0 and not force:
         log(
             f"[1/3] 检测到已有 {existing_n} 条非空 translation，跳过导出以免覆盖: {trans_json}\n"
@@ -536,7 +549,7 @@ def _fallback_manual_after_export(
 ) -> None:
     """API unavailable: export review tables and stop for hand translation (same as --manual-translation tail)."""
     log(f"\n[翻译 API] {reason}")
-    filled = _translation_nonempty_count(trans_json)
+    filled = translation_json_nonempty_count(trans_json)
     total = 0
     try:
         data = json.loads(trans_json.read_text(encoding="utf-8")) if trans_json.is_file() else {}
@@ -777,234 +790,22 @@ def handle_translate_run_failure(
     return "manual"
 
 
-def load_yaml_file(yaml_path: Path, label: str):
-    try:
-        import yaml
-    except ImportError as e:
-        # PipelineError subclasses SystemExit, so CLI exit codes are unchanged
-        # while callers can catch every failure uniformly.
-        raise PipelineError(
-            f"错误: 使用 {label} 需要安装 PyYAML，请运行 pip install PyYAML"
-        ) from e
-    if not yaml_path.is_file():
-        raise PipelineError(f"错误: {label} 文件不存在: {yaml_path}")
-    try:
-        data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, yaml.YAMLError) as e:
-        raise PipelineError(f"Invalid {label} YAML {yaml_path}: {e}") from e
-    if data is None:
-        return {}
-    if not isinstance(data, dict):
-        raise PipelineError(f"Invalid {label} YAML {yaml_path}: root must be a mapping")
-    return data
-
-
-def load_yaml_rules(rules_path: Path):
-    """Load normalizations + optional preserve_patterns from a rules YAML.
-
-    Returns a dict: {"normalizations": [...], "preserve_patterns": [compiled re, ...]}.
-    preserve_patterns skip rule application when original matches (translate path
-    still runs separately; this only protects the rules-normalize pass).
-    """
-    data = load_yaml_file(rules_path, "规则")
-    rules = []
-    if "normalizations" not in data:
-        raw_rules = []
-    else:
-        raw_rules = data["normalizations"]
-    if not isinstance(raw_rules, list):
-        raise PipelineError(
-            f"Invalid rules YAML {rules_path}: normalizations must be a list"
-        )
-    for rule_index, item in enumerate(raw_rules):
-        if not isinstance(item, dict):
-            raise PipelineError(
-                f"Invalid rules YAML {rules_path}: normalizations[{rule_index}] must be a mapping"
-            )
-        targets = item.get("match", [])
-        if isinstance(targets, str):
-            targets = [targets]
-        elif not isinstance(targets, list):
-            raise PipelineError(
-                f"Invalid rules YAML {rules_path}: normalizations[{rule_index}].match must be a string or list"
-            )
-        if not all(isinstance(target, (str, int, float)) for target in targets):
-            raise PipelineError(
-                f"Invalid rules YAML {rules_path}: normalizations[{rule_index}].match contains a non-scalar value"
-            )
-        translation = item.get("translation")
-        if translation is None:
-            continue
-        rules.append({
-            "name": item.get("name", "unnamed"),
-            "match": {str(x) for x in targets},
-            "translation": str(translation),
-        })
-    preserve = []
-    preserve_raw = data.get("preserve_patterns")
-    if preserve_raw is None:
-        preserve_raw = []
-    if not isinstance(preserve_raw, list):
-        raise PipelineError(
-            f"Invalid rules YAML {rules_path}: preserve_patterns must be a list"
-        )
-    for pattern_index, pat in enumerate(preserve_raw):
-        try:
-            preserve.append(re.compile(str(pat)))
-        except re.error as e:
-            raise PipelineError(
-                f"Invalid rules YAML {rules_path}: preserve_patterns[{pattern_index}] is not a valid regex: {e}"
-            ) from e
-    return {"normalizations": rules, "preserve_patterns": preserve}
-
-
-def publish_output(src_path: Path, dst_path: Path, *, backup_prev: bool = True):
-    """Copy rendered output to the final path using a temp file + atomic replace.
-
-    When backup_prev is True (default), rename an existing dst to dst.bak first and
-    restore it if the replace fails — matching burn's default backup contract.
-    """
-    src_path = Path(src_path)
-    dst_path = Path(dst_path)
-    if not src_path.is_file():
-        raise PipelineError(f"错误: 渲染输出不存在: {src_path}")
-    if src_path.resolve() == dst_path.resolve():
-        return dst_path
-    dst_path.parent.mkdir(parents=True, exist_ok=True)
-    backup = None
-    backup_created = False
-    if backup_prev and dst_path.is_file():
-        backup = Path(str(dst_path) + ".bak")
-        try:
-            if backup.is_file():
-                backup.unlink()
-            dst_path.rename(backup)
-            backup_created = True
-            print(f"  [backup] {backup}")
-        except OSError as e:
-            print(f"  warning: cannot backup {dst_path}: {e}")
-            backup = None
-            backup_created = False
-    fd, tmp_name = tempfile.mkstemp(prefix=dst_path.stem + ".", suffix=".partial.mp4", dir=str(dst_path.parent))
-    os.close(fd)
-    tmp_path = Path(tmp_name)
-    try:
-        try:
-            shutil.copy2(src_path, tmp_path)
-            os.replace(tmp_path, dst_path)
-        except OSError:
-            if backup_created and backup is not None and backup.is_file() and not dst_path.is_file():
-                try:
-                    backup.rename(dst_path)
-                    print(f"  已从备份恢复: {dst_path}")
-                except OSError as restore_err:
-                    print(f"  警告: 无法从备份恢复 {backup}: {restore_err}")
-            raise
-    finally:
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except OSError:
-            pass
-    try:
-        src_path.unlink()
-    except OSError:
-        pass
-    return dst_path
+# ---------------------------------------------------------------------------
+# 人工复核表 / 翻译质检（lint）/ YAML / 发布 / 规则清洗 —— 门面（刀四/刀五）。
+# 实现已整体搬至 review_tables.py（原样搬运）；review_tables 及纯函数、
+# LINT_* 正则、load_yaml_file / load_yaml_rules / load_profile / publish_output
+# 已在文件头 import + re-export（tests 未按属性 monkeypatch 这些名字，直接
+# 绑定即可）。依赖 DRY_RUN/log 的函数保留下方薄包装：显式传入 dry_run=DRY_RUN
+# 与本模块的 log，使"测试按模块属性 monkeypatch DRY_RUN"的历史语义完全不变；
+# 对外名字与签名一概不变。
+# ---------------------------------------------------------------------------
 
 
 def normalize_translation(json_path: Path, rules_path: Path | None = None):
-    if not rules_path:
-        print("\n[规则清洗] 未指定 --rules，跳过规则清洗。")
-        return
-    if DRY_RUN:
-        print(f"\n[dry-run] 跳过规则清洗写入: {json_path}")
-        return
-    loaded = load_yaml_rules(rules_path)
-    rules = loaded.get("normalizations") or []
-    preserve_patterns = loaded.get("preserve_patterns") or []
-    if not rules:
-        print(f"\n[规则清洗] 规则文件无 normalizations: {rules_path}")
-        return
-    data = json.loads(json_path.read_text(encoding="utf-8"))
-    changed = []
-    for msg in data.get("messages", []):
-        original = str(msg.get("original", ""))
-        if any(p.search(original) for p in preserve_patterns):
-            continue
-        for rule in rules:
-            if original in rule["match"] and msg.get("translation") != rule["translation"]:
-                changed.append((msg.get("index"), rule["name"], original, msg.get("translation"), rule["translation"]))
-                msg["translation"] = rule["translation"]
-                break
-    atomic_write_json(json_path, data)
-    if changed:
-        print(f"\n[规则清洗] 已应用 {len(changed)} 条修改，规则文件: {rules_path}")
-        for idx, rule_name, original, old, new in changed:
-            print(f"  [{idx}] {rule_name}: {original!r}: {old!r} -> {new!r}")
-    else:
-        print(f"\n[规则清洗] 无需修改，规则文件: {rules_path}")
-
-
-def load_profile(profile_path: Path):
-    data = load_yaml_file(profile_path, "Profile")
-    glossary_value = data.get("glossary")
-    if glossary_value is not None and not isinstance(glossary_value, dict):
-        raise PipelineError(
-            f"Invalid Profile YAML {profile_path}: glossary must be a mapping"
-        )
-    preserve_value = data.get("preserve")
-    if preserve_value is not None and not isinstance(preserve_value, list):
-        raise PipelineError(
-            f"Invalid Profile YAML {profile_path}: preserve must be a list"
-        )
-    style_value = data.get("translation_style")
-    if style_value is not None and not isinstance(style_value, dict):
-        raise PipelineError(
-            f"Invalid Profile YAML {profile_path}: translation_style must be a mapping"
-        )
-    context_parts = []
-    if data.get("context"):
-        context_parts.append(str(data["context"]))
-
-    glossary = data.get("glossary") or {}
-    if glossary:
-        terms = []
-        for src, dst in glossary.items():
-            terms.append(f"  {src} -> {dst}")
-        context_parts.append(
-            "**术语词典 / Glossary (必须严格遵守 / MUST follow strictly)**\n"
-            + "\n".join(terms)
-        )
-
-    preserve = data.get("preserve") or []
-    if preserve:
-        context_parts.append("需要保留 / Preserve: " + ", ".join(map(str, preserve)))
-
-    style = data.get("translation_style") or {}
-    if style:
-        style_lines = [f"{k}: {v}" for k, v in style.items()]
-        context_parts.append("翻译风格 / Translation style:\n" + "\n".join(style_lines))
-
-    return "\n\n".join(context_parts), data
-
-
-# ---------------------------------------------------------------------------
-# 人工复核表 / 翻译质检（lint）——实现已整体搬至 review_tables.py（原样搬运）。
-# 这里保留薄包装：显式传入 dry_run=DRY_RUN 与本模块的 log，使"测试按模块属性
-# monkeypatch DRY_RUN"的历史语义完全不变；纯函数与 LINT_* 正则直接 re-export，
-# 对外名字与签名一概不变。
-# ---------------------------------------------------------------------------
-import review_tables as review_tables
-from review_tables import (  # noqa: F401 - re-exported for tests/CLI compatibility
-    LINT_BRACKET_TOKEN_RE,
-    LINT_MENTION_RE,
-    LINT_PURE_EMOTE_RE,
-    LINT_URL_RE,
-    _lint_issue,
-    _review_issue_map,
-    _review_rows,
-)
+    # 规则清洗实现单源在 review_tables.normalize_translation；本模块全局
+    # DRY_RUN 是唯一事实源，调用时注入（tests/test_pipeline_scenarios.py 按
+    # 模块属性改写 render.DRY_RUN 的历史语义不变）。
+    review_tables.normalize_translation(json_path, rules_path=rules_path, dry_run=DRY_RUN)
 
 
 def _prepare_review_export(json_path, max_chars=90):

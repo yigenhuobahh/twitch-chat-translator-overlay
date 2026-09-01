@@ -1,20 +1,37 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""人工复核表（TSV/XLSX）导出导入与翻译质检（lint）。
+"""人工复核表（TSV/XLSX）导出导入、翻译质检（lint）与 YAML/发布/规则清洗簇。
 
 从 render_cn_chat.py 原样搬出（搬运而非重写）：本模块保持纯函数 —— 不读
 模块级可变全局；dry-run 与日志经显式参数注入，由调用方（render_cn_chat 的
 薄包装）传入 `dry_run=DRY_RUN, log=log`，以保留测试按模块属性 monkeypatch
 DRY_RUN 的语义。render_cn_chat 对这些名字保持 re-export/包装，外部签名不变。
+
+刀五迁入 load_yaml_file / load_yaml_rules / load_profile / publish_output /
+normalize_translation（原样搬运）： PipelineError 一并在此单源定义
+（render_cn_chat re-export），使 YAML/发布簇能抛出同一错误类而不产生
+review_tables -> render_cn_chat 的反向导入。
 """
 
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import re
+import shutil
+import tempfile
 
 from common_utils import atomic_write_json
+
+
+class PipelineError(SystemExit):
+    """流水线错误（原 render_cn_chat.PipelineError，单源迁至此处）。
+
+    继承 SystemExit，CLI 退出码链保持不变；render_cn_chat 顶部 re-export
+    该名字，`from render_cn_chat import PipelineError` 等历史消费者拿到的
+    是同一个类对象。
+    """
 
 
 def _review_issue_map(json_path: Path, max_chars: int = 90, data: dict | None = None, lint_fn=None):
@@ -423,3 +440,227 @@ def lint_translation(
             print(f"  质检报告: {report_path}")
 
     return issues
+
+
+# ---------------------------------------------------------------------------
+# 刀五迁入（自 render_cn_chat.py 原样搬运）：YAML 规则/Profile 解析、
+# 渲染产物发布、翻译 JSON 规则清洗。除 normalize_translation 的 DRY_RUN
+# 改为显式 dry_run 参数注入外，函数体一概 verbatim。
+# ---------------------------------------------------------------------------
+
+
+def load_yaml_file(yaml_path: Path, label: str):
+    try:
+        import yaml
+    except ImportError as e:
+        # PipelineError subclasses SystemExit, so CLI exit codes are unchanged
+        # while callers can catch every failure uniformly.
+        raise PipelineError(
+            f"错误: 使用 {label} 需要安装 PyYAML，请运行 pip install PyYAML"
+        ) from e
+    if not yaml_path.is_file():
+        raise PipelineError(f"错误: {label} 文件不存在: {yaml_path}")
+    try:
+        data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as e:
+        raise PipelineError(f"Invalid {label} YAML {yaml_path}: {e}") from e
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise PipelineError(f"Invalid {label} YAML {yaml_path}: root must be a mapping")
+    return data
+
+
+def load_yaml_rules(rules_path: Path):
+    """Load normalizations + optional preserve_patterns from a rules YAML.
+
+    Returns a dict: {"normalizations": [...], "preserve_patterns": [compiled re, ...]}.
+    preserve_patterns skip rule application when original matches (translate path
+    still runs separately; this only protects the rules-normalize pass).
+    """
+    data = load_yaml_file(rules_path, "规则")
+    rules = []
+    if "normalizations" not in data:
+        raw_rules = []
+    else:
+        raw_rules = data["normalizations"]
+    if not isinstance(raw_rules, list):
+        raise PipelineError(
+            f"Invalid rules YAML {rules_path}: normalizations must be a list"
+        )
+    for rule_index, item in enumerate(raw_rules):
+        if not isinstance(item, dict):
+            raise PipelineError(
+                f"Invalid rules YAML {rules_path}: normalizations[{rule_index}] must be a mapping"
+            )
+        targets = item.get("match", [])
+        if isinstance(targets, str):
+            targets = [targets]
+        elif not isinstance(targets, list):
+            raise PipelineError(
+                f"Invalid rules YAML {rules_path}: normalizations[{rule_index}].match must be a string or list"
+            )
+        if not all(isinstance(target, (str, int, float)) for target in targets):
+            raise PipelineError(
+                f"Invalid rules YAML {rules_path}: normalizations[{rule_index}].match contains a non-scalar value"
+            )
+        translation = item.get("translation")
+        if translation is None:
+            continue
+        rules.append({
+            "name": item.get("name", "unnamed"),
+            "match": {str(x) for x in targets},
+            "translation": str(translation),
+        })
+    preserve = []
+    preserve_raw = data.get("preserve_patterns")
+    if preserve_raw is None:
+        preserve_raw = []
+    if not isinstance(preserve_raw, list):
+        raise PipelineError(
+            f"Invalid rules YAML {rules_path}: preserve_patterns must be a list"
+        )
+    for pattern_index, pat in enumerate(preserve_raw):
+        try:
+            preserve.append(re.compile(str(pat)))
+        except re.error as e:
+            raise PipelineError(
+                f"Invalid rules YAML {rules_path}: preserve_patterns[{pattern_index}] is not a valid regex: {e}"
+            ) from e
+    return {"normalizations": rules, "preserve_patterns": preserve}
+
+
+def publish_output(src_path: Path, dst_path: Path, *, backup_prev: bool = True):
+    """Copy rendered output to the final path using a temp file + atomic replace.
+
+    When backup_prev is True (default), rename an existing dst to dst.bak first and
+    restore it if the replace fails — matching burn's default backup contract.
+    """
+    src_path = Path(src_path)
+    dst_path = Path(dst_path)
+    if not src_path.is_file():
+        raise PipelineError(f"错误: 渲染输出不存在: {src_path}")
+    if src_path.resolve() == dst_path.resolve():
+        return dst_path
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    backup = None
+    backup_created = False
+    if backup_prev and dst_path.is_file():
+        backup = Path(str(dst_path) + ".bak")
+        try:
+            if backup.is_file():
+                backup.unlink()
+            dst_path.rename(backup)
+            backup_created = True
+            print(f"  [backup] {backup}")
+        except OSError as e:
+            print(f"  warning: cannot backup {dst_path}: {e}")
+            backup = None
+            backup_created = False
+    fd, tmp_name = tempfile.mkstemp(prefix=dst_path.stem + ".", suffix=".partial.mp4", dir=str(dst_path.parent))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        try:
+            shutil.copy2(src_path, tmp_path)
+            os.replace(tmp_path, dst_path)
+        except OSError:
+            if backup_created and backup is not None and backup.is_file() and not dst_path.is_file():
+                try:
+                    backup.rename(dst_path)
+                    print(f"  已从备份恢复: {dst_path}")
+                except OSError as restore_err:
+                    print(f"  警告: 无法从备份恢复 {backup}: {restore_err}")
+            raise
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+    try:
+        src_path.unlink()
+    except OSError:
+        pass
+    return dst_path
+
+
+def normalize_translation(json_path: Path, rules_path: Path | None = None, *, dry_run: bool = False):
+    """规则清洗（原 render_cn_chat.normalize_translation，原样搬运）。
+
+    dry_run: 由调用方（render_cn_chat 薄包装）注入模块全局 DRY_RUN，
+    保持测试按模块属性 monkeypatch DRY_RUN 的语义；本模块自身不读全局。
+    """
+    if not rules_path:
+        print("\n[规则清洗] 未指定 --rules，跳过规则清洗。")
+        return
+    if dry_run:
+        print(f"\n[dry-run] 跳过规则清洗写入: {json_path}")
+        return
+    loaded = load_yaml_rules(rules_path)
+    rules = loaded.get("normalizations") or []
+    preserve_patterns = loaded.get("preserve_patterns") or []
+    if not rules:
+        print(f"\n[规则清洗] 规则文件无 normalizations: {rules_path}")
+        return
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    changed = []
+    for msg in data.get("messages", []):
+        original = str(msg.get("original", ""))
+        if any(p.search(original) for p in preserve_patterns):
+            continue
+        for rule in rules:
+            if original in rule["match"] and msg.get("translation") != rule["translation"]:
+                changed.append((msg.get("index"), rule["name"], original, msg.get("translation"), rule["translation"]))
+                msg["translation"] = rule["translation"]
+                break
+    atomic_write_json(json_path, data)
+    if changed:
+        print(f"\n[规则清洗] 已应用 {len(changed)} 条修改，规则文件: {rules_path}")
+        for idx, rule_name, original, old, new in changed:
+            print(f"  [{idx}] {rule_name}: {original!r}: {old!r} -> {new!r}")
+    else:
+        print(f"\n[规则清洗] 无需修改，规则文件: {rules_path}")
+
+
+def load_profile(profile_path: Path):
+    data = load_yaml_file(profile_path, "Profile")
+    glossary_value = data.get("glossary")
+    if glossary_value is not None and not isinstance(glossary_value, dict):
+        raise PipelineError(
+            f"Invalid Profile YAML {profile_path}: glossary must be a mapping"
+        )
+    preserve_value = data.get("preserve")
+    if preserve_value is not None and not isinstance(preserve_value, list):
+        raise PipelineError(
+            f"Invalid Profile YAML {profile_path}: preserve must be a list"
+        )
+    style_value = data.get("translation_style")
+    if style_value is not None and not isinstance(style_value, dict):
+        raise PipelineError(
+            f"Invalid Profile YAML {profile_path}: translation_style must be a mapping"
+        )
+    context_parts = []
+    if data.get("context"):
+        context_parts.append(str(data["context"]))
+
+    glossary = data.get("glossary") or {}
+    if glossary:
+        terms = []
+        for src, dst in glossary.items():
+            terms.append(f"  {src} -> {dst}")
+        context_parts.append(
+            "**术语词典 / Glossary (必须严格遵守 / MUST follow strictly)**\n"
+            + "\n".join(terms)
+        )
+
+    preserve = data.get("preserve") or []
+    if preserve:
+        context_parts.append("需要保留 / Preserve: " + ", ".join(map(str, preserve)))
+
+    style = data.get("translation_style") or {}
+    if style:
+        style_lines = [f"{k}: {v}" for k, v in style.items()]
+        context_parts.append("翻译风格 / Translation style:\n" + "\n".join(style_lines))
+
+    return "\n\n".join(context_parts), data
