@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
+import re
 import tempfile
 from typing import Any
 
@@ -192,6 +194,119 @@ BOOL_FIELDS = {
 
 # Fields that may be a bare bool flag OR a path string (lint-translation).
 OPTIONAL_PATH_OR_BOOL = {"lint_translation"}
+
+# Numeric job fields, aligned with the burn/translate argparse type= definitions
+# (twitch_chat_burn.py: --x/--fps/--crf/... are int, --offset/--msg-lifetime/...
+# are float; translate_chat_openai.py: --batch-size/--workers are int). Wrong
+# YAML value types must fail here at load time instead of deep inside a burn
+# subprocess (D-#7).
+INT_JOB_FIELDS = frozenset(
+    {
+        "x",
+        "y",
+        "width",
+        "height",
+        "font_size",
+        "fps",
+        "max_visible",
+        "max_message_lines",
+        "bg_alpha",
+        "emote_height",
+        "crf",
+        "webm_crf",
+        "webm_cpu_used",
+        "message_image_cache_size",
+        "batch_size",
+        "workers",
+    }
+)
+
+FLOAT_JOB_FIELDS = frozenset(
+    {
+        "offset",
+        "output_fps",
+        "msg_lifetime",
+        "min_visible_seconds",
+        "arrival_interval",
+        "x_ratio",
+        "y_ratio",
+        "width_ratio",
+        "height_ratio",
+        "font_size_ratio",
+        "preview_frame",
+        "preview_clip",
+        "blank_hold_seconds",
+    }
+)
+
+# output_fps also accepts exact rationals ("30000/1001") like the burn CLI's
+# --output-fps parser; the value stays a string for that CLI to normalize.
+_RATIONAL_FPS_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?\s*/\s*[+-]?\d+(?:\.\d+)?$")
+
+
+def _numeric_type_error(attr: str, expected: str, value: Any) -> ValueError:
+    return ValueError(
+        f"job 字段 {attr} 需要{expected}，收到 {value!r}（{type(value).__name__}）"
+    )
+
+
+def _validated_int_field(attr: str, value: Any) -> Any:
+    """Mirror argparse type=int for a job YAML value.
+
+    ints pass through unchanged; integral floats (18.0) and numeric strings
+    ("18") coerce exactly as the burn CLI's argparse would; everything else —
+    lists, non-numeric strings, bools — is a load-time ValueError.
+    """
+    if isinstance(value, bool):
+        raise _numeric_type_error(attr, "整数", value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value.is_integer():
+            return int(value)
+        raise _numeric_type_error(attr, "整数", value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            raise _numeric_type_error(attr, "整数", value) from None
+    raise _numeric_type_error(attr, "整数", value)
+
+
+def _validated_float_field(attr: str, value: Any) -> Any:
+    """Mirror argparse type=float for a job YAML value.
+
+    ints/floats pass through unchanged (no int→float rewrite); numeric strings
+    coerce; output_fps additionally keeps exact rational strings ("30000/1001").
+    Non-finite values are rejected like the burn CLI's own parsers do.
+    """
+    if isinstance(value, bool):
+        raise _numeric_type_error(attr, "数值（整数或小数）", value)
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise _numeric_type_error(attr, "有限数值", value)
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            parsed = float(text)
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            if math.isfinite(parsed):
+                return parsed
+            raise _numeric_type_error(attr, "有限数值", value)
+        if attr == "output_fps" and _RATIONAL_FPS_RE.match(text):
+            num, _, den = text.partition("/")
+            try:
+                quotient = float(num) / float(den)
+            except (ZeroDivisionError, ValueError):
+                quotient = None
+            if quotient is not None and math.isfinite(quotient):
+                return value
+            raise _numeric_type_error(attr, "数值（整数或小数）", value)
+        raise _numeric_type_error(attr, "数值（整数或小数）", value)
+    raise _numeric_type_error(attr, "数值（整数或小数）", value)
 
 
 def _require_yaml() -> None:
@@ -427,6 +542,12 @@ def load_job_file(path: str | Path) -> dict[str, Any]:
                     f"job mode 必须是 auto|preview|translate|render|full，收到 {value!r}"
                 )
             out[attr] = mode
+            continue
+        if attr in INT_JOB_FIELDS:
+            out[attr] = _validated_int_field(attr, value)
+            continue
+        if attr in FLOAT_JOB_FIELDS:
+            out[attr] = _validated_float_field(attr, value)
             continue
         out[attr] = value
 

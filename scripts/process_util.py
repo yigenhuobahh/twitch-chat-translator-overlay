@@ -440,13 +440,23 @@ def clean_companion_flags_error(args) -> str | None:
 
 
 def _dir_size_bytes(path: str | Path) -> int:
+    """Cheap top-level size estimate for a tree that is about to be deleted.
+
+    The former full ``os.walk`` pre-pass doubled I/O on multi-GB job dirs just
+    to feed one log line. Top-level file sizes stay exact (the common
+    ``*.partial.mp4`` case); nested directories only contribute their dir-entry
+    size, so deep trees report a lower bound — the log marks that figure "≈".
+    """
     total = 0
-    for root, _dirs, files in os.walk(path):
-        for name in files:
-            try:
-                total += os.path.getsize(os.path.join(root, name))
-            except OSError:
-                pass
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                try:
+                    total += entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
     return total
 
 
@@ -592,7 +602,9 @@ def clean_temp_artifacts(
                         return
                     freed += size
                     count += 1
-                    print(f"  [clean] {label} ({size / (1024 * 1024):.1f} MB)")
+                    # Top-level estimate only (see _dir_size_bytes): "≈" marks
+                    # the size as a lower bound for deep trees.
+                    print(f"  [clean] {label} (≈{size / (1024 * 1024):.1f} MB)")
             elif os.path.isfile(entry_path) and _should_remove_file(name):
                 size = os.path.getsize(entry_path)
                 os.remove(entry_path)

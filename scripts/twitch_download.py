@@ -874,12 +874,10 @@ def concat_videos(
     # concatenating, freeze the first decoded video frame for that lead-in and
     # trim it to the segment's audio/container duration. Each segment then has
     # a common zero-based timeline without dropping a second from its tail.
-    durations: list[float] = []
-    for p in paths:
-        try:
-            durations.append(probe_media_duration(p))
-        except TwitchDownloadError:
-            durations.append(0.0)
+    # Probe failure must abort loudly: recording 0.0 used to shrink that
+    # segment's trim to 1ms and surface later as a misleading "裁切时间轴…
+    # 总时长不一致" error (or silently drop the segment for direct callers).
+    durations: list[float] = [probe_media_duration(p) for p in paths]
     try:
         timeline = cut_timeline or CutTimeline.from_ranges(remove_ranges, sum(durations))
     except CutTimelineError as exc:
@@ -1584,7 +1582,6 @@ def _flatten_td_cli_into(dest: Path) -> Path | None:
 
 def try_portable_td_cli(
     *,
-    assume_yes: bool = False,
     root: Path | None = None,
     timeout: float = 120.0,
 ) -> bool:

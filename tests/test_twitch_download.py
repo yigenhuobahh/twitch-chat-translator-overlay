@@ -257,11 +257,56 @@ def test_try_portable_td_cli_extracts_zip(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("PATH", "")
     monkeypatch.setattr(td, "safe_which", lambda _name: None)
 
-    ok = td.try_portable_td_cli(assume_yes=True, root=root, timeout=10.0)
+    ok = td.try_portable_td_cli(root=root, timeout=10.0)
     assert ok is True
     installed = root / "tools" / "TwitchDownloaderCLI" / "TwitchDownloaderCLI.exe"
     assert installed.is_file()
     assert td.find_twitchdownloader_cli(root) == installed.resolve()
+
+
+def test_try_portable_td_cli_signature_has_no_assume_yes(tmp_path: Path, monkeypatch):
+    """D-#10: assume_yes was a dead parameter and is gone from the signature."""
+    import inspect
+
+    import twitch_download as td
+
+    params = inspect.signature(td.try_portable_td_cli).parameters
+    assert "assume_yes" not in params
+
+    # Callers still passing the removed kwarg must fail loudly, not silently.
+    with pytest.raises(TypeError, match="assume_yes"):
+        td.try_portable_td_cli(assume_yes=True, root=tmp_path)  # type: ignore[call-arg]
+
+    # Offline smoke: new keyword-only signature runs the no-CLI failure path
+    # without network (release lookup mocked to fail).
+    monkeypatch.setattr(td, "find_twitchdownloader_cli", lambda root=None: None)
+
+    def fake_fetch(*, timeout: float = 30.0):
+        raise td.TwitchDownloadError("无法连接 GitHub releases: offline")
+
+    monkeypatch.setattr(td, "fetch_latest_td_cli_release_asset", fake_fetch)
+    ok = td.try_portable_td_cli(root=tmp_path / "fresh-root")
+    assert ok is False
+
+
+def test_clean_temp_artifacts_removes_partial_files_and_keeps_others(tmp_path: Path):
+    """D-#9 behavior guard: cleanup results are unchanged without a full pre-walk."""
+    from process_util import clean_temp_artifacts
+
+    partial = tmp_path / "out.partial.mp4"
+    partial.write_bytes(b"p" * 100)
+    mp4_partial = tmp_path / "clip.mp4.partial"
+    mp4_partial.write_bytes(b"q" * 50)
+    keep = tmp_path / "final.mp4"
+    keep.write_bytes(b"keep")
+
+    count, freed = clean_temp_artifacts(tmp_path)
+
+    assert count == 2
+    assert not partial.exists()
+    assert not mp4_partial.exists()
+    assert keep.is_file()
+    assert freed > 0
 
 def test_installed_defaults_ignore_untrusted_cwd_tools(tmp_path: Path, monkeypatch):
     import twitch_download as td

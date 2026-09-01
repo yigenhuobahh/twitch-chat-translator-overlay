@@ -959,7 +959,7 @@ def offer_td_cli_guide(*, assume_yes: bool = False) -> bool:
         print("         或 run.bat 菜单 → 下载素材并继续")
 
     if assume_yes:
-        ok = try_portable_td_cli(assume_yes=True, root=_repo_root())
+        ok = try_portable_td_cli(root=_repo_root())
         if ok:
             return True
         print("  自动安装失败；请手动下载 zip 到上述目录。")
@@ -976,7 +976,7 @@ def offer_td_cli_guide(*, assume_yes: bool = False) -> bool:
         "是否自动下载并安装 TwitchDownloaderCLI 到 tools/（约数十 MB，需网络）？",
         default=False,
     ):
-        ok = try_portable_td_cli(assume_yes=True, root=_repo_root())
+        ok = try_portable_td_cli(root=_repo_root())
         if ok:
             return True
         print("  自动安装未成功。")

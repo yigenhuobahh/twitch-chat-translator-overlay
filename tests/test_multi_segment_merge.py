@@ -473,6 +473,52 @@ def test_concat_single_video_with_cuts_never_uses_copy_fast_path(tmp_path: Path,
     assert "-filter_complex" in calls[0]
 
 
+def test_concat_videos_probe_failure_propagates(tmp_path: Path, monkeypatch):
+    """A failed duration probe must abort concat instead of recording 0.0 (D-#4).
+
+    The old `except TwitchDownloadError: durations.append(0.0)` silently turned
+    the segment into a 1ms trim and surfaced as a misleading duration-mismatch
+    error (or dropped the segment for direct callers).
+    """
+    import twitch_download as td
+
+    paths = [tmp_path / "a.mp4", tmp_path / "b.mp4"]
+    for path in paths:
+        path.write_bytes(b"x")
+
+    def broken_probe(_path: Path) -> float:
+        raise td.TwitchDownloadError("无法读取视频时长: boom")
+
+    monkeypatch.setattr(td, "probe_media_duration", broken_probe)
+
+    with pytest.raises(td.TwitchDownloadError, match="无法读取视频时长"):
+        td.concat_videos(paths, tmp_path / "out.mp4")
+
+
+def test_concat_videos_feeds_probed_durations_into_timeline_check(
+    tmp_path: Path, monkeypatch
+):
+    """Probed durations must still reach the cut-timeline consistency check."""
+    from cut_timeline import CutTimeline
+    import twitch_download as td
+
+    paths = [tmp_path / "a.mp4", tmp_path / "b.mp4"]
+    for path in paths:
+        path.write_bytes(b"x")
+
+    monkeypatch.setattr(td, "probe_media_duration", lambda _path: 10.0)
+    # Timeline built against 100s of source, but probes report 10s+10s.
+    timeline = CutTimeline.from_ranges([(2.0, 4.0)], 100.0)
+
+    with pytest.raises(td.TwitchDownloadError, match="不一致"):
+        td.concat_videos(
+            paths,
+            tmp_path / "out.mp4",
+            remove_ranges=None,
+            cut_timeline=timeline,
+        )
+
+
 def test_download_assets_multi_accepts_cut_and_fps(tmp_path: Path, monkeypatch):
     """download_assets_multi should accept remove_ranges + output_fps + encoder
     and forward them to concat_videos / merge_chat_html."""

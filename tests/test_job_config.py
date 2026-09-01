@@ -377,3 +377,81 @@ def test_yaml_quote_plain_values_unchanged(job_mod):
     assert job_mod._yaml_quote("a\nb") == '"a\\nb"'
     assert job_mod._yaml_quote("- note") == '"- note"'
     assert job_mod._yaml_quote("-note") == "-note"  # no space: plain scalar stays
+
+
+def test_load_job_rejects_wrong_numeric_types(tmp_path: Path, job_mod):
+    """D-#7: fps list / crf string must fail at load with the field name,
+    not deep inside a burn subprocess argparse."""
+    p_fps = tmp_path / "bad_fps.yaml"
+    p_fps.write_text("fps:\n  - 1\n  - 2\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="fps"):
+        job_mod.load_job_file(p_fps)
+
+    p_crf = tmp_path / "bad_crf.yaml"
+    p_crf.write_text('crf: "high"\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="crf"):
+        job_mod.load_job_file(p_crf)
+
+    # bool is not a legal integer value either.
+    p_bool = tmp_path / "bad_bool.yaml"
+    p_bool.write_text("max_visible: true\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="max_visible"):
+        job_mod.load_job_file(p_bool)
+
+    # Non-numeric offset string.
+    p_offset = tmp_path / "bad_offset.yaml"
+    p_offset.write_text("offset: later\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="offset"):
+        job_mod.load_job_file(p_offset)
+
+
+def test_load_job_numeric_values_passthrough(tmp_path: Path, job_mod):
+    """D-#7: legal int/float values keep their types and values unchanged."""
+    p = tmp_path / "nums.yaml"
+    p.write_text(
+        "\n".join(
+            [
+                "crf: 18",
+                "workers: 4",
+                "offset: 12.5",
+                "preview_clip: 12",
+                "msg_lifetime: 14",
+                "output_fps: 59.94",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    data = job_mod.load_job_file(p)
+    assert data["crf"] == 18 and isinstance(data["crf"], int)
+    assert data["workers"] == 4
+    assert data["offset"] == 12.5
+    # int for a float field stays an int (no silent rewrite).
+    assert data["preview_clip"] == 12 and isinstance(data["preview_clip"], int)
+    assert data["msg_lifetime"] == 14
+    assert data["output_fps"] == 59.94
+
+
+def test_load_job_numeric_string_and_rational_fps(tmp_path: Path, job_mod):
+    """Numeric strings coerce like argparse type= would; output_fps keeps
+    exact rational strings ("30000/1001") for the burn CLI parser."""
+    p = tmp_path / "strs.yaml"
+    p.write_text(
+        "\n".join(
+            [
+                'crf: "18"',
+                'offset: "7264"',
+                "output_fps: 30000/1001",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    data = job_mod.load_job_file(p)
+    assert data["crf"] == 18 and isinstance(data["crf"], int)
+    assert data["offset"] == 7264.0
+    assert data["output_fps"] == "30000/1001"
+
+    # Broken rational fps must still fail at load time.
+    p_bad = tmp_path / "bad_rational.yaml"
+    p_bad.write_text("output_fps: 30000/zero\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="output_fps"):
+        job_mod.load_job_file(p_bad)

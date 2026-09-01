@@ -151,7 +151,7 @@ def test_failed_td_archive_does_not_replace_existing_install(
         lambda *_args, **_kwargs: FakeResponse(payload),
     )
 
-    assert td.try_portable_td_cli(assume_yes=True, root=root) is False
+    assert td.try_portable_td_cli(root=root) is False
     assert marker.read_text(encoding="utf-8") == "keep"
     assert not (root / "tools" / "escape.exe").exists()
 
@@ -393,7 +393,7 @@ def test_deep_td_archive_layout_does_not_replace_existing_install(
         lambda *_args, **_kwargs: FakeResponse(payload),
     )
 
-    assert td.try_portable_td_cli(assume_yes=True, root=root) is False
+    assert td.try_portable_td_cli(root=root) is False
     assert marker.read_text(encoding="utf-8") == "keep"
     assert not (destination / "outer").exists()
 
