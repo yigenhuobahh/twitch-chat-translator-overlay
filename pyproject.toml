@@ -69,6 +69,7 @@ package-dir = {"" = "scripts"}
 py-modules = [
   "chat_parser",
   "chat_window",
+  "cli_spec",
   "common_utils",
   "cut_timeline",
   "doctor_check",
@@ -221,6 +222,7 @@ ignore = [
 known-first-party = [
   "chat_parser",
   "chat_window",
+  "cli_spec",
   "common_utils",
   "cut_timeline",
   "doctor_check",

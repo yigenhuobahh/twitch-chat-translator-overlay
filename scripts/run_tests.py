@@ -15,6 +15,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -28,6 +29,7 @@ COVERAGE_FAIL_UNDER = 65
 COMPILE_SCRIPTS = [
     "chat_parser.py",
     "chat_window.py",
+    "cli_spec.py",
     "common_utils.py",
     "cut_timeline.py",
     "doctor_check.py",
@@ -72,52 +74,50 @@ def run(cmd: list[str]) -> int:
     return subprocess.call(cmd, cwd=str(ROOT))
 
 
-def ensure_pytest(install_dev: bool) -> bool:
+def _print_install_hint(module_name: str) -> None:
+    print(
+        f"{module_name} 未安装。可先运行:\n"
+        "  python scripts/run_tests.py --install-dev\n"
+        "或:\n"
+        "  pip install -r requirements-dev.txt",
+        file=sys.stderr,
+    )
+
+
+def _ensure_importable(module_name: str, install_dev: bool, *, recheck=None) -> bool:
+    """Import *module_name*; optionally install dev requirements then retry once.
+
+    ensure_pytest / ensure_pytest_cov / ensure_ruff 共用的样板：缺模块且未指定
+    --install-dev 时打印统一安装提示并返回 False；允许安装则先
+    ``pip install -r requirements-dev.txt`` 再重试一次。``recheck`` 是可选的
+    安装后校验回调（ruff 常以独立二进制形态工作，import 成功与否不代表
+    ``python -m ruff`` 可用，此时安装后改用 CLI 探针校验）；缺省用 import。
+    """
     try:
-        import pytest  # noqa: F401
+        __import__(module_name)
         return True
     except ImportError:
-        if not install_dev:
-            print(
-                "pytest 未安装。可先运行:\n"
-                "  python scripts/run_tests.py --install-dev\n"
-                "或:\n"
-                "  pip install -r requirements-dev.txt",
-                file=sys.stderr,
-            )
-            return False
-        code = run([sys.executable, "-m", "pip", "install", "-r", str(ROOT / "requirements-dev.txt")])
-        if code != 0:
-            return False
-        try:
-            import pytest  # noqa: F401
-            return True
-        except ImportError:
-            return False
+        pass
+    if not install_dev:
+        _print_install_hint(module_name)
+        return False
+    if run([sys.executable, "-m", "pip", "install", "-r", str(ROOT / "requirements-dev.txt")]) != 0:
+        return False
+    if recheck is not None:
+        return recheck()
+    try:
+        __import__(module_name)
+        return True
+    except ImportError:
+        return False
+
+
+def ensure_pytest(install_dev: bool) -> bool:
+    return _ensure_importable("pytest", install_dev)
 
 
 def ensure_pytest_cov(install_dev: bool) -> bool:
-    try:
-        import pytest_cov  # noqa: F401
-        return True
-    except ImportError:
-        if not install_dev:
-            print(
-                "pytest-cov 未安装。可先运行:\n"
-                "  python scripts/run_tests.py --install-dev\n"
-                "或:\n"
-                "  pip install -r requirements-dev.txt",
-                file=sys.stderr,
-            )
-            return False
-        code = run([sys.executable, "-m", "pip", "install", "-r", str(ROOT / "requirements-dev.txt")])
-        if code != 0:
-            return False
-        try:
-            import pytest_cov  # noqa: F401
-            return True
-        except ImportError:
-            return False
+    return _ensure_importable("pytest_cov", install_dev)
 
 
 def compile_check() -> int:
@@ -129,41 +129,31 @@ def compile_check() -> int:
     return run([sys.executable, "-m", "py_compile", *present])
 
 
-def ensure_ruff(install_dev: bool) -> bool:
-    try:
-        import ruff  # noqa: F401
-        return True
-    except ImportError:
-        # ruff is often a standalone binary via `python -m ruff`
-        pass
-    # Prefer invoking as module; if missing, optionally install dev deps.
+def _ruff_cli_available() -> bool:
+    """Probe ``python -m ruff --version``; ruff ships as a standalone binary too,
+    so a failing ``import ruff`` does not mean the tool is unusable."""
     probe = subprocess.run(
         [sys.executable, "-m", "ruff", "--version"],
         cwd=str(ROOT),
         capture_output=True,
         text=True,
     )
-    if probe.returncode == 0:
+    return probe.returncode == 0
+
+
+def ensure_ruff(install_dev: bool) -> bool:
+    try:
+        import ruff  # noqa: F401
         return True
+    except ImportError:
+        # ruff is often a standalone binary via `python -m ruff`; probe the CLI
+        # before treating it as missing.
+        if _ruff_cli_available():
+            return True
     if not install_dev:
-        print(
-            "ruff 未安装。可先运行:\n"
-            "  python scripts/run_tests.py --install-dev\n"
-            "或:\n"
-            "  pip install -r requirements-dev.txt",
-            file=sys.stderr,
-        )
+        _print_install_hint("ruff")
         return False
-    code = run([sys.executable, "-m", "pip", "install", "-r", str(ROOT / "requirements-dev.txt")])
-    if code != 0:
-        return False
-    probe2 = subprocess.run(
-        [sys.executable, "-m", "ruff", "--version"],
-        cwd=str(ROOT),
-        capture_output=True,
-        text=True,
-    )
-    return probe2.returncode == 0
+    return _ensure_importable("ruff", True, recheck=_ruff_cli_available)
 
 
 def lint_check() -> int:
@@ -182,7 +172,7 @@ def packaging_smoke() -> int:
         ("doctor", [sys.executable, str(ROOT / "scripts" / "render_cn_chat.py"), "--doctor"]),
         ("wizard-help", [sys.executable, str(ROOT / "scripts" / "job_wizard.py"), "help"]),
     ]
-    env = dict(**{k: v for k, v in __import__("os").environ.items()})
+    env = dict(os.environ)
     env["PYTHONPATH"] = str(ROOT / "scripts")
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
@@ -243,7 +233,7 @@ def packaging_smoke() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run unit/smoke/max tests for twitch-chat-translator-overlay")
     parser.add_argument("--install-dev", action="store_true", help="pip install requirements-dev.txt first")
-    parser.add_argument("--smoke", action="store_true", help="include FFmpeg smoke tests (default: yes if ffmpeg present)")
+    parser.add_argument("--smoke", action="store_true", help="run FFmpeg smoke tests; errors out if ffmpeg/ffprobe missing (default: smoke auto-runs when ffmpeg present)")
     parser.add_argument("--unit-only", action="store_true", help="skip smoke tests even if ffmpeg is present")
     parser.add_argument(
         "--max",
@@ -320,6 +310,17 @@ def main() -> int:
         pass
 
     ffmpeg_ok = safe_which("ffmpeg") is not None and safe_which("ffprobe") is not None
+
+    # --smoke 真语义：显式要求跑 FFmpeg smoke 时，缺 ffmpeg/ffprobe 直接报错退出
+    # （此前 --smoke 是空操作，用户以为跑了 smoke 实际被静默跳过）。
+    # 可改用 --unit-only 跳过 smoke，或安装 FFmpeg 后重试。
+    if args.smoke and not ffmpeg_ok:
+        print(
+            "错误: --smoke 需要 ffmpeg/ffprobe，但未在 PATH（含 tools/）中找到。\n"
+            "  可改用 --unit-only 跳过 smoke，或安装 FFmpeg 后重试。",
+            file=sys.stderr,
+        )
+        return 2
 
     # Marker selection
     # - unit-only: not smoke and not max (fast)

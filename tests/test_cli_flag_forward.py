@@ -277,16 +277,16 @@ def test_render_preview_clip_forwards_strict_import():
 
 
 def test_pipeline_parser_exposes_strict_import():
+    import cli_spec
     import render_cn_chat as pipe
 
-    # build_parser is main()-local; re-parse via argparse by invoking the
-    # same defaults through a tiny harness: exec the add_argument region is
-    # heavy, so just check the flag is registered by importing and running
-    # parse on a stub. We reconstruct via the module's documented default map
-    # and the source contract.
-    src = Path(pipe.__file__).read_text(encoding="utf-8")
-    assert '"--strict-import"' in src or "'--strict-import'" in src
-    assert "append_strict_import_arg" in src
+    # argparse 定义已单源迁至 scripts/cli_spec.py（render_cn_chat re-export）；
+    # 源码契约断言改为读 cli_spec，并补一个真实解析检查。
+    spec_src = (SCRIPTS / "cli_spec.py").read_text(encoding="utf-8")
+    assert '"--strict-import"' in spec_src or "'--strict-import'" in spec_src
+    pipe_src = Path(pipe.__file__).read_text(encoding="utf-8")
+    assert "append_strict_import_arg" in pipe_src
+    assert cli_spec.build_arg_parser().parse_args(["--strict-import"]).strict_import is True
     assert "strict_import" in pipe.PIPELINE_CLI_DEFAULTS
     assert pipe.PIPELINE_CLI_DEFAULTS["strict_import"] is False
 
@@ -390,3 +390,80 @@ def test_job_source_media_check_forwarded_to_media_gate(monkeypatch, tmp_path, c
 
     assert pipe.main() is None
     assert seen.get("mode") == "decode"
+
+
+# ---------------------------------------------------------------------------
+# W1-A1: CLI 单源化——scripts/cli_spec.py 与 PIPELINE_CLI_DEFAULTS 同步契约
+# ---------------------------------------------------------------------------
+
+
+def _parser_action_defaults(parser) -> dict:
+    defaults = {}
+    for action in parser._actions:
+        if action.dest == "help":  # argparse 自带的 -h/--help
+            continue
+        defaults[action.dest] = action.default
+    return defaults
+
+
+def test_pipeline_cli_defaults_match_every_parser_action_default():
+    """PIPELINE_CLI_DEFAULTS 必须与 build_arg_parser 的逐项 default 完全一致。
+
+    字典是 job/layout/render preset "CLI wins" 判断的唯一来源；历史上曾因
+    手工复刻漏同步而静默丢过 job YAML 字段（如 source_media_check）。
+    本测试同时拦住两侧漂移：字典缺项 / 多项 / 值不一致都会失败。
+    """
+    import cli_spec
+
+    parser_defaults = _parser_action_defaults(cli_spec.build_arg_parser())
+    defaults = cli_spec.PIPELINE_CLI_DEFAULTS
+
+    missing = sorted(set(parser_defaults) - set(defaults))
+    extra = sorted(set(defaults) - set(parser_defaults))
+    mismatched = sorted(
+        key
+        for key in set(parser_defaults) & set(defaults)
+        if parser_defaults[key] != defaults[key]
+    )
+    problems = []
+    if missing:
+        problems.append(f"PIPELINE_CLI_DEFAULTS 缺少 argparse 选项默认值: {missing}")
+    if extra:
+        problems.append(f"PIPELINE_CLI_DEFAULTS 含非 argparse 选项的键: {extra}")
+    for key in mismatched:
+        problems.append(
+            f"{key}: parser default={parser_defaults[key]!r} != dict={defaults[key]!r}"
+        )
+    assert not problems, "CLI 默认值漂移:\n" + "\n".join(problems)
+
+
+def test_render_cn_chat_reexports_cli_spec_symbols():
+    import cli_spec
+    import render_cn_chat as pipe
+
+    # `from render_cn_chat import PIPELINE_CLI_DEFAULTS` 等旧导入路径保持可用。
+    assert pipe.PIPELINE_CLI_DEFAULTS is cli_spec.PIPELINE_CLI_DEFAULTS
+    assert pipe.build_arg_parser is cli_spec.build_arg_parser
+    assert pipe._cli_flag_present is cli_spec._cli_flag_present
+
+
+def test_cli_flag_present_matches_exact_and_value_forms(monkeypatch):
+    import cli_spec
+
+    monkeypatch.setattr(sys, "argv", ["prog", "--overlay-codec", "png"])
+    assert cli_spec._cli_flag_present("--overlay-codec") is True
+    assert cli_spec._cli_flag_present("--offset") is False
+    # --flag=value 形式也算显式传入
+    monkeypatch.setattr(sys, "argv", ["prog", "--offset=1.5"])
+    assert cli_spec._cli_flag_present("--offset") is True
+    monkeypatch.setattr(sys, "argv", ["prog", "video.mp4", "chat.html"])
+    assert cli_spec._cli_flag_present("--offset") is False
+
+
+def test_build_arg_parser_set_defaults_from_single_source():
+    """build_arg_parser 末尾 set_defaults(**PIPELINE_CLI_DEFAULTS)：空 argv 解析
+    得到的 namespace 与字典完全一致（字典即默认值的单一权威来源）。"""
+    import cli_spec
+
+    parsed = vars(cli_spec.build_arg_parser().parse_args([]))
+    assert parsed == cli_spec.PIPELINE_CLI_DEFAULTS

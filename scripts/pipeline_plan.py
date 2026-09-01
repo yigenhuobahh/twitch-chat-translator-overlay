@@ -7,6 +7,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+import sys
 from typing import Any
 
 FlagSpec = tuple[str, str, str]
@@ -142,6 +143,67 @@ def append_shared_burn_args(command: list[str], args: object) -> list[str]:
     append_fps_args(command, args)
     append_layout_burn_args(command, args)
     return append_perf_encode_args(command, args)
+
+
+def build_burn_command(
+    args: object,
+    video: Path | str,
+    chat_html: Path | str,
+    burn: Path | str,
+    *,
+    trans_json: Path | str | None = None,
+    out_dir: Path | str | None = None,
+) -> list[str]:
+    """Assemble the pipeline's final ``twitch_chat_burn.py`` render command.
+
+    render_cn_chat 的 render-original 与 import-translation 两个分支原本各自
+    内联 ~30 行几乎相同的命令组装，这里合一以免两侧漂移。生成的命令列表与
+    拆分前逐字节一致（顺序由既有 CLI 场景测试守护）。
+
+    - ``trans_json`` 传入时追加 ``--import-translation`` 并转发
+      ``--strict-import``；render-original 路径传 None（不导入翻译，也
+      不发明 strict-import）。
+    - ``out_dir`` 对应 ``--workdir`` 下的 temp 输出目录；None 表示交给
+      burn 的默认输出命名。
+    """
+    command = [
+        sys.executable,
+        str(burn),
+        str(video),
+        str(chat_html),
+        "--x", str(args.x),
+        "--y", str(args.y),
+        "--w", str(args.width),
+        "--h", str(args.height),
+        "--font-size", str(args.font_size),
+        "--font-path", args.font_path,
+        "--font-bold-path", args.font_bold_path,
+        "--bg-alpha", str(args.bg_alpha),
+    ]
+    if trans_json is not None:
+        command.extend(["--import-translation", str(trans_json)])
+        append_strict_import_arg(command, args)
+    append_shared_burn_args(command, args)
+    if getattr(args, "keep_temp", False):
+        command.append("--keep-temp")
+    if getattr(args, "no_backup_prev", False):
+        command.append("--no-backup-prev")
+    if out_dir is not None:
+        command.extend(["--out-dir", str(out_dir)])
+    if getattr(args, "offset", None) is not None:
+        command.extend(["--offset", str(args.offset)])
+    preview_frame = getattr(args, "preview_frame", None)
+    if preview_frame is not None:
+        command.extend(["--preview-frame", str(preview_frame)])
+        preview_image = getattr(args, "preview_image", None)
+        if preview_image:
+            command.extend(["--preview-image", str(Path(preview_image).resolve())])
+    preview_clip = getattr(args, "preview_clip", None)
+    if preview_clip is not None:
+        command.extend(["--preview-clip", str(preview_clip)])
+    if getattr(args, "preview_dense", False):
+        command.append("--preview-dense")
+    return command
 
 
 @dataclass(frozen=True)
