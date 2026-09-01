@@ -1331,7 +1331,7 @@ def _menu_download_and_continue() -> int:
     if choice == "3":
         return _run_pipeline(video, chat, "--mode", "full", "--yes")
     if choice == "4":
-        files = print_job_list(root=default_jobs_dir())
+        files = print_job_list(default_jobs_dir())
         if not files:
             return 0
         sel = _prompt("输入编号或配置名", "1")

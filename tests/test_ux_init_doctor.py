@@ -456,3 +456,382 @@ def test_safe_which_allows_absolute_path_directory_below_cwd(
     monkeypatch.setenv("PATH", str(user_bin))
 
     assert common_utils.safe_which("ffprobe") == str(executable.resolve())
+
+
+# ---------------------------------------------------------------------------
+# doctor_check.doctor() 全路径：视频探针 + HTML 时间轴对齐诊断 + 退出码语义
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def doctor_mod():
+    import doctor_check
+
+    return doctor_check
+
+
+def _doctor_args(video: Path | None = None, chat_html: Path | None = None, offset: float | None = None):
+    return SimpleNamespace(
+        video=video,
+        chat_html=chat_html,
+        offset=offset,
+        font_path="auto",
+        font_bold_path="auto",
+        offer_fix=False,
+        yes=False,
+        fix_yes=False,
+    )
+
+
+def _write_td_chat(tmp_path: Path, name: str, seconds: list[int]) -> Path:
+    """TwitchDownloader 形态的最小聊天 HTML（时间戳从 ?t=0h0mNs 链接解析）。"""
+    rows = []
+    for i, total in enumerate(seconds):
+        h, rem = divmod(total, 3600)
+        m, s = divmod(rem, 60)
+        rows.append(
+            f'<pre class="comment-root">[<a href="https://www.twitch.tv/videos/1?t={h}h{m}m{s}s">'
+            f"{h}:{m:02d}:{s:02d}</a>] <span class=\"comment-author\">User{i}</span>"
+            f'<span class="comment-message">: msg {i}</span></pre>'
+        )
+    html = (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body>"
+        + "".join(rows)
+        + "</body></html>"
+    )
+    path = tmp_path / name
+    path.write_text(html, encoding="utf-8")
+    return path
+
+
+def _patch_doctor_probe(monkeypatch, doctor_mod, duration: str) -> None:
+    """FFmpeg 面 stub：safe_which/require_executable/探针输出/字体/就绪清单可控。
+
+    patch 全部落在 doctor_check 模块属性上，不触碰实现文件；
+    prepend_tools_ffmpeg_to_path 一并短路，避免测试进程的 os.environ PATH 被改写。
+    """
+    monkeypatch.setattr(doctor_mod, "prepend_tools_ffmpeg_to_path", lambda: None)
+    monkeypatch.setattr(doctor_mod, "safe_which", lambda name: f"C:/trusted-tools/{name}.exe")
+    monkeypatch.setattr(doctor_mod, "require_executable", lambda name: f"{name}.exe")
+    monkeypatch.setattr(
+        doctor_mod, "detect_cjk_font", lambda: (r"C:\fonts\cjk.ttf", r"C:\fonts\cjk-bold.ttf")
+    )
+    monkeypatch.setattr(doctor_mod, "print_readiness_report", lambda items=None: (True, True))
+    monkeypatch.setattr(
+        doctor_mod.subprocess,
+        "run",
+        lambda cmd, **kwargs: SimpleNamespace(returncode=0, stdout=f"{duration}\n", stderr=""),
+    )
+
+
+def test_doctor_missing_video_file_fails_with_hint(doctor_mod, tmp_path, capsys):
+    code = doctor_mod.doctor(_doctor_args(video=tmp_path / "nope.mp4"))
+
+    out = capsys.readouterr().out
+    assert "[FAIL] 输入视频" in out
+    assert "诊断结果: 存在问题" in out
+    assert code == 1
+
+
+def test_doctor_missing_chat_html_file_fails(doctor_mod, tmp_path, capsys):
+    code = doctor_mod.doctor(_doctor_args(chat_html=tmp_path / "nope.html"))
+
+    out = capsys.readouterr().out
+    assert "[FAIL] 聊天 HTML" in out
+    assert "诊断结果: 存在问题" in out
+    assert code == 1
+
+
+def test_doctor_skips_probe_and_alignment_without_ffprobe(
+    doctor_mod, tmp_path, monkeypatch, capsys
+):
+    video = tmp_path / "real.mp4"
+    video.write_bytes(b"video")
+    chat = _write_td_chat(tmp_path, "chat.html", [1, 2, 3])
+    monkeypatch.setattr(doctor_mod, "prepend_tools_ffmpeg_to_path", lambda: None)
+    monkeypatch.setattr(doctor_mod, "safe_which", lambda name: None)
+
+    code = doctor_mod.doctor(_doctor_args(video=video, chat_html=chat))
+
+    out = capsys.readouterr().out
+    assert "[FAIL] ffprobe" in out
+    assert "视频可读取" not in out  # ffprobe 缺失：探针门禁直接短路
+    assert "时间轴对齐" not in out
+    assert code == 1
+
+
+def test_doctor_probe_and_alignment_ok_with_stubbed_ffprobe(
+    doctor_mod, tmp_path, monkeypatch, capsys, fixtures_dir
+):
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    chat = fixtures_dir / "twitchdownloader_chat.html"
+    _patch_doctor_probe(monkeypatch, doctor_mod, "12.5")
+
+    code = doctor_mod.doctor(_doctor_args(video=video, chat_html=chat))
+
+    out = capsys.readouterr().out
+    assert "[OK] 视频可读取: 12.5" in out
+    assert "[OK] 时间轴对齐" in out  # 首条 1s < 视频 12.5s，无警告
+    assert "诊断结果: 通过" in out
+    assert code == 0
+
+
+def test_doctor_detects_auto_offset_from_first_message_beyond_video(
+    doctor_mod, tmp_path, monkeypatch, capsys
+):
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    chat = _write_td_chat(tmp_path, "chat.html", [100, 101, 103])
+    _patch_doctor_probe(monkeypatch, doctor_mod, "10.0")
+
+    code = doctor_mod.doctor(_doctor_args(video=video, chat_html=chat))
+
+    out = capsys.readouterr().out
+    assert "将自动 offset=100s" in out
+    assert "# doctor 检测到自动 offset≈100s" in out
+    assert code == 0
+
+
+def test_doctor_flags_misaligned_chat_that_auto_offset_cannot_fix(
+    doctor_mod, tmp_path, monkeypatch, capsys
+):
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    chat = _write_td_chat(tmp_path, "chat.html", [100, 150, 200])
+    _patch_doctor_probe(monkeypatch, doctor_mod, "10.0")
+
+    code = doctor_mod.doctor(_doctor_args(video=video, chat_html=chat))
+
+    out = capsys.readouterr().out
+    assert "[WARN] 时间轴对齐" in out
+    assert "自动检测未触发" in out
+    assert "时间轴有警告" in out
+    assert code == 0  # WARN 不计入失败，诊断整体仍算通过
+
+
+def test_doctor_reports_chat_html_without_messages(
+    doctor_mod, tmp_path, monkeypatch, capsys
+):
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    chat = tmp_path / "empty.html"
+    chat.write_text("<html><body></body></html>", encoding="utf-8")
+    _patch_doctor_probe(monkeypatch, doctor_mod, "10.0")
+
+    code = doctor_mod.doctor(_doctor_args(video=video, chat_html=chat))
+
+    out = capsys.readouterr().out
+    assert "解析到 0 条消息" in out
+    assert code == 0
+
+
+def test_doctor_alignment_failure_is_non_fatal(doctor_mod, tmp_path, monkeypatch, capsys):
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    chat = _write_td_chat(tmp_path, "chat.html", [1, 2, 3])
+    _patch_doctor_probe(monkeypatch, doctor_mod, "10.0")
+
+    def raise_runtime(*_a, **_k):
+        raise RuntimeError("parser exploded")
+
+    monkeypatch.setattr("chat_parser.parse_chat_html", raise_runtime)
+
+    code = doctor_mod.doctor(_doctor_args(video=video, chat_html=chat))
+
+    out = capsys.readouterr().out
+    assert "跳过详细诊断 (RuntimeError)" in out
+    assert code == 0  # doctor 不应因诊断失败而整体失败
+
+
+def test_doctor_manual_offset_bypasses_auto_detection(
+    doctor_mod, tmp_path, monkeypatch, capsys
+):
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    chat = _write_td_chat(tmp_path, "chat.html", [1, 2, 3])
+    _patch_doctor_probe(monkeypatch, doctor_mod, "10.0")
+
+    code = doctor_mod.doctor(_doctor_args(video=video, chat_html=chat, offset=5.0))
+
+    out = capsys.readouterr().out
+    assert "[OK] 时间轴对齐" in out
+    assert "自动 offset" not in out  # manual 模式不做自动检测推荐
+    assert code == 0
+
+
+@pytest.mark.smoke
+def test_doctor_real_ffprobe_reports_video_and_alignment(
+    doctor_mod, tmp_path, monkeypatch, capsys, make_test_video, fixtures_dir
+):
+    video = make_test_video(duration=3.0)
+    chat = fixtures_dir / "twitchdownloader_chat.html"
+    monkeypatch.setattr(doctor_mod, "prepend_tools_ffmpeg_to_path", lambda: None)
+
+    code = doctor_mod.doctor(_doctor_args(video=video, chat_html=chat))
+
+    out = capsys.readouterr().out
+    assert "视频可读取" in out
+    assert "时间轴对齐" in out
+    assert "诊断结果:" in out
+    assert code in (0, 1)  # 退出码取决于本机字体等环境项；探针段本身必须存在
+
+
+@pytest.mark.smoke
+def test_doctor_real_ffprobe_detects_auto_offset(
+    doctor_mod, tmp_path, monkeypatch, capsys, make_test_video
+):
+    video = make_test_video(duration=2.0)
+    chat = _write_td_chat(tmp_path, "chat.html", [100, 101, 103])
+    monkeypatch.setattr(doctor_mod, "prepend_tools_ffmpeg_to_path", lambda: None)
+
+    code = doctor_mod.doctor(_doctor_args(video=video, chat_html=chat))
+
+    out = capsys.readouterr().out
+    assert "将自动 offset=100s" in out
+    assert code in (0, 1)
+
+
+# ---------------------------------------------------------------------------
+# doctor 分支补齐：字体显式路径 / 探针失败 / 警告分支 / 自动修复复检 / 平台文案
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_explicit_font_paths_check_file_existence(
+    doctor_mod, tmp_path, monkeypatch, capsys
+):
+    good_font = tmp_path / "cjk.ttf"
+    good_font.write_bytes(b"font")
+    args = _doctor_args()
+    args.font_path = str(good_font)
+    args.font_bold_path = str(tmp_path / "missing-bold.ttf")
+    _patch_doctor_probe(monkeypatch, doctor_mod, "10.0")
+
+    code = doctor_mod.doctor(args)
+
+    out = capsys.readouterr().out
+    assert f"[OK] 常规字体: {good_font}" in out
+    assert "[FAIL] 粗体字体" in out
+    assert code == 1
+
+
+def test_doctor_alignment_warns_when_message_span_much_shorter_than_video(
+    doctor_mod, tmp_path, monkeypatch, capsys
+):
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    chat = _write_td_chat(tmp_path, "chat.html", [70, 75, 80])
+    _patch_doctor_probe(monkeypatch, doctor_mod, "1000.0")
+
+    code = doctor_mod.doctor(_doctor_args(video=video, chat_html=chat))
+
+    out = capsys.readouterr().out
+    assert "[WARN] 时间轴对齐" in out
+    assert "消息跨度" in out
+    assert "时间轴有警告" in out
+    assert code == 0
+
+
+def test_doctor_reports_probe_timeout_as_video_failure(
+    doctor_mod, tmp_path, monkeypatch, capsys
+):
+    import subprocess
+
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(doctor_mod, "prepend_tools_ffmpeg_to_path", lambda: None)
+    monkeypatch.setattr(doctor_mod, "safe_which", lambda name: f"C:/t/{name}.exe")
+    monkeypatch.setattr(doctor_mod, "require_executable", lambda name: f"{name}.exe")
+    monkeypatch.setattr(
+        doctor_mod, "detect_cjk_font", lambda: (r"C:\fonts\cjk.ttf", r"C:\fonts\cjk-bold.ttf")
+    )
+    monkeypatch.setattr(doctor_mod, "print_readiness_report", lambda items=None: (True, True))
+
+    def raise_timeout(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="ffprobe", timeout=45)
+
+    monkeypatch.setattr(doctor_mod.subprocess, "run", raise_timeout)
+
+    code = doctor_mod.doctor(_doctor_args(video=video))
+
+    out = capsys.readouterr().out
+    assert "[FAIL] 视频可读取" in out
+    assert code == 1
+
+
+def test_doctor_unparseable_duration_keeps_alignment_silent(
+    doctor_mod, tmp_path, monkeypatch, capsys
+):
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    chat = _write_td_chat(tmp_path, "chat.html", [1, 2, 3])
+    _patch_doctor_probe(monkeypatch, doctor_mod, "N/A")
+
+    code = doctor_mod.doctor(_doctor_args(video=video, chat_html=chat))
+
+    out = capsys.readouterr().out
+    assert "[OK] 视频可读取" in out  # 探针退出码 0，但时长无法解析 → 不做对齐诊断
+    assert "时间轴对齐" not in out
+    assert code == 0
+
+
+@pytest.mark.parametrize("system,expected_hint", [("Darwin", "brew install ffmpeg"), ("Linux", "apt install ffmpeg")])
+def test_doctor_platform_specific_ffmpeg_fix_hints(
+    doctor_mod, monkeypatch, capsys, system, expected_hint
+):
+    monkeypatch.setattr(doctor_mod, "prepend_tools_ffmpeg_to_path", lambda: None)
+    monkeypatch.setattr(doctor_mod, "safe_which", lambda name: None)
+    monkeypatch.setattr(doctor_mod, "detect_cjk_font", lambda: (None, None))
+    monkeypatch.setattr(doctor_mod, "print_readiness_report", lambda items=None: (False, False))
+    monkeypatch.setattr(doctor_mod, "maybe_prompt_offer_fixes", lambda **k: False)
+    monkeypatch.setattr(doctor_mod.platform, "system", lambda: system)
+
+    code = doctor_mod.doctor(_doctor_args())
+
+    out = capsys.readouterr().out
+    assert expected_hint in out
+    assert code == 1
+
+
+def test_doctor_stub_module_without_spec_falls_back_to_sys_modules(
+    doctor_mod, monkeypatch, capsys
+):
+    import sys
+    from types import ModuleType
+
+    _patch_doctor_probe(monkeypatch, doctor_mod, "10.0")
+    stub = ModuleType("yaml")
+    stub.__spec__ = None  # 某些测试桩模块会把 __spec__ 置空
+    monkeypatch.setitem(sys.modules, "yaml", stub)
+
+    code = doctor_mod.doctor(_doctor_args())
+
+    out = capsys.readouterr().out
+    assert "[OK] PyYAML" in out  # find_spec 抛 ValueError 时按 sys.modules 兜底
+    assert code == 0
+
+
+def test_doctor_offer_fix_runs_then_rechecks(doctor_mod, tmp_path, monkeypatch, capsys):
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(doctor_mod, "prepend_tools_ffmpeg_to_path", lambda: None)
+    monkeypatch.setattr(doctor_mod, "safe_which", lambda name: None)
+    monkeypatch.setattr(
+        doctor_mod, "detect_cjk_font", lambda: (r"C:\fonts\cjk.ttf", r"C:\fonts\cjk-bold.ttf")
+    )
+    offered: list[bool] = []
+    monkeypatch.setattr(doctor_mod, "offer_fixes", lambda **k: offered.append(True))
+    monkeypatch.setattr(doctor_mod, "maybe_prompt_offer_fixes", lambda **k: True)
+    reports = iter([(False, True), (True, True)])
+    monkeypatch.setattr(
+        doctor_mod, "print_readiness_report", lambda items=None: next(reports)
+    )
+
+    args = _doctor_args(video=video)
+    args.offer_fix = True
+    code = doctor_mod.doctor(args)
+
+    out = capsys.readouterr().out
+    assert offered == [True]
+    assert "--- 修复后复检 ---" in out
+    assert code == 1  # ffprobe 仍缺失：复检后依旧失败
