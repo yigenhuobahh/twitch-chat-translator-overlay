@@ -448,7 +448,7 @@ def test_task_session_start_failure_cleans_transient_files(tmp_path: Path):
     assert session.result_path is not None and not session.result_path.exists()
 
 
-@pytest.mark.smoke
+@pytest.mark.slow
 def test_offline_demo_runs_through_task_session(tmp_path: Path):
     session = TaskSession(
         [sys.executable, str(SCRIPTS / "quick_demo.py"), "--output-dir", str(tmp_path / "demo")],

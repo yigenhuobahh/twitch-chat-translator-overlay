@@ -758,17 +758,8 @@ def test_gitignore_protects_user_jobs():
 # ---------------------------------------------------------------------------
 # Parser / AST hygiene for long-term
 # ---------------------------------------------------------------------------
-
-
-def test_no_exec_burn_in_doctor_source():
-    # doctor 实现位于 doctor_check.py（自 render_cn_chat 搬出）；两处都不得
-    # exec 编译源码，且 doctor 侧仍保留对 chat_parser 的真实 import。
-    text = "\n".join(
-        (SCRIPTS / name).read_text(encoding="utf-8")
-        for name in ("render_cn_chat.py", "doctor_check.py")
-    )
-    assert "exec(compile" not in text
-    assert "from chat_parser import" in text or "import chat_parser" in text
+# （"doctor 不得 exec 源码"契约断言已收敛至 tests/test_doctor_import.py 正典，
+# 原本在此的 test_no_exec_burn_in_doctor_source 为重复断言，已删除。）
 
 
 def test_test_tree_has_no_syntax_errors():

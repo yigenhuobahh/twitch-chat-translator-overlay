@@ -9,6 +9,11 @@ on:
     - cron: "17 18 * * *"
   workflow_dispatch:
 
+# 最小权限默认：所有 job 只授予只读源码权限；需要更多权限的 job
+# 在 job 级显式覆盖（见 scheduled-max / security-audit）。
+permissions:
+  contents: read
+
 jobs:
   test:
     if: github.event_name != 'schedule'
@@ -85,6 +90,12 @@ jobs:
           PYTHONUTF8: "1"
         run: |
           python scripts/run_tests.py --lint --no-compile
+
+      - name: Security quick scan (bandit)
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: python -m bandit -r scripts -q -ll
 
       - name: Run tests (unit + smoke)
         env:
@@ -258,7 +269,10 @@ jobs:
   scheduled-max:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    # job 级 permissions 会整体覆盖默认值（未列出的 scope 归零），而
+    # actions/checkout 需要 contents: read 才能拉取源码，故两者都需显式授予。
     permissions:
+      contents: read
       issues: write
 
     steps:
@@ -303,7 +317,10 @@ jobs:
   security-audit:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    # 同 scheduled-max：contents: read 供 checkout 使用，issues: write 供
+    # 失败时自动建 issue 使用，均按 job 级最小授予。
     permissions:
+      contents: read
       issues: write
 
     steps:
@@ -320,7 +337,11 @@ jobs:
           python -m pip install -r requirements-dev.txt
 
       - name: Audit declared Python dependencies
-        run: python -m pip_audit -r requirements.txt
+        run: |
+          python -m pip_audit -r requirements.txt
+          # dev 依赖（bandit/pip-audit/ruff/textual 等）同属供应链，一并审计。
+          # 分两次调用，避免依赖 pip-audit 对多 -r / 嵌套 -r 的解析行为。
+          python -m pip_audit -r requirements-dev.txt
 
       - name: Scan application code with Bandit
         run: python -m bandit -r scripts -q -ll

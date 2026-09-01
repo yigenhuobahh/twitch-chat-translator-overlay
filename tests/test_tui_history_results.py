@@ -709,7 +709,7 @@ def test_textual_unmount_marks_running_task_interrupted(tmp_path: Path):
     asyncio.run(exercise())
 
 
-@pytest.mark.smoke
+@pytest.mark.slow
 def test_textual_demo_records_manifest_artifacts(tmp_path: Path):
     pytest.importorskip("textual")
     from textual.widgets import TabbedContent
