@@ -31,6 +31,7 @@ from common_utils import (
     is_console_entry_script,
     register_trusted_executable_dir,
     safe_which,
+    translate_api_env_config,
     trusted_tools_root,
 )
 
@@ -395,9 +396,11 @@ def collect_readiness(*, font_path: str | None = "auto", font_bold_path: str | N
     )
 
     # Translation API (optional for original render)
-    base_url = os.getenv("OPENAI_COMPAT_BASE_URL") or os.getenv("AGNES_BASE_URL")
-    model = os.getenv("OPENAI_COMPAT_MODEL") or os.getenv("AGNES_MODEL")
-    api_key = os.getenv("OPENAI_COMPAT_API_KEY") or os.getenv("AGNES_API_KEY")
+    # C-O7: 与 get_translate_api_config 共用 common_utils 的同一实现,不再各写一份。
+    api_cfg = get_translate_api_config()
+    base_url = api_cfg["base_url"]
+    model = api_cfg["model"]
+    api_key = api_cfg["api_key"]
     api_ok = bool(base_url and model and api_key)
     items.append(
         CheckItem(
@@ -437,12 +440,13 @@ def collect_readiness(*, font_path: str | None = "auto", font_bold_path: str | N
 
 
 def get_translate_api_config() -> dict[str, str | None]:
-    """Return current OpenAI-compatible env (OPENAI_COMPAT_* with AGNES_* fallback)."""
-    return {
-        "base_url": os.getenv("OPENAI_COMPAT_BASE_URL") or os.getenv("AGNES_BASE_URL"),
-        "api_key": os.getenv("OPENAI_COMPAT_API_KEY") or os.getenv("AGNES_API_KEY"),
-        "model": os.getenv("OPENAI_COMPAT_MODEL") or os.getenv("AGNES_MODEL"),
-    }
+    """Return current OpenAI-compatible env (OPENAI_COMPAT_* with AGNES_* fallback).
+
+    Canonical entry point; the pure env read lives in
+    ``common_utils.translate_api_env_config`` so translate_chat_openai's
+    standalone fallback shares the exact same implementation (C-O7).
+    """
+    return translate_api_env_config()
 
 
 def translate_api_config_ok(cfg: dict[str, str | None] | None = None) -> bool:

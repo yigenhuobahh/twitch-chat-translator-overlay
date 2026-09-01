@@ -93,7 +93,8 @@ def test_compute_time_offset_auto_and_manual():
     assert messages[1]["timestamp"] == 100.0
 
 
-def test_translation_error_classification_and_backoff():
+def test_translation_error_classification_and_backoff(monkeypatch):
+    import translation_support
     from translation_support import TranslationErrorKind, backoff_seconds, classify_api_error
 
     class FakeHTTPError(Exception):
@@ -106,6 +107,8 @@ def test_translation_error_classification_and_backoff():
     assert classify_api_error(FakeHTTPError(401, "unauthorized")) == TranslationErrorKind.AUTH
     assert classify_api_error(TimeoutError("timed out")) == TranslationErrorKind.TIMEOUT
     assert classify_api_error(ValueError("json decode boom")) == TranslationErrorKind.BAD_JSON
+    # C-O9: 指数分支叠加随机抖动;固定 jitter=0 使历史精确值断言保持确定性。
+    monkeypatch.setattr(translation_support.random, "uniform", lambda lo, hi: 0.0)
     assert backoff_seconds(TranslationErrorKind.RATE_LIMIT, 0, FakeHTTPError(429)) == 7.0
     assert backoff_seconds(TranslationErrorKind.AUTH, 0) == 0.0
     assert backoff_seconds(TranslationErrorKind.SERVER, 1) == 20.0

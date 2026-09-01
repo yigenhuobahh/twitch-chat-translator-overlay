@@ -383,3 +383,152 @@ def test_installed_ffmpeg_lookup_ignores_untrusted_cwd_tools(tmp_path, monkeypat
     assert eb.safe_which("ffmpeg") is None
     assert eb.safe_which("ffprobe") is None
     assert os.environ["PATH"] == ""
+
+
+# ---------------------------------------------------------------------------
+# C-O7: one sunk .env API-triple reader shared by all three call sites
+# ---------------------------------------------------------------------------
+
+_API_ENV_KEYS = (
+    "OPENAI_COMPAT_BASE_URL",
+    "OPENAI_COMPAT_API_KEY",
+    "OPENAI_COMPAT_MODEL",
+    "AGNES_BASE_URL",
+    "AGNES_API_KEY",
+    "AGNES_MODEL",
+)
+
+
+def test_get_translate_api_config_delegates_to_common_utils(monkeypatch):
+    """env_bootstrap.get_translate_api_config 与 common_utils 下沉函数逐项等价。"""
+    import common_utils as cu
+    import env_bootstrap as eb
+
+    for key in _API_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+    # 未配置:两项实现一致地返回 None 三元组。
+    assert eb.get_translate_api_config() == {
+        "base_url": None,
+        "api_key": None,
+        "model": None,
+    }
+    assert cu.translate_api_env_config() == eb.get_translate_api_config()
+
+    # OPENAI_COMPAT_* 优先。
+    monkeypatch.setenv("OPENAI_COMPAT_BASE_URL", "https://compat.invalid/v1")
+    monkeypatch.setenv("OPENAI_COMPAT_API_KEY", "compat-key")
+    monkeypatch.setenv("OPENAI_COMPAT_MODEL", "compat-model")
+    cfg = eb.get_translate_api_config()
+    assert cfg == {
+        "base_url": "https://compat.invalid/v1",
+        "api_key": "compat-key",
+        "model": "compat-model",
+    }
+
+    # AGNES_* 逐项回退(缺哪个补哪个)。
+    monkeypatch.delenv("OPENAI_COMPAT_MODEL", raising=False)
+    monkeypatch.setenv("AGNES_BASE_URL", "https://agnes.invalid/v1")
+    monkeypatch.setenv("AGNES_API_KEY", "agnes-key")
+    monkeypatch.setenv("AGNES_MODEL", "agnes-model")
+    cfg = eb.get_translate_api_config()
+    assert cfg == {
+        "base_url": "https://compat.invalid/v1",
+        "api_key": "compat-key",
+        "model": "agnes-model",
+    }
+    assert cfg == cu.translate_api_env_config()
+
+
+def test_collect_readiness_api_item_uses_shared_fallback(monkeypatch):
+    """collect_readiness 的 api 检查项复用同一回退实现(AGNES_* 也算已配置)。"""
+    import env_bootstrap as eb
+
+    for key in _API_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("AGNES_BASE_URL", "https://agnes.invalid/v1")
+    monkeypatch.setenv("AGNES_API_KEY", "agnes-key")
+    monkeypatch.setenv("AGNES_MODEL", "agnes-model")
+    assert next(i for i in eb.collect_readiness() if i.key == "api").ok is True
+
+    monkeypatch.delenv("AGNES_API_KEY", raising=False)
+    assert next(i for i in eb.collect_readiness() if i.key == "api").ok is False
+
+
+def test_translate_module_top_level_fallback_uses_shared_reader(monkeypatch):
+    """C-O7:translate 模块顶部的回退读取与 common_utils 下沉函数等价。"""
+    import common_utils as cu
+    from helpers import load_module
+
+    for key in _API_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("AGNES_BASE_URL", "https://agnes.invalid/v1")
+    monkeypatch.setenv("AGNES_API_KEY", "agnes-key")
+    monkeypatch.setenv("AGNES_MODEL", "agnes-model")
+
+    tr = load_module("translate_chat_openai", "translate_chat_openai.py")
+    cfg = cu.translate_api_env_config()
+
+    assert tr.BASE_URL == cfg["base_url"] == "https://agnes.invalid/v1"
+    assert tr.API_KEY == cfg["api_key"] == "agnes-key"
+    assert tr.MODEL == cfg["model"] == "agnes-model"
+
+
+def test_translate_main_rereads_shared_api_config(monkeypatch, tmp_path):
+    """C-O7:main() 运行时重读走同一共享函数(导入后出现的 AGNES_* 可达)。"""
+    import json
+    from types import SimpleNamespace
+
+    import common_utils as cu
+    from helpers import load_module
+
+    for key in _API_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+    tr = load_module("translate_chat_openai", "translate_chat_openai.py")
+    # 模块导入时 env 为空(BASE_URL 等为 None);配置随后才出现,
+    # main() 必须经共享函数重读 env 拿到 AGNES_* 回退。
+    monkeypatch.setenv("AGNES_BASE_URL", "https://agnes.invalid/v1")
+    monkeypatch.setenv("AGNES_API_KEY", "agnes-key")
+    monkeypatch.setenv("AGNES_MODEL", "agnes-model")
+
+    json_path = tmp_path / "cfg.json"
+    json_path.write_text(
+        json.dumps(
+            {"messages": [{"index": 0, "author": "a", "original": "hi", "translation": ""}]},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    record: dict = {}
+
+    class Completions:
+        def create(self, **kwargs):
+            record["create_kwargs"] = kwargs
+            payload = json.dumps(
+                {"translations": [{"index": 0, "translation": "译"}]},
+                ensure_ascii=False,
+            )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=payload))]
+            )
+
+    class Client:
+        def __init__(self, **kwargs):
+            record["client_kwargs"] = kwargs
+            self.chat = SimpleNamespace(completions=Completions())
+
+    monkeypatch.setattr(tr, "OpenAI", Client)
+    monkeypatch.setattr(
+        tr.sys, "argv", ["translate_chat_openai.py", str(json_path), "--workers", "1"]
+    )
+
+    tr.main()
+
+    cfg = cu.translate_api_env_config()
+    assert (
+        record["client_kwargs"]["base_url"]
+        == cfg["base_url"]
+        == "https://agnes.invalid/v1"
+    )
+    assert record["create_kwargs"]["model"] == cfg["model"] == "agnes-model"

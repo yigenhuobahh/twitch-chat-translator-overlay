@@ -151,6 +151,22 @@ def env_loaded_from_dotenv(key: str) -> bool:
     return str(key) in _DOTENV_LOADED_KEYS
 
 
+def translate_api_env_config() -> dict[str, str | None]:
+    """Read the translation API triple: OPENAI_COMPAT_* with legacy AGNES_* fallback.
+
+    Single pure source of truth shared by ``env_bootstrap.get_translate_api_config``
+    (canonical entry) and ``translate_chat_openai`` (standalone fallback), so the
+    three former duplicated os.getenv chains cannot drift apart. Deliberately
+    depends only on ``os.getenv`` — no ``__file__`` or ``_DOTENV_LOADED_KEYS``
+    access (tests patch both on this module).
+    """
+    return {
+        "base_url": os.getenv("OPENAI_COMPAT_BASE_URL") or os.getenv("AGNES_BASE_URL"),
+        "api_key": os.getenv("OPENAI_COMPAT_API_KEY") or os.getenv("AGNES_API_KEY"),
+        "model": os.getenv("OPENAI_COMPAT_MODEL") or os.getenv("AGNES_MODEL"),
+    }
+
+
 def atomic_write_json(path: str | Path, data) -> None:
     """原子写 JSON：先写同目录唯一临时文件，成功后 os.replace 原子替换。
 

@@ -625,3 +625,195 @@ def test_repo_root_dotenv_load_prints_no_notice(tmp_path: Path, monkeypatch, cap
 
     for key in _TRANSLATION_ENV_KEYS:
         os.environ.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# C-O9: exponential backoff carries bounded jitter; Retry-After stays exact
+# ---------------------------------------------------------------------------
+
+
+def test_backoff_exponential_branch_adds_bounded_jitter(monkeypatch):
+    import translation_support as support
+
+    kind = support.TranslationErrorKind.SERVER  # base 10.0
+    # Max jitter (base * 0.3): attempt 1 -> 10*2 + 10*0.3 = 23.0
+    monkeypatch.setattr(support.random, "uniform", lambda lo, hi: hi)
+    assert support.backoff_seconds(kind, 1) == pytest.approx(23.0)
+    # Zero jitter keeps the historical pure-exponential value.
+    monkeypatch.setattr(support.random, "uniform", lambda lo, hi: 0.0)
+    assert support.backoff_seconds(kind, 1) == pytest.approx(20.0)
+
+    # Unpatched: value stays within [pure, pure + base*0.3] and caps at 120.
+    monkeypatch.undo()
+    for _ in range(50):
+        value = support.backoff_seconds(kind, 1)
+        assert 20.0 <= value <= 23.0
+    assert support.backoff_seconds(kind, 8) == 120.0
+
+
+def test_backoff_retry_after_branch_ignores_jitter(monkeypatch):
+    import translation_support as support
+
+    class RateLimitedError(Exception):
+        status_code = 429
+        response = type("R", (), {"headers": {"Retry-After": "7"}})()
+
+    # Even with maximal jitter, the server-provided Retry-After value is exact.
+    monkeypatch.setattr(support.random, "uniform", lambda lo, hi: hi)
+    assert (
+        support.backoff_seconds(
+            support.TranslationErrorKind.RATE_LIMIT, 0, RateLimitedError()
+        )
+        == 7.0
+    )
+    # Zero-base kinds (AUTH/CLIENT) stay 0 regardless of jitter.
+    assert support.backoff_seconds(support.TranslationErrorKind.AUTH, 0) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# C-O6: success finalization keeps a failed_last_run audit trail
+# ---------------------------------------------------------------------------
+
+
+def test_success_run_keeps_failed_last_run_audit_and_clears_failed(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """批次失败进入 progress 后被最终重试救回:收尾 failed 清空,
+    failed_last_run 保留本轮失败明细供事后审计。"""
+    import translate_chat_openai as tr
+
+    messages = [
+        {"index": 0, "author": "alice", "original": "flaky", "translation": ""},
+        {"index": 1, "author": "bob", "original": "stable", "translation": ""},
+    ]
+    json_path = tmp_path / "audit.json"
+    json_path.write_text(
+        json.dumps({"messages": messages}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    class FlakyError(Exception):
+        status_code = 500  # retryable SERVER kind
+
+    calls = {"flaky": 0, "stable": 0}
+
+    class Completions:
+        def create(self, **kwargs):
+            prompt = kwargs["messages"][0]["content"]
+            if "flaky" in prompt:
+                calls["flaky"] += 1
+                if calls["flaky"] <= 3:
+                    # Main pass: all 3 in-batch attempts fail -> batch failure.
+                    raise FlakyError("internal server error")
+                payload = json.dumps(
+                    {"translations": [{"index": 0, "translation": "恢复了"}]},
+                    ensure_ascii=False,
+                )
+            else:
+                calls["stable"] += 1
+                payload = json.dumps(
+                    {"translations": [{"index": 1, "translation": "稳定"}]},
+                    ensure_ascii=False,
+                )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=payload))]
+            )
+
+    class Client:
+        def __init__(self, **_kwargs):
+            self.chat = SimpleNamespace(completions=Completions())
+
+    monkeypatch.setattr(tr, "OpenAI", Client)
+    monkeypatch.setattr(tr, "BASE_URL", "https://provider.invalid/v1")
+    monkeypatch.setattr(tr, "API_KEY", "stub-key")
+    monkeypatch.setattr(tr, "MODEL", "stub-model")
+    monkeypatch.setattr(tr.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        tr.sys,
+        "argv",
+        [
+            "translate_chat_openai.py",
+            str(json_path),
+            "--workers",
+            "1",
+            "--batch-size",
+            "1",
+        ],
+    )
+
+    tr.main()
+
+    assert calls["flaky"] == 4  # 3 failed attempts + 1 rescued retry-pass call
+    progress = tr.load_progress(tr.progress_path_for(json_path))
+    assert progress["failed"] == []
+    assert progress["failed_last_run"] == [0]
+    updated = json.loads(json_path.read_text(encoding="utf-8"))
+    assert updated["messages"][0]["translation"] == "恢复了"
+
+
+# ---------------------------------------------------------------------------
+# C-O10: interrupt during the execution phase still persists finished batches
+# ---------------------------------------------------------------------------
+
+
+def test_keyboard_interrupt_forces_progress_persist_of_completed_batches(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """C-O10:worker 抛 KeyboardInterrupt 时,已完成批次必须被强制落盘。
+
+    批次 1 完成后首次落盘(节流窗口开启);批次 2 完成后的非强制落盘被
+    30 秒节流跳过;批次 3 抛 KeyboardInterrupt。收尾强制落盘必须把批次 2
+    的译文补写进 progress,否则它会停留在内存里丢失。
+    """
+    import translate_chat_openai as tr
+
+    messages = [
+        {"index": i, "author": "a", "original": f"m{i}", "translation": ""}
+        for i in range(3)
+    ]
+    json_path = tmp_path / "interrupt.json"
+    json_path.write_text(
+        json.dumps({"messages": messages}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    def fake_translate_batch(_client, batch, batch_num, *_args, **_kwargs):
+        if batch_num == 3:
+            raise KeyboardInterrupt("simulated ctrl+c")
+        return [
+            {"index": batch[0]["index"], "translation": f"译{batch[0]['index']}"}
+        ]
+
+    class StubClient:
+        def __init__(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(tr, "translate_batch", fake_translate_batch)
+    monkeypatch.setattr(tr, "OpenAI", StubClient)
+    monkeypatch.setattr(tr, "BASE_URL", "https://provider.invalid/v1")
+    monkeypatch.setattr(tr, "API_KEY", "stub-key")
+    monkeypatch.setattr(tr, "MODEL", "stub-model")
+    monkeypatch.setattr(
+        tr.sys,
+        "argv",
+        [
+            "translate_chat_openai.py",
+            str(json_path),
+            "--workers",
+            "1",
+            "--batch-size",
+            "1",
+        ],
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        tr.main()
+
+    progress = tr.load_progress(tr.progress_path_for(json_path))
+    assert progress["translations"] == {"0": "译0", "1": "译1"}
+    assert progress["failed"] == []
+    # 中断发生在收尾之前:JSON 快照未写回,译文只在 progress 中。
+    updated = json.loads(json_path.read_text(encoding="utf-8"))
+    assert [m["translation"] for m in updated["messages"]] == ["", "", ""]

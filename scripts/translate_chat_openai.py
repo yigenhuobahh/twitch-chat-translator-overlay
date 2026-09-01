@@ -46,6 +46,7 @@ from common_utils import (
     ensure_utf8_stdio,
     load_dotenv_if_present,
     positive_float_arg,
+    translate_api_env_config,
 )
 from translation_support import (
     TranslationCache,
@@ -60,9 +61,11 @@ ensure_utf8_stdio()
 load_dotenv_if_present()
 
 # Prefer OPENAI_COMPAT_*; fall back to legacy AGNES_* for local setups.
-BASE_URL = os.getenv("OPENAI_COMPAT_BASE_URL") or os.getenv("AGNES_BASE_URL")
-API_KEY = os.getenv("OPENAI_COMPAT_API_KEY") or os.getenv("AGNES_API_KEY")
-MODEL = os.getenv("OPENAI_COMPAT_MODEL") or os.getenv("AGNES_MODEL")
+# C-O7: 与 env_bootstrap.get_translate_api_config 共用 common_utils 的同一实现。
+_initial_api_env = translate_api_env_config()
+BASE_URL = _initial_api_env["base_url"]
+API_KEY = _initial_api_env["api_key"]
+MODEL = _initial_api_env["model"]
 BATCH_SIZE = 10
 MAX_WORKERS = 4
 MAX_BATCH_CHARS = 16_000
@@ -170,6 +173,8 @@ def empty_progress() -> dict:
         "fingerprints": {},
         "json_translation_fingerprints": {},
         "failed": [],
+        # C-O6 审计字段:本轮曾失败的行(含被重试救回者);旧进度无此字段按空处理。
+        "failed_last_run": [],
     }
 
 
@@ -278,6 +283,11 @@ def load_progress(path: Path) -> dict:
 
     raw_failed = normalized.get("failed")
     normalized["failed"] = list(raw_failed) if isinstance(raw_failed, list) else []
+    # 旧 schema 进度无 failed_last_run 字段:忽略(向后兼容),按空列表归一。
+    raw_failed_last = normalized.get("failed_last_run")
+    normalized["failed_last_run"] = (
+        list(raw_failed_last) if isinstance(raw_failed_last, list) else []
+    )
     return normalized
 
 
@@ -715,22 +725,13 @@ def main():
 
     # Re-read env at runtime so late dotenv / test env changes are honored.
     # If env is unset, keep module-level values (import-time load or test monkeypatch).
+    # C-O7: 读取逻辑下沉到 common_utils.translate_api_env_config,
+    # 与 env_bootstrap.get_translate_api_config 完全一致。
     global BASE_URL, API_KEY, MODEL
-    BASE_URL = (
-        os.getenv("OPENAI_COMPAT_BASE_URL")
-        or os.getenv("AGNES_BASE_URL")
-        or BASE_URL
-    )
-    API_KEY = (
-        os.getenv("OPENAI_COMPAT_API_KEY")
-        or os.getenv("AGNES_API_KEY")
-        or API_KEY
-    )
-    MODEL = (
-        os.getenv("OPENAI_COMPAT_MODEL")
-        or os.getenv("AGNES_MODEL")
-        or MODEL
-    )
+    _runtime_api_env = translate_api_env_config()
+    BASE_URL = _runtime_api_env["base_url"] or BASE_URL
+    API_KEY = _runtime_api_env["api_key"] or API_KEY
+    MODEL = _runtime_api_env["model"] or MODEL
 
     json_path = os.path.abspath(args.json_path)
     if not os.path.isfile(json_path):
@@ -907,6 +908,14 @@ def main():
         print()
 
     failed_indexes = set(failed_set)
+    # C-O6: 审计集合。记录本轮曾失败(含之后被重试救回)的行,使成功收尾
+    # 清空 failed 后仍能回答"哪些行曾失败被重试救回"。只在失败发生时写入。
+    failed_last_run: set[int] = set()
+
+    def mark_failed(idx: int) -> None:
+        failed_indexes.add(idx)
+        failed_last_run.add(idx)
+
     error_counts = {}
     progress_lock = threading.Lock()
     error_counts_lock = threading.Lock()
@@ -968,59 +977,77 @@ def main():
             "fingerprints": message_fps,
             "json_translation_fingerprints": json_translation_fps,
             "failed": sorted(failed_indexes),
+            # C-O6: 收尾清空 failed 后,本字段保留本轮失败明细供事后审计;
+            # 旧进度读入时无此字段按空处理,兼容性检查不校验它。
+            "failed_last_run": sorted(failed_last_run),
         }
         save_progress(progress_file, payload)
         progress_save_state["last_save"] = time.monotonic()
         progress_save_state["batches_since"] = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {}
-        for batch_num, batch in batches:
-            future = executor.submit(
-                translate_batch,
-                client,
-                batch,
-                batch_num,
-                args.context,
-                args.target_language,
-                cache,
-                error_counts,
-                bump_error,
-            )
-            futures[future] = (batch_num, batch)
+    # C-O10: 翻译执行区外层保护。非强制落盘有 30 秒节流,Ctrl+C/异常中断时
+    # 最后一次落盘可能停留在 30 秒前,把中断前已完成批次的进度丢掉。
+    # 正常成功路径不走此分支(既有收尾语义不变);异常路径先强制落盘一次,
+    # 再把中断原样抛出。落盘自身失败只打印一行告警,不掩盖原始异常。
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = {}
+            for batch_num, batch in batches:
+                future = executor.submit(
+                    translate_batch,
+                    client,
+                    batch,
+                    batch_num,
+                    args.context,
+                    args.target_language,
+                    cache,
+                    error_counts,
+                    bump_error,
+                )
+                futures[future] = (batch_num, batch)
 
-        for future in concurrent.futures.as_completed(futures):
-            batch_num, batch = futures[future]
-            try:
-                translations = future.result()
-                if translations:
-                    with progress_lock:
-                        for item in translations:
-                            if "index" in item and "translation" in item:
-                                idx = item["index"]
-                                translation_map[idx] = item["translation"]
-                                failed_indexes.discard(idx)
-                        persist_progress()
-                else:
-                    print(f"批次 {batch_num} 翻译失败")
+            for future in concurrent.futures.as_completed(futures):
+                batch_num, batch = futures[future]
+                try:
+                    translations = future.result()
+                    if translations:
+                        with progress_lock:
+                            for item in translations:
+                                if "index" in item and "translation" in item:
+                                    idx = item["index"]
+                                    translation_map[idx] = item["translation"]
+                                    failed_indexes.discard(idx)
+                            persist_progress()
+                    else:
+                        print(f"批次 {batch_num} 翻译失败")
+                        with progress_lock:
+                            for msg in batch:
+                                mark_failed(msg["index"])
+                            persist_progress(force=True)
+                except Exception as e:
+                    print(f"批次 {batch_num} 异常: {type(e).__name__}: {e}")
                     with progress_lock:
                         for msg in batch:
-                            failed_indexes.add(msg["index"])
+                            mark_failed(msg["index"])
                         persist_progress(force=True)
-            except Exception as e:
-                print(f"批次 {batch_num} 异常: {type(e).__name__}: {e}")
-                with progress_lock:
-                    for msg in batch:
-                        failed_indexes.add(msg["index"])
-                    persist_progress(force=True)
-            completed_batches += 1
-            emit_task_event(
-                "stage_progress",
-                stage="translate",
-                completed=completed_batches,
-                total=total_batches,
-                unit="batches",
+                completed_batches += 1
+                emit_task_event(
+                    "stage_progress",
+                    stage="translate",
+                    completed=completed_batches,
+                    total=total_batches,
+                    unit="batches",
+                )
+    except BaseException:
+        try:
+            persist_progress(force=True)
+        except Exception as persist_exc:
+            print(
+                f"[warn] 中断后强制落盘失败: {type(persist_exc).__name__}: {persist_exc}",
+                file=sys.stderr,
+                flush=True,
             )
+        raise
 
     # Retry non-preserve missing messages once, still in original batch sizes.
     missing_for_retry = []
@@ -1060,7 +1087,7 @@ def main():
                     failed_indexes.discard(item["index"])
             still_missing = [m["index"] for m in retry_batch if m["index"] not in translation_map]
             for idx in still_missing:
-                failed_indexes.add(idx)
+                mark_failed(idx)
             persist_progress(force=True)
 
     updated = 0
@@ -1084,7 +1111,7 @@ def main():
             translation_map.pop(idx, None)
             msg["translation"] = msg.get("original", "")
             missing += 1
-            failed_indexes.add(idx)
+            mark_failed(idx)
 
     # 收尾清理循环刚改写过 translation,最终落盘前刷新 JSON 快照指纹,
     # 使 resume 能据此识别收尾后的人工复核改动。

@@ -889,3 +889,161 @@ def test_corrupt_progress_file_warns_to_stderr_and_starts_empty(
     err = capsys.readouterr().err
     assert "[warn]" in err
     assert "broken.progress.json" in err
+
+
+# ---------------------------------------------------------------------------
+# C-O6: failed_last_run audit field — additive schema, backward compatible
+# ---------------------------------------------------------------------------
+
+
+def test_load_progress_sanitizes_failed_last_run(tmp_path: Path):
+    """failed_last_run 按列表归一;旧文件无此字段按空处理;坏类型不致命。"""
+    import translate_chat_openai as tr
+
+    legacy = tmp_path / "legacy.progress.json"
+    legacy.write_text(json.dumps({"failed": [3]}), encoding="utf-8")
+    loaded = tr.load_progress(legacy)
+    assert loaded["failed_last_run"] == []
+    assert loaded["failed"] == [3]
+
+    malformed = tmp_path / "malformed.progress.json"
+    malformed.write_text(json.dumps({"failed_last_run": "oops"}), encoding="utf-8")
+    assert tr.load_progress(malformed)["failed_last_run"] == []
+
+
+def test_progress_compatibility_ignores_failed_last_run_field():
+    """C-O6:兼容性检查不得因新增审计字段(或其异常取值)报失配。"""
+    import translate_chat_openai as tr
+
+    identity = {
+        "schema_version": tr.PROGRESS_SCHEMA_VERSION,
+        "target_language": "zh",
+        "provider": tr.TRANSLATION_PROVIDER,
+        "base_url_fingerprint": tr.base_url_fingerprint("https://provider.invalid/v1"),
+        "model": "stub-model",
+        "prompt_version": tr.PROMPT_VERSION,
+        "context_fingerprint": tr.context_fingerprint("livestream chat"),
+        "context_length": len("livestream chat"),
+    }
+    compat_kwargs = {
+        "target_language": "zh",
+        "context": "livestream chat",
+        "provider": tr.TRANSLATION_PROVIDER,
+        "base_url": "https://provider.invalid/v1",
+        "model": "stub-model",
+        "prompt_version": tr.PROMPT_VERSION,
+    }
+
+    with_field = dict(identity, failed_last_run=[0, 7])
+    assert tr.progress_compatibility_errors(with_field, **compat_kwargs) == []
+    weird = dict(identity, failed_last_run="not-even-a-list")
+    assert tr.progress_compatibility_errors(weird, **compat_kwargs) == []
+
+
+def test_legacy_progress_without_failed_last_run_field_still_resumes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """旧 schema 进度(无 failed_last_run)必须原样兼容续传,不被判失配。"""
+    import translate_chat_openai as tr
+
+    message = {
+        "index": 0,
+        "author": "alice",
+        "original": "hello",
+        "translation": "",
+    }
+    json_path = tmp_path / "legacy-resume.json"
+    json_path.write_text(
+        json.dumps({"messages": [message]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    progress_path = tr.progress_path_for(json_path)
+    progress_path.write_text(
+        json.dumps(
+            {
+                "schema_version": tr.PROGRESS_SCHEMA_VERSION,
+                "provider": tr.TRANSLATION_PROVIDER,
+                "base_url_fingerprint": tr.base_url_fingerprint(
+                    "https://provider.invalid/v1"
+                ),
+                "model": "stub-model",
+                "prompt_version": tr.PROMPT_VERSION,
+                "target_language": "zh",
+                "context": "livestream chat",
+                "translations": {},
+                "fingerprints": {"0": tr.fingerprint_message(message)},
+                "json_translation_fingerprints": {
+                    "0": tr.fingerprint_translation(message["original"])
+                },
+                "failed": [0],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # 读入时归一为空审计字段,且兼容性检查不因缺字段报错。
+    loaded = tr.load_progress(progress_path)
+    assert loaded["failed_last_run"] == []
+    assert tr.progress_compatibility_errors(
+        loaded,
+        target_language="zh",
+        context="livestream chat",
+        provider=tr.TRANSLATION_PROVIDER,
+        base_url="https://provider.invalid/v1",
+        model="stub-model",
+        prompt_version=tr.PROMPT_VERSION,
+    ) == []
+
+    record: dict = {}
+    monkeypatch.setattr(tr, "OpenAI", _success_openai(record, "新译文"))
+    monkeypatch.setattr(tr, "BASE_URL", "https://provider.invalid/v1")
+    monkeypatch.setattr(tr, "API_KEY", "stub-key")
+    monkeypatch.setattr(tr, "MODEL", "stub-model")
+    monkeypatch.setattr(
+        tr.sys,
+        "argv",
+        ["translate_chat_openai.py", str(json_path), "--workers", "1"],
+    )
+
+    tr.main()
+
+    assert record["completions"].calls == 1
+    updated = json.loads(json_path.read_text(encoding="utf-8"))
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert updated["messages"][0]["translation"] == "新译文"
+    assert progress["failed"] == []
+    assert progress["failed_last_run"] == []
+
+
+# ---------------------------------------------------------------------------
+# C-O7: sunk .env API-triple reader in common_utils (single implementation)
+# ---------------------------------------------------------------------------
+
+
+def test_translate_api_env_config_reads_env_with_legacy_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """common_utils.translate_api_env_config:OPENAI_COMPAT_* 优先,
+    AGNES_* 逐项回退,未配置为 None;不依赖 __file__/_DOTENV_LOADED_KEYS。"""
+    import common_utils as cu
+
+    _clear_translation_env(monkeypatch)
+    assert cu.translate_api_env_config() == {
+        "base_url": None,
+        "api_key": None,
+        "model": None,
+    }
+
+    monkeypatch.setenv("OPENAI_COMPAT_BASE_URL", "https://compat.invalid/v1")
+    monkeypatch.setenv("OPENAI_COMPAT_MODEL", "compat-model")
+    monkeypatch.setenv("AGNES_API_KEY", "agnes-key")
+    assert cu.translate_api_env_config() == {
+        "base_url": "https://compat.invalid/v1",
+        "api_key": "agnes-key",
+        "model": "compat-model",
+    }
+
+    # 纯 getenv 读取:即使 dotenv 登记集合被测试替换为无关对象也不受影响。
+    monkeypatch.setattr(cu, "_DOTENV_LOADED_KEYS", object())
+    assert cu.translate_api_env_config()["api_key"] == "agnes-key"

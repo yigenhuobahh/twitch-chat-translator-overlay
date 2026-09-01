@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import random
 import re
 import threading
 import time
@@ -94,7 +95,9 @@ def backoff_seconds(kind: str, attempt: int, exc: BaseException | None = None) -
     }.get(kind, 12.0)
     if base <= 0:
         return 0.0
-    return min(120.0, base * (2 ** attempt))
+    # C-O9: 纯指数分支叠加有界随机抖动,避免多 worker 在 429 下按同一节拍
+    # 同步重试形成波次;Retry-After 分支保持服务器指定值不动。
+    return min(120.0, base * (2 ** attempt) + random.uniform(0, base * 0.3))
 
 
 def cache_key(
