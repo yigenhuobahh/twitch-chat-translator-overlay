@@ -122,3 +122,46 @@ def test_output_fps_flag_overrides_source(make_test_video, tmp_path: Path):
     else:
         fps = float(rate)
     assert 23.0 <= fps <= 25.0, rate
+
+
+@pytest.mark.smoke
+def test_output_fps_rational_flag_writes_exact_ntsc_rate(make_test_video, tmp_path: Path):
+    """--output-fps 30000/1001 (N/M) must reach ffmpeg -r as the exact rate.
+
+    Regression: the flag only accepted floats, so an NTSC source explicitly
+    requested as 29.97 encoded at a drifting decimal; the exact rational
+    (30000/1001) is what fps_to_ffmpeg_rate prepares for.
+    """
+    video = make_test_video(duration=2.0, fps=30)
+    html = FIXTURES_DIR / "twitchdownloader_chat.html"
+    out_dir = tmp_path / "out_ntsc"
+    out_dir.mkdir()
+    cmd = [
+        sys.executable, str(SCRIPTS_DIR / "twitch_chat_burn.py"),
+        str(video), str(html),
+        "--fps", "15",
+        "--output-fps", "30000/1001",
+        "--preview-clip", "1",
+        "--out-dir", str(out_dir),
+        "--job-dir", str(out_dir),
+        "--keep-temp",
+        "--offset", "0",
+        "--x", "5", "--y", "20", "--w", "280", "--h", "180",
+        "--overlay-codec", "png",
+    ]
+    r = _run(cmd)
+    assert r.returncode == 0, r.stdout + "\n" + r.stderr
+    final = out_dir / f"{video.stem}_chat.mp4"
+    assert final.is_file()
+    probe = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate,avg_frame_rate",
+            "-of", "json", str(final),
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    info = json.loads(probe.stdout)
+    stream = info["streams"][0]
+    rates = [stream.get("r_frame_rate"), stream.get("avg_frame_rate")]
+    assert "30000/1001" in rates, f"exact NTSC rate missing in probe: {rates}"

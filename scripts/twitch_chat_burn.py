@@ -331,6 +331,24 @@ MESSAGE_BADGE_SIZE = 9
 MESSAGE_GAP = 3
 MESSAGE_INDENT = 12
 
+# Badge title -> display color. Twitch badge titles arrive with arbitrary
+# casing ("Broadcaster", "Moderator"), so lookups normalize via badge_color_for.
+BADGE_COLORS = {
+    "broadcaster": (255, 50, 50),
+    "moderator": (0, 160, 0),
+    "vip": (213, 0, 213),
+    "subscriber": (100, 100, 255),
+    "premium": (0, 169, 255),
+    "verified": (0, 169, 255),
+}
+BADGE_FALLBACK_COLOR = (85, 85, 85)
+
+
+def badge_color_for(title) -> tuple[int, int, int]:
+    """Map a badge title to its color, case/whitespace-insensitive, else gray."""
+    key = str(title or "").split("-")[0].strip().lower()
+    return BADGE_COLORS.get(key, BADGE_FALLBACK_COLOR)
+
 
 def compute_message_header_width(msg, *, padding, badge_size, gap, font, font_bold):
     """Width of badges + author + colon on the first line (before body fragments)."""
@@ -708,6 +726,38 @@ def _quantize_fps(value: float) -> float:
     return v
 
 
+def parse_output_fps_arg(text: str) -> float:
+    """argparse type for --output-fps: decimal ("29.97") or exact rational ("30000/1001").
+
+    Rationals are normalized to float for the config contract; the NTSC family
+    snaps back to the exact rate in _quantize_fps, so fps_to_ffmpeg_rate still
+    emits "30000/1001" for -r instead of a drifting 29.97 decimal.
+    """
+    s = str(text).strip()
+    if "/" in s:
+        num_s, _, den_s = s.partition("/")
+        try:
+            num = float(num_s.strip())
+            den = float(den_s.strip())
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"invalid rational fps value: {text!r} (expected N/M, e.g. 30000/1001)"
+            ) from None
+        if not (math.isfinite(num) and math.isfinite(den)) or den == 0:
+            raise argparse.ArgumentTypeError(f"invalid rational fps value: {text!r}")
+        fps = num / den
+        if not math.isfinite(fps):
+            raise argparse.ArgumentTypeError(f"fps out of range: {text!r}")
+        return fps
+    try:
+        parsed = float(s)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"invalid float value: {text!r}") from exc
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("must be finite")
+    return parsed
+
+
 def fps_to_ffmpeg_rate(fps) -> str:
     """Format fps for ffmpeg -r / -framerate (prefer exact NTSC rationals)."""
     v = _quantize_fps(float(fps))
@@ -866,6 +916,7 @@ def schedule_messages(
 
     dropped_past_duration = 0
     dropped_min_visible = 0
+    dropped_before_start = 0
     for i, m in enumerate(messages):
         source_t = float(m.get("timestamp", 0) or 0)
         # Rate limiting delays on-screen start; lifetime is measured from admit
@@ -881,6 +932,9 @@ def schedule_messages(
         # Keep messages that can still be visible inside the render window,
         # not only those that start before duration.
         if (source_t + life) <= 0:
+            # Ends before the render window opens (e.g. a large negative
+            # --offset); counted and reported below instead of dropped silently.
+            dropped_before_start += 1
             continue
         if t >= duration:
             dropped_past_duration += 1
@@ -939,6 +993,18 @@ def schedule_messages(
                 lane_owners[occupied_lane] = schedule_idx
             last_admitted_at = t
 
+    if dropped_before_start:
+        if not msg_schedule and dropped_before_start * 2 > len(messages):
+            print(
+                f"  [WARN] lanes 调度: {dropped_before_start}/{len(messages)} 条消息时间戳早于 0s "
+                f"且无任何消息上屏，成片将没有弹幕；建议检查 --offset 是否设置过大",
+                flush=True,
+            )
+        else:
+            print(
+                f"  [WARN] lanes 调度: {dropped_before_start} 条消息时间戳早于 0s 未上屏",
+                flush=True,
+            )
     if dropped_past_duration:
         print(
             f"  [WARN] lanes 调度: {dropped_past_duration} 条因 arrival_interval 延后超出 "
@@ -1504,16 +1570,6 @@ def render_overlay(chat_data, out_dir, video_path, config):
             "请安装 CJK 字体或用 --font-path 指定。"
         ) from e
 
-    # Badge 颜色
-    BADGE_COLORS = {
-        "broadcaster": (255, 50, 50),
-        "moderator": (0, 160, 0),
-        "vip": (213, 0, 213),
-        "subscriber": (100, 100, 255),
-        "premium": (0, 169, 255),
-        "verified": (0, 169, 255),
-    }
-
     LINE_H = line_height_px(config.font_size)
     # Layout constants shared by line-count prepass and bitmap render.
     padding = MESSAGE_PAD
@@ -1659,7 +1715,7 @@ def render_overlay(chat_data, out_dir, video_path, config):
         x = padding
         for badge in msg.get("badges") or []:
             title = str((badge or {}).get("title") or "")
-            bc = BADGE_COLORS.get(title.split("-")[0], (85, 85, 85))
+            bc = badge_color_for(title)
             draw.rectangle([x, 3, x + badge_size, 3 + badge_size], fill=bc + (255,))
             x += badge_size + gap
 
@@ -1755,8 +1811,13 @@ def render_overlay(chat_data, out_dir, video_path, config):
                 flush=True,
             )
     else:
-        for i in range(len(messages)):
-            img, nl = message_image(i)
+        # Pre-render only messages the scheduler actually placed on screen.
+        # The composition loop draws bitmaps exclusively from msg_schedule rows,
+        # so eagerly rendering dropped entries (timestamp >= duration, or ended
+        # before t=0) only wasted memory/CPU without changing any output frame.
+        scheduled_indexes = sorted({row[3] for row in msg_schedule})
+        for i in scheduled_indexes:
+            message_image(i)
         print(f"  渲染 {len(msg_images)} 条消息图片", flush=True)
     # --- 生成帧序列 ---
     frames_dir = os.path.join(out_dir, "overlay_frames")
@@ -2778,9 +2839,10 @@ def _main(status_sink=None):
     parser.add_argument("--fps", type=int, default=15, help="弹幕 overlay 渲染帧率 (默认 15；只影响聊天层采样，不强制成片帧率)")
     parser.add_argument(
         "--output-fps",
-        type=float,
+        type=parse_output_fps_arg,
         default=None,
-        help="最终成片视频帧率（只接受小数，如 29.97 / 59.94）；默认跟随源视频。不要与 --fps 混用：--fps 只控弹幕层",
+        help="最终成片视频帧率（小数如 29.97 / 59.94，或精确有理数如 30000/1001）；"
+        "默认跟随源视频。不要与 --fps 混用：--fps 只控弹幕层",
     )
     parser.add_argument(
         "--max-visible",
