@@ -83,7 +83,9 @@ py-modules = [
   "layout_preset",
   "media_health",
   "media_probe",
+  "overlay_compose",
   "overlay_config",
+  "overlay_render",
   "overlay_scene",
   "pipeline_plan",
   "pipeline_runner",
@@ -221,6 +223,8 @@ ignore = [
 "scripts/*.py" = ["E402"]
 # Render hot path uses ALL_CAPS locals (LINE_H, MAX_W) as domain constants.
 "scripts/twitch_chat_burn.py" = ["E402", "N806"]
+"scripts/overlay_render.py" = ["E402", "N806"]
+"scripts/overlay_compose.py" = ["E402"]
 # Tests: pytest naming + short fixtures.
 "tests/**/*.py" = ["N802", "N803", "N806"]
 
@@ -242,7 +246,9 @@ known-first-party = [
   "layout_preset",
   "media_health",
   "media_probe",
+  "overlay_compose",
   "overlay_config",
+  "overlay_render",
   "overlay_scene",
   "pipeline_plan",
   "pipeline_runner",

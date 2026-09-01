@@ -100,14 +100,20 @@ def test_lazy_message_image_cache_evicts(tmp_path: Path, make_test_video):
     # resolve fonts
     from common_utils import resolve_font_paths
     cfg.font_path, cfg.font_bold_path = resolve_font_paths("auto", "auto")
-    frames_dir, duration = burn.render_overlay(chat, str(tmp_path), str(video), cfg)
-    assert duration > 0
-    assert Path(frames_dir).is_dir()
+    # render_overlay returns a RenderResult and no longer writes runtime
+    # results back onto config (main() injects them at the boundary).
+    result = burn.render_overlay(chat, str(tmp_path), str(video), cfg)
+    assert result.duration > 0
+    assert Path(result.frames_dir).is_dir()
     # frames were produced
-    pngs = list(Path(frames_dir).glob("frame_*.png"))
+    pngs = list(Path(result.frames_dir).glob("frame_*.png"))
     assert pngs
-    assert cfg.frame_stats["write"] >= 1
-    assert "written" not in cfg.frame_stats
+    assert result.stats["write"] >= 1
+    assert "written" not in result.stats
+    # No runtime config writebacks: stage_timings / frame_stats stay empty
+    # until main() injects RenderResult values at the pipeline boundary.
+    assert cfg.frame_stats == {}
+    assert cfg.stage_timings == {}
 
 
 def test_render_cn_chat_accepts_layout_preset_flag():

@@ -19,6 +19,8 @@ class OverlayConfig:
     font_bold_path: str = "auto"
     fps: int = 15
     # Final published video FPS (float; may be NTSC 30000/1001). None = probe source.
+    # Result carrier: main() resolves/injects this at the pipeline boundary;
+    # render/compose return it on their result objects and never write here.
     output_fps: float | None = None
     # 0 = auto-fill by overlay box height / font size (resolve_lane_budget).
     max_visible: int = 0
@@ -40,6 +42,8 @@ class OverlayConfig:
     bg_alpha: int = 255
     emote_h: int = 22
     preview_frame: float | None = None
+    # Result carrier: render_overlay returns the published preview path on its
+    # RenderResult; main() injects it here before run_meta / promote logic.
     preview_image: str | None = None
     preview_clip: float | None = None
     # Absolute start of a densest-segment preview clip (seconds on the offset timeline).
@@ -53,6 +57,10 @@ class OverlayConfig:
     message_image_cache_size: int = 256
     no_backup_prev: bool = False
     encode: Any = None  # EncodeOptions | None
+    # Result carriers kept for run_meta dump shape (config.to_dict()). The
+    # constructor args stay accepted for backward compatibility; render/compose
+    # no longer mutate them at runtime — main() injects the values from
+    # RenderResult / ComposeResult at the pipeline boundary.
     stage_timings: dict[str, float] = field(default_factory=dict)
     frame_stats: dict[str, int] = field(default_factory=dict)
 

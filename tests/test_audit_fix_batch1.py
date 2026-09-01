@@ -14,6 +14,7 @@ import pytest
 
 from helpers import load_module
 import media_probe
+import overlay_compose
 
 
 def test_expand_frame_sequence_fails_on_missing_middle_frame(tmp_path: Path):
@@ -315,12 +316,17 @@ def test_compose_publish_restores_bak_on_replace_failure(tmp_path: Path, make_te
             raise OSError("simulated replace failure")
         return real_replace(src, dst)
 
-    with mock.patch.object(burn, "run_tracked", side_effect=fake_run_tracked), mock.patch.object(
-        burn, "validate_rendered_output", side_effect=fake_validate
+    # Patch ownership: compose_video / validate_rendered_output / encode-arg
+    # builders 的调用点在 overlay_compose，patch 必须落在属主模块才能命中
+    # 调用链（门面 twitch_chat_burn 的同名符号只是 re-export 别名）。
+    # media_probe.resolve_output_fps 经 media_probe.<symbol> 属性访问调用，
+    # 继续按属主模块 patch。
+    with mock.patch.object(overlay_compose, "run_tracked", side_effect=fake_run_tracked), mock.patch.object(
+        overlay_compose, "validate_rendered_output", side_effect=fake_validate
     ), mock.patch.object(
-        burn, "resolve_encode_options", side_effect=fake_resolve_encode_options
+        overlay_compose, "resolve_encode_options", side_effect=fake_resolve_encode_options
     ), mock.patch.object(
-        burn, "resolve_source_av_timing", return_value={
+        overlay_compose, "resolve_source_av_timing", return_value={
             "source_duration": 1.0,
             "video_start": 0.0,
             "audio_start": 0.0,
@@ -331,11 +337,11 @@ def test_compose_publish_restores_bak_on_replace_failure(tmp_path: Path, make_te
     ), mock.patch.object(
         media_probe, "resolve_output_fps", return_value=10
     ), mock.patch.object(
-        burn, "build_video_encode_args", return_value=["-c:v", "libx264"]
+        overlay_compose, "build_video_encode_args", return_value=["-c:v", "libx264"]
     ), mock.patch.object(
-        burn, "build_audio_encode_args", return_value=["-c:a", "aac"]
+        overlay_compose, "build_audio_encode_args", return_value=["-c:a", "aac"]
     ), mock.patch.object(
-        burn, "summarize_encode_options", return_value="stub"
+        overlay_compose, "summarize_encode_options", return_value="stub"
     ), mock.patch("os.replace", side_effect=flaky_replace):
         result = burn.compose_video(str(video), str(frames), str(tmp_path), config, duration=1.0)
 

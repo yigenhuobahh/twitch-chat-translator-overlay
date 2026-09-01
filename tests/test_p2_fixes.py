@@ -40,8 +40,12 @@ class TestWebMDurationCheck:
         )
         short_summary = {"ok": True, "duration": 1.0, "has_video": True, "has_audio": False}
 
+        # Patch ownership: compose_video 的调用点在 overlay_compose（门面
+        # twitch_chat_burn 只是 re-export 别名），patch 必须落在属主模块上。
+        # expand_frame_sequence_for_ffmpeg 属 overlay_render（渲染侧收尾）；
+        # compose_video 不调用它，此处保留原测试的防御性 patch 并迁移归属。
         with mock.patch("media_probe.probe_media_summary", return_value=short_summary):
-            with mock.patch("twitch_chat_burn.resolve_source_av_timing") as mock_timing:
+            with mock.patch("overlay_compose.resolve_source_av_timing") as mock_timing:
                 mock_timing.return_value = {
                     "has_audio": False,
                     "video_lead_in": 0.0,
@@ -50,17 +54,17 @@ class TestWebMDurationCheck:
                     "audio_start": 0.0,
                 }
                 with mock.patch("media_probe.resolve_output_fps", return_value=30):
-                    with mock.patch("twitch_chat_burn.run_tracked") as mock_run:
+                    with mock.patch("overlay_compose.run_tracked") as mock_run:
                         mock_run.return_value = mock.Mock(returncode=0)
-                        with mock.patch("twitch_chat_burn.build_webm_encode_args", return_value=[]):
-                            with mock.patch("twitch_chat_burn.build_video_encode_args", return_value=[]):
-                                with mock.patch("twitch_chat_burn.build_audio_encode_args", return_value=[]):
+                        with mock.patch("overlay_compose.build_webm_encode_args", return_value=[]):
+                            with mock.patch("overlay_compose.build_video_encode_args", return_value=[]):
+                                with mock.patch("overlay_compose.build_audio_encode_args", return_value=[]):
                                     with mock.patch(
-                                        "twitch_chat_burn.missing_frame_indexes",
+                                        "overlay_compose.missing_frame_indexes",
                                         return_value=[],
                                     ):
                                         with mock.patch(
-                                            "twitch_chat_burn.expand_frame_sequence_for_ffmpeg",
+                                            "overlay_render.expand_frame_sequence_for_ffmpeg",
                                             return_value=None,
                                         ):
                                             result = burn.compose_video(

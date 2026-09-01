@@ -16,6 +16,8 @@ import pytest
 
 from helpers import load_module
 import media_probe
+import overlay_compose
+import overlay_render
 
 
 @pytest.fixture(scope="module")
@@ -356,16 +358,29 @@ def _configure_fake_main(
     def fake_render(_chat_data, out_dir, _video_path, config):
         frames = Path(out_dir) / "overlay_frames"
         frames.mkdir(parents=True, exist_ok=True)
+        preview_path = None
         if config.preview_frame is not None:
             preview_path = Path(out_dir) / "video_preview_1s.png"
             preview_path.write_bytes(b"png")
-            config.preview_image = str(preview_path)
-        return str(frames), 2.0
+        # render_overlay returns RenderResult; main() injects preview_path etc.
+        return overlay_render.RenderResult(
+            frames_dir=str(frames),
+            duration=2.0,
+            frame_count=1,
+            stats={"write": 1},
+            timings={"render_frames": 0.1},
+            preview_path=str(preview_path) if preview_path else None,
+        )
 
     def fake_compose(_video_path, _frames_dir, out_dir, _config, _duration):
         result = Path(out_dir) / "video_chat.mp4"
         result.write_bytes(b"finished-video")
-        return str(result)
+        return overlay_compose.ComposeResult(
+            output_path=str(result),
+            output_fps=29.97,
+            summary={},
+            timings={},
+        )
 
     monkeypatch.setattr(burn, "render_overlay", fake_render)
     monkeypatch.setattr(burn, "compose_video", fake_compose)

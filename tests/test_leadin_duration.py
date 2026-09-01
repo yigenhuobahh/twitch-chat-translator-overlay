@@ -201,14 +201,21 @@ def _write_blank_frames(frames_dir: Path, count: int) -> None:
 
 
 def _spy_on_run_tracked(burn, recorded: list) -> mock.Mock:
-    """Record every run_tracked argv while still running the real command."""
-    original = burn.run_tracked
+    """Record every run_tracked argv while still running the real command.
+
+    run_tracked 的调用点在 overlay_compose.compose_video（门面
+    twitch_chat_burn.run_tracked 只是 re-export 别名），spy 必须落在属主
+    模块上才能看到 compose 的 ffmpeg 调用。``burn`` 参数保留以兼容调用点。
+    """
+    import overlay_compose
+
+    original = overlay_compose.run_tracked
 
     def spy(cmd, *args, **kwargs):
         recorded.append([str(c) for c in cmd])
         return original(cmd, *args, **kwargs)
 
-    return mock.patch.object(burn, "run_tracked", side_effect=spy)
+    return mock.patch.object(overlay_compose, "run_tracked", side_effect=spy)
 
 
 @pytest.mark.smoke
@@ -253,7 +260,9 @@ def test_compose_audio_late_source_stays_av_aligned(tmp_path: Path):
 
     recorded_cmds: list = []
     with _spy_on_run_tracked(burn, recorded_cmds):
-        out = burn.compose_video(str(src), str(frames_dir), str(tmp_path), config, duration=duration)
+        compose_result = burn.compose_video(str(src), str(frames_dir), str(tmp_path), config, duration=duration)
+    # compose_video returns ComposeResult (output_path/...), None on failure.
+    out = compose_result.output_path if compose_result else None
 
     assert out is not None and Path(out).is_file(), "real compose failed (see compose stdout)"
     # compose_video returning non-None means the REAL validate_rendered_output
@@ -333,7 +342,9 @@ def test_compose_lead_in_tail_cap_and_validate_floors(tmp_path: Path):
 
     recorded_cmds: list = []
     with _spy_on_run_tracked(burn, recorded_cmds):
-        out = burn.compose_video(str(src), str(frames_dir), str(tmp_path), config, duration=duration)
+        compose_result = burn.compose_video(str(src), str(frames_dir), str(tmp_path), config, duration=duration)
+    # compose_video returns ComposeResult (output_path/...), None on failure.
+    out = compose_result.output_path if compose_result else None
 
     assert out is not None and Path(out).is_file(), "real compose failed (see compose stdout)"
     mux_cmds = [c for c in recorded_cmds if "-movflags" in c]

@@ -8,6 +8,10 @@ Twitch Chat Overlay Tool
 用法:
   python twitch_chat_burn.py <video.mp4> <chat.html> [选项]
 
+实现布局: 本模块现在是 CLI 门面（argparse / 预览时间窗规划 / 主流程编排）。
+渲染与合成的实现分别位于 overlay_render.py / overlay_compose.py，其余
+提取模块见下方 re-export 区。tests 仍可消费本模块的扁平命名空间。
+
 示例:
   python twitch_chat_burn.py "video.mp4" "chat.html"
   python twitch_chat_burn.py "video.mp4" "chat.html" --x 15 --y 327 --w 497 --h 363
@@ -22,63 +26,14 @@ Twitch Chat Overlay Tool
 """
 
 import argparse
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict  # noqa: F401  (re-exported; REND-N9)
 import json
 import math
 import os
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import sys
-import time
-
-_PREVIEW_FRAME_TIMEOUT_SECONDS = 120.0
-_MAX_EMOTE_ANIMATION_FRAMES = 300
-_MAX_EMOTE_SOURCE_PIXELS = 4_000_000
-_MAX_EMOTE_DECODED_BYTES_PER_ASSET = 32 * 1024 * 1024
-_MAX_EMOTE_DECODED_BYTES_TOTAL = 256 * 1024 * 1024
-
-# Chat fade envelope (seconds): message alpha ramps in over FADE_IN_SECONDS from
-# its first visible frame and out over FADE_OUT_SECONDS before it leaves.
-FADE_IN_SECONDS = 0.3
-FADE_OUT_SECONDS = 0.5
-
-
-def emote_decode_plan(
-    width,
-    height,
-    frame_count,
-    target_height,
-    remaining_bytes,
-):
-    """Validate one emote before Pillow materializes every animation frame."""
-    width = int(width)
-    height = int(height)
-    frame_count = int(frame_count)
-    target_height = int(target_height)
-    remaining_bytes = max(0, int(remaining_bytes))
-    if width <= 0 or height <= 0 or frame_count <= 0 or target_height <= 0:
-        raise ValueError("emote dimensions, frame count, and target height must be positive")
-    if width * height > _MAX_EMOTE_SOURCE_PIXELS:
-        raise ValueError(f"emote source has too many pixels ({width}x{height})")
-    if frame_count > _MAX_EMOTE_ANIMATION_FRAMES:
-        raise ValueError(
-            f"emote animation has too many frames "
-            f"({frame_count} > {_MAX_EMOTE_ANIMATION_FRAMES})"
-        )
-    target_width = max(1, int(width * target_height / height))
-    decoded_bytes = target_width * target_height * 4 * frame_count
-    if decoded_bytes > _MAX_EMOTE_DECODED_BYTES_PER_ASSET:
-        raise ValueError(
-            f"emote decoded size exceeds per-asset budget ({decoded_bytes} bytes)"
-        )
-    if decoded_bytes > remaining_bytes:
-        raise ValueError(
-            f"emote decoded size exceeds remaining global budget ({decoded_bytes} bytes)"
-        )
-    return target_width, decoded_bytes
-
 
 # Allow sibling imports when loaded as a script or via importlib from tests.
 _SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -110,17 +65,27 @@ from common_utils import (
 
 # Windows runners often use cp1252; Chinese prints must not crash the CLI.
 ensure_utf8_stdio()
+# ============================================================
+# Extracted modules: media probe / text layout / scheduling / translation IO
+# ============================================================
+# These regions moved to dedicated modules; this facade re-exports every
+# moved symbol so scripts and tests keep the flat ``twitch_chat_burn``
+# namespace. Internal callers address probes via ``media_probe.<symbol>``
+# attribute access so monkeypatching the owner module keeps working.
+import chat_schedule
+import chat_text_layout
 from encode_options import (
-    build_audio_encode_args,
-    build_video_encode_args,
-    build_webm_encode_args,
+    build_audio_encode_args,  # noqa: F401  (re-exported; owner use in overlay_compose)
+    build_video_encode_args,  # noqa: F401
+    build_webm_encode_args,  # noqa: F401
     resolve_encode_options,
     summarize_encode_options,
 )
 from layout_preset import apply_layout_preset_to_namespace, load_layout_preset
+import media_probe
 from overlay_config import OverlayConfig
 import overlay_scene as _overlay_scene
-from overlay_scene import (
+from overlay_scene import (  # noqa: F401  (planning re-exports below)
     OverlayScenePlan,
     frame_index_range,
     line_height_px,
@@ -134,9 +99,9 @@ from process_util import (
     is_dangerous_publish_path,
     make_job_dir,
     path_is_under,
-    run_tracked,
+    run_tracked,  # noqa: F401  (re-exported; owner use in overlay_compose)
 )
-from render_perf import (
+from render_perf import (  # noqa: F401  (frame-store helpers re-exported)
     blank_gap_frame_indexes,
     ensure_render_disk_headroom,
     expand_frame_sequence_for_ffmpeg,
@@ -145,25 +110,6 @@ from render_perf import (
 )
 from render_preset import apply_render_preset_to_namespace, load_render_preset
 from run_meta import mark_run_status, write_run_meta
-
-# Compatibility exports for existing scripts and tests.  Scene planning owns
-# their definitions, while this module remains the established render facade.
-AUTO_LAZY_MESSAGE_THRESHOLD = _overlay_scene.AUTO_LAZY_MESSAGE_THRESHOLD
-compute_lane_capacity = _overlay_scene.compute_lane_capacity
-expected_overlay_frame_count = _overlay_scene.expected_overlay_frame_count
-resolve_message_image_cache_policy = _overlay_scene.resolve_message_image_cache_policy
-
-# ============================================================
-# Extracted modules: media probe / text layout / scheduling / translation IO
-# ============================================================
-# These regions moved to dedicated modules; this facade re-exports every
-# moved symbol so scripts and tests keep the flat ``twitch_chat_burn``
-# namespace. Internal callers address probes via ``media_probe.<symbol>``
-# attribute access so monkeypatching the owner module keeps working.
-
-import chat_schedule
-import chat_text_layout
-import media_probe
 import translation_io
 
 # media_probe: ffprobe wrappers (lru-cached per absolute path + stat signature).
@@ -211,6 +157,52 @@ translation_json_nonempty_count = translation_io.translation_json_nonempty_count
 build_export_translation_payload = translation_io.build_export_translation_payload
 write_export_translation_json = translation_io.write_export_translation_json
 apply_imported_translations = translation_io.apply_imported_translations
+
+# Compatibility exports for existing scripts and tests.  Scene planning owns
+# their definitions, while this module remains the established render facade.
+AUTO_LAZY_MESSAGE_THRESHOLD = _overlay_scene.AUTO_LAZY_MESSAGE_THRESHOLD
+compute_lane_capacity = _overlay_scene.compute_lane_capacity
+expected_overlay_frame_count = _overlay_scene.expected_overlay_frame_count
+resolve_message_image_cache_policy = _overlay_scene.resolve_message_image_cache_policy
+
+# ============================================================
+# Extracted modules: overlay render / overlay compose
+# ============================================================
+# render_overlay + FrameRenderer live in overlay_render.py; compose_video and
+# the A/V timing / output-validation cluster live in overlay_compose.py. The
+# facade re-exports every moved symbol. Result objects (RenderResult /
+# ComposeResult) replaced the old runtime config writebacks — main() injects
+# result values into OverlayConfig at the pipeline boundary. Tests patch the
+# owner modules (overlay_render.X / overlay_compose.X) at the seams.
+import overlay_compose
+import overlay_render
+
+# overlay_render: frame sequence rendering.
+FrameRenderer = overlay_render.FrameRenderer
+RenderResult = overlay_render.RenderResult
+render_overlay = overlay_render.render_overlay
+FADE_IN_SECONDS = overlay_render.FADE_IN_SECONDS
+FADE_OUT_SECONDS = overlay_render.FADE_OUT_SECONDS
+emote_decode_plan = overlay_render.emote_decode_plan
+_store_message_image = overlay_render._store_message_image
+_PREVIEW_FRAME_TIMEOUT_SECONDS = overlay_render._PREVIEW_FRAME_TIMEOUT_SECONDS
+_MAX_EMOTE_ANIMATION_FRAMES = overlay_render._MAX_EMOTE_ANIMATION_FRAMES
+_MAX_EMOTE_SOURCE_PIXELS = overlay_render._MAX_EMOTE_SOURCE_PIXELS
+_MAX_EMOTE_DECODED_BYTES_PER_ASSET = overlay_render._MAX_EMOTE_DECODED_BYTES_PER_ASSET
+_MAX_EMOTE_DECODED_BYTES_TOTAL = overlay_render._MAX_EMOTE_DECODED_BYTES_TOTAL
+
+# overlay_compose: A/V timing, output validation, mux pipeline.
+# Naming contract (audit_cli_clean guard): compose publishes
+# Path(video_path).stem + "_chat.mp4" (implementation in overlay_compose).
+ComposeResult = overlay_compose.ComposeResult
+compose_video = overlay_compose.compose_video
+detect_frame_start_number = overlay_compose.detect_frame_start_number
+get_stream_start_time = overlay_compose.get_stream_start_time
+resolve_source_av_timing = overlay_compose.resolve_source_av_timing
+expected_compose_duration = overlay_compose.expected_compose_duration
+_default_max_extra_seconds = overlay_compose._default_max_extra_seconds
+validate_rendered_output = overlay_compose.validate_rendered_output
+build_audio_encode_args_for_compose = overlay_compose.build_audio_encode_args_for_compose
 
 
 # Absolute layout presets (layout_default / layout_mobile / CLI defaults) are
@@ -403,1217 +395,6 @@ def layout_bounds_warnings(config, video_path) -> list[str]:
     return warns
 
 
-def _store_message_image(msg_images, msg_lines, idx, image, nl, *, lazy, cache_cap):
-    msg_lines[idx] = nl
-    msg_images[idx] = image
-    msg_images.move_to_end(idx)
-    if lazy:
-        while len(msg_images) > cache_cap:
-            evicted_idx, _image = msg_images.popitem(last=False)
-            msg_lines.pop(evicted_idx, None)
-    return len(msg_images)
-
-
-def render_overlay(chat_data, out_dir, video_path, config):
-    """渲染聊天覆盖层为 PNG 帧序列。"""
-    from PIL import Image, ImageDraw, ImageFont
-
-    print("[2/4] 渲染 overlay 帧序列...", flush=True)
-
-    messages = chat_data["messages"]
-    emote_map = chat_data.get("emote_map", {})
-
-    # GIF / animated WebP 不能直接 convert，否则只会取第一帧。
-    # 预解码后按消息显示时间选择动画帧。
-    emote_imgs = {}
-    decoded_emote_bytes = 0
-    for cls, path in emote_map.items():
-        try:
-            with Image.open(path) as source:
-                frame_count = int(getattr(source, "n_frames", 1) or 1)
-                target_width, decoded_bytes = emote_decode_plan(
-                    source.width,
-                    source.height,
-                    frame_count,
-                    config.emote_h,
-                    _MAX_EMOTE_DECODED_BYTES_TOTAL - decoded_emote_bytes,
-                )
-                frames = []
-                durations = []
-                for frame_index in range(frame_count):
-                    source.seek(frame_index)
-                    image = source.convert("RGBA")
-                    if (
-                        image.width != target_width
-                        or image.height != config.emote_h
-                    ):
-                        image = image.resize(
-                            (target_width, config.emote_h),
-                            Image.LANCZOS,
-                        )
-                    frames.append(image)
-                    durations.append(
-                        max(10, int(source.info.get("duration", 100)))
-                    )
-            if not frames:
-                raise ValueError("emote has no decodable frames")
-            decoded_emote_bytes += decoded_bytes
-            emote_imgs[cls] = {
-                "frames": frames,
-                "durations": durations,
-                "cycle_ms": sum(durations),
-                "width": frames[0].width,
-            }
-            state = f"动画 {len(frames)} 帧" if len(frames) > 1 else "静态"
-            print(
-                f"  emote: {cls} "
-                f"({frames[0].width}x{frames[0].height}, {state})",
-                flush=True,
-            )
-        except Exception as exc:
-            print(f"  emote 加载失败 {cls}: {exc}", flush=True)
-    def emote_image(cls, message_age=0.0):
-        emote = emote_imgs.get(cls)
-        if not emote:
-            return None
-        if len(emote["frames"]) == 1:
-            return emote["frames"][0]
-        elapsed_ms = int(max(0.0, message_age) * 1000) % emote["cycle_ms"]
-        elapsed = 0
-        for img, frame_duration in zip(emote["frames"], emote["durations"]):
-            elapsed += frame_duration
-            if elapsed_ms < elapsed:
-                return img
-        return emote["frames"][-1]
-
-    def emote_width(cls):
-        return emote_imgs[cls]["width"]
-
-    # 字体
-    try:
-        font = ImageFont.truetype(config.font_path, config.font_size)
-        font_bold = ImageFont.truetype(config.font_bold_path or config.font_path, config.font_size)
-    except OSError as e:
-        raise RuntimeError(
-            f"无法加载字体: regular={config.font_path!r} bold={config.font_bold_path!r}: {e}. "
-            "请安装 CJK 字体或用 --font-path 指定。"
-        ) from e
-
-    LINE_H = line_height_px(config.font_size)
-    # Layout constants shared by line-count prepass and bitmap render.
-    padding = MESSAGE_PAD
-    badge_size = MESSAGE_BADGE_SIZE
-    gap = MESSAGE_GAP
-    indent = MESSAGE_INDENT
-
-    # Build the immutable scene budget before the line-count prepass, scheduling,
-    # or generating frames (its duration drives the prepass skip below).
-    scene = OverlayScenePlan.from_config(
-        source_duration=media_probe.probe_video_duration(video_path),
-        config=config,
-        message_count=len(messages),
-    )
-    MSG_LIFETIME = config.msg_lifetime
-    raw_max_visible = scene.raw_max_visible
-    auto_capacity = scene.auto_capacity
-    stack_mode = scene.stack_mode
-    MAX_VISIBLE = scene.max_visible
-    if raw_max_visible <= 0:
-        print(
-            f"  max_visible=auto → {MAX_VISIBLE} lanes "
-            f"(height={config.height}px, font={config.font_size}px, LINE_H={line_height_px(config.font_size)})",
-            flush=True,
-        )
-    elif scene.budget_warning:
-        print(f"  [WARN] {scene.budget_warning}", flush=True)
-    print(f"  stack_mode={stack_mode}", flush=True)
-
-    duration = scene.duration
-    print(f"  视频时长: {scene.source_duration:.1f}s", flush=True)
-    # preview_clip may start mid-video (densest window). Chat timestamps are rebased
-    # to 0 in main() when clip_start > 0; compose seeks the source with -ss.
-    # Here we only shorten the render duration to the clip length.
-    if scene.preview_clip is not None:
-        clip_len = scene.preview_clip
-        clip_start = scene.preview_clip_start
-        if clip_start > 1e-6:
-            print(
-                f"  预览短片模式: 源窗口 [{clip_start:.1f}s, {clip_start + clip_len:.1f}s] "
-                f"(聊天已 rebase→0，渲染时长 {duration:.1f}s)",
-                flush=True,
-            )
-        else:
-            print(f"  预览短片模式: 仅渲染前 {duration:.1f}s", flush=True)
-
-    # --- 预计算每条消息的行数（用于 lane 分配）---
-    MAX_W = config.width - 4
-    def text_width(s):
-        bb = font.getbbox(s)
-        return bb[2] - bb[0]
-
-    max_message_lines = max(0, int(getattr(config, "max_message_lines", 0) or 0))
-
-    def calc_msg_lines(msg):
-        """计算消息需要多少行（与 render_message 共用 layout_message_lines）。"""
-        _lines, _header, num_lines = layout_message_lines(
-            msg,
-            max_w=MAX_W,
-            font=font,
-            font_bold=font_bold,
-            text_width_fn=text_width,
-            emote_width_fn=emote_width,
-            emote_available_fn=lambda cls: cls in emote_imgs,
-            max_message_lines=max_message_lines,
-            truncate_with_ellipsis=False,
-            padding=padding,
-            badge_size=badge_size,
-            gap=gap,
-            indent=indent,
-        )
-        return num_lines
-
-    msg_line_count = {}
-    for i, m in enumerate(messages):
-        # Messages starting at/after the render duration are always dropped by
-        # the scheduler (t >= duration); skip their layout measurement entirely.
-        if float(m.get("timestamp", 0) or 0) >= duration:
-            continue
-        msg_line_count[i] = calc_msg_lines(m)
-
-    if stack_mode == "float":
-        msg_schedule = schedule_messages_float(
-            messages,
-            msg_line_count,
-            duration=duration,
-            capacity_lines=MAX_VISIBLE,
-            arrival_interval=getattr(config, "arrival_interval", 0.0),
-            throttle_from=scene.float_throttle_from,
-        )
-    else:
-        msg_schedule = schedule_messages(
-            messages,
-            msg_line_count,
-            duration=duration,
-            max_visible=MAX_VISIBLE,
-            msg_lifetime=MSG_LIFETIME,
-            min_visible_seconds=getattr(config, "min_visible_seconds", 0.0),
-            arrival_interval=getattr(config, "arrival_interval", 0.0),
-            auto_capacity=auto_capacity,
-        )
-
-    if stack_mode == "float":
-        print(
-            f"  调度(float上浮): {len(msg_schedule)} 条事件, capacity={MAX_VISIBLE} 行",
-            flush=True,
-        )
-    else:
-        lane_counts = Counter(s[2] for s in msg_schedule)
-        print(
-            f"  调度(lanes): {len(msg_schedule)} 条消息, lanes={MAX_VISIBLE}, "
-            f"lane 分布: {dict(sorted(lane_counts.items()))}",
-            flush=True,
-        )
-
-    # --- 渲染单条消息为图片（支持自动换行）---
-    def render_message(msg, message_age=0.0):
-        """渲染单条消息，超宽时自动换行。返回 (image, num_lines)。"""
-        lines, header, num_lines = layout_message_lines(
-            msg,
-            max_w=MAX_W,
-            font=font,
-            font_bold=font_bold,
-            text_width_fn=text_width,
-            emote_width_fn=emote_width,
-            emote_available_fn=lambda cls: cls in emote_imgs,
-            max_message_lines=max_message_lines,
-            truncate_with_ellipsis=True,
-            padding=padding,
-            badge_size=badge_size,
-            gap=gap,
-            indent=indent,
-        )
-        author = header["author"]
-        author_w = header["author_w"]
-        colon_w = header["colon_w"]
-
-        total_h = LINE_H * num_lines
-        img = Image.new("RGBA", (MAX_W, total_h), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-
-        # --- 绘制第一行头部 ---
-        x = padding
-        for badge in msg.get("badges") or []:
-            title = str((badge or {}).get("title") or "")
-            bc = badge_color_for(title)
-            draw.rectangle([x, 3, x + badge_size, 3 + badge_size], fill=bc + (255,))
-            x += badge_size + gap
-
-        color = hex_to_rgb(msg["color"]) if msg.get("color") else (255, 255, 255)
-        draw.text((x + 1, 1), author, fill=(0, 0, 0, 200), font=font_bold)
-        draw.text((x, 0), author, fill=color + (255,), font=font_bold)
-        x += author_w + gap
-
-        draw.text((x + 1, 1), ":", fill=(0, 0, 0, 200), font=font)
-        draw.text((x, 0), ":", fill=(200, 200, 200, 255), font=font)
-        x += colon_w + gap
-
-        # --- 绘制第一行的 fragments ---
-        for fi in lines[0]:
-            if fi[0] == "text":
-                draw.text((x + 1, 1), fi[1], fill=(0, 0, 0, 200), font=font)
-                draw.text((x, 0), fi[1], fill=(239, 239, 239, 255), font=font)
-                x += fi[2]
-            elif fi[0] == "emote":
-                eimg = emote_image(fi[1], message_age)
-                if eimg:
-                    ey = (LINE_H - eimg.height) // 2
-                    img.paste(eimg, (x, ey), eimg)
-                    x += fi[2] + gap
-
-        # --- 绘制续行 ---
-        for line_idx in range(1, num_lines):
-            y = line_idx * LINE_H
-            x = padding + indent
-            for fi in lines[line_idx]:
-                if fi[0] == "text":
-                    draw.text((x + 1, y + 1), fi[1], fill=(0, 0, 0, 200), font=font)
-                    draw.text((x, y), fi[1], fill=(239, 239, 239, 255), font=font)
-                    x += fi[2]
-                elif fi[0] == "emote":
-                    eimg = emote_image(fi[1], message_age)
-                    if eimg:
-                        ey = y + (LINE_H - eimg.height) // 2
-                        img.paste(eimg, (x, ey), eimg)
-                        x += fi[2] + gap
-
-        return img, num_lines
-
-    animated_message_ids = {
-        i for i, message in enumerate(messages)
-        if any(
-            fragment.get("type") == "emote"
-            and len(emote_imgs.get(fragment.get("class", ""), {}).get("frames", [])) > 1
-            for fragment in message["fragments"]
-        )
-    }
-    if animated_message_ids:
-        print(f"  动画表情: {len(animated_message_ids)} 条消息将逐帧更新", flush=True)
-
-    # Message bitmap cache:
-    # - default: pre-render all static message images (predictable, existing behavior)
-    # - --lazy-message-images: only render when a message becomes visible; LRU cap for long VODs
-    lazy_images = scene.lazy_message_images
-    cache_cap = scene.message_image_cache_size
-    auto_lazy = scene.auto_lazy_message_images
-    config.lazy_message_images = lazy_images
-    cache_peak = 0
-    msg_images = OrderedDict()  # idx -> Image
-    msg_lines = {}  # msg_index -> num_lines
-
-    def message_image(idx, message_age=0.0, force_dynamic=False):
-        """Return (img, nl) for message idx; animated/dynamic always re-renders."""
-        nonlocal cache_peak
-        if force_dynamic or idx in animated_message_ids:
-            img, nl = render_message(messages[idx], message_age)
-            msg_lines[idx] = nl
-            return img, nl
-        if idx in msg_images:
-            msg_images.move_to_end(idx)
-            return msg_images[idx], msg_lines.get(idx, 1)
-        img, nl = render_message(messages[idx], 0.0)
-        cache_size = _store_message_image(
-            msg_images, msg_lines, idx, img, nl,
-            lazy=lazy_images,
-            cache_cap=cache_cap,
-        )
-        cache_peak = max(cache_peak, cache_size)
-        return img, nl
-
-    if lazy_images:
-        print(
-            f"  消息图: lazy 模式 (cache_size={cache_cap}, messages={len(messages)})",
-            flush=True,
-        )
-        if auto_lazy:
-            print(
-                f"  消息数达到 {AUTO_LAZY_MESSAGE_THRESHOLD}，已自动启用 lazy 缓存",
-                flush=True,
-            )
-    else:
-        # Pre-render only messages the scheduler actually placed on screen.
-        # The composition loop draws bitmaps exclusively from msg_schedule rows,
-        # so eagerly rendering dropped entries (timestamp >= duration, or ended
-        # before t=0) only wasted memory/CPU without changing any output frame.
-        scheduled_indexes = sorted({row[3] for row in msg_schedule})
-        for i in scheduled_indexes:
-            message_image(i)
-        print(f"  渲染 {len(msg_images)} 条消息图片", flush=True)
-    # --- 生成帧序列 ---
-    frames_dir = os.path.join(out_dir, "overlay_frames")
-    os.makedirs(frames_dir, exist_ok=True)
-    # 清除旧帧
-    for old in os.listdir(frames_dir):
-        if old.endswith(".png"):
-            os.remove(os.path.join(frames_dir, old))
-    ensure_render_disk_headroom(frames_dir)
-
-    FPS = scene.fps
-    W, H = config.width, config.height
-    BG_ALPHA = config.bg_alpha
-
-    # 找 change points
-    preview_frame_time = scene.preview_frame_time
-    if preview_frame_time is not None:
-        preview_t = scene.preview_time
-        assert preview_t is not None
-        change_points = [preview_t, min(duration, preview_t + 1 / max(FPS, 1))]
-        if change_points[1] <= change_points[0]:
-            change_points[1] = change_points[0] + 1 / max(FPS, 1)
-        print(f"  预览帧模式: t={preview_t:.2f}s", flush=True)
-    else:
-        change_points = set()
-        for start, end, _lane, _idx, _nl_sch in msg_schedule:
-            change_points.add(start)
-            change_points.add(end)
-        change_points.add(0)
-        change_points.add(duration)
-        change_points = sorted(cp for cp in change_points if 0 <= cp <= duration)
-
-    # Use a global frame index so short chat segments do not inflate the total
-    # frame count via repeated ceil() rounding.
-    total_frames = scene.total_frames
-    frame_num = 0
-    render_start_time = time.time()
-    last_progress_time = render_start_time
-    reuse_static = bool(getattr(config, "reuse_static_frames", True))
-    skip_blank = bool(getattr(config, "skip_blank_frames", True))
-    blank_hold_seconds = float(getattr(config, "blank_hold_seconds", 0.5) or 0.5)
-    blank_stride = max(1, int(round(blank_hold_seconds * FPS)))
-    stats = {
-        "write": 0,
-        "hardlink": 0,
-        "copy": 0,
-        "reused_static": 0,
-        "blank_sparse": 0,
-        "composited": 0,
-        "filled": 0,
-    }
-    written_indexes: list[int] = []
-    last_static_key = None
-    last_static_frame_idx = None
-    lane_visibility = None if stack_mode == "float" else _LaneVisibilityCursor(msg_schedule)
-
-    for cp_idx in range(len(change_points)):
-        cp = change_points[cp_idx]
-        next_cp = change_points[cp_idx + 1] if cp_idx + 1 < len(change_points) else duration
-
-        if stack_mode == "float":
-            # Bottom-up Twitch stack: recompute lanes from currently active messages.
-            visible = active_float_stack(msg_schedule, cp, MAX_VISIBLE)
-        else:
-            visible = lane_visibility.at(cp)
-
-        if preview_frame_time is not None:
-            frame_indexes = [0]
-        else:
-            start_i, end_i = frame_index_range(cp, next_cp, FPS, total_frames)
-            # Fully blank segments: only materialize sparse keyframes, then expand later.
-            if skip_blank and not visible and preview_frame_time is None:
-                frame_indexes = blank_gap_frame_indexes(start_i, end_i, hold_stride=blank_stride)
-                stats["blank_sparse"] += max(0, (end_i - start_i) - len(frame_indexes))
-            else:
-                frame_indexes = list(range(start_i, end_i))
-
-        # Static segment key: same visible message set, none animated, and no fade edges
-        # inside this change-point range. Safe to draw once and hardlink the rest.
-        # Blank segments are also static (fully transparent).
-        # IMPORTANT: fade-in (first FADE_IN_SECONDS) / fade-out (last FADE_OUT_SECONDS)
-        # make alpha time-dependent.
-        # Even with change_points at start/end, the *boundary segment that still contains*
-        # the fade window must NOT be static-reused, or every hardlinked frame freezes
-        # the first (or last) alpha sample.
-        segment_has_anim = any(idx in animated_message_ids for _lane, idx, _s, _e, _nl in visible)
-        segment_has_fade = any(
-            (cp < (start + FADE_IN_SECONDS) and next_cp > start)
-            or (cp < end and next_cp > (end - FADE_OUT_SECONDS))
-            for _lane, idx, start, end, _nl in visible
-        )
-        static_key = None
-        if reuse_static and not segment_has_anim and not segment_has_fade and preview_frame_time is None:
-            if not visible:
-                static_key = ("__blank__",)
-            else:
-                static_key = tuple((lane, idx, nl_sch) for lane, idx, _s, _e, nl_sch in visible)
-
-        segment_template = None
-        segment_template_idx = None
-
-        for frame_i in frame_indexes:
-            # Always use clamped preview_t for visibility (not raw preview_frame_time,
-            # which can sit past duration and empty the stack at EOF).
-            if preview_frame_time is not None:
-                current_t = preview_t
-            else:
-                current_t = frame_i / float(FPS)
-            if preview_frame_time is None and current_t >= duration:
-                break
-
-            out_frame_num = 0 if preview_frame_time is not None else frame_i
-            if frame_num % 256 == 0:
-                ensure_render_disk_headroom(frames_dir)
-
-            # Reuse previous identical static frame without re-compositing.
-            if (
-                static_key is not None
-                and segment_template is not None
-                and segment_template_idx is not None
-                and static_key == last_static_key
-            ):
-                action = write_or_reuse_frame(
-                    frames_dir,
-                    out_frame_num,
-                    segment_template,
-                    reuse_from=segment_template_idx,
-                )
-                stats[action] = stats.get(action, 0) + 1
-                stats["reused_static"] += 1
-                written_indexes.append(out_frame_num)
-                frame_num += 1
-                continue
-
-            if (
-                static_key is not None
-                and last_static_key == static_key
-                and last_static_frame_idx is not None
-                and segment_template is None
-            ):
-                # Carry reuse across change-point boundaries with same visible set.
-                action = write_or_reuse_frame(
-                    frames_dir,
-                    out_frame_num,
-                    None,
-                    reuse_from=last_static_frame_idx,
-                )
-                stats[action] = stats.get(action, 0) + 1
-                stats["reused_static"] += 1
-                segment_template_idx = last_static_frame_idx
-                # Keep a dummy non-None marker so subsequent frames in this segment reuse.
-                segment_template = True
-                written_indexes.append(out_frame_num)
-                frame_num += 1
-                continue
-
-            if visible and BG_ALPHA:
-                # Reuse one solid chat-box background (avoids per-frame full alloc when possible).
-                frame = Image.new("RGBA", (W, H), (0, 0, 0, BG_ALPHA))
-            else:
-                frame = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-
-            if visible:
-                for lane, idx, start, end, nl_vis in visible:
-                    if idx in animated_message_ids:
-                        msg_img, nl = message_image(idx, current_t - start, force_dynamic=True)
-                    else:
-                        msg_img, nl = message_image(idx)
-                    if msg_img:
-                        # Schedule may clamp overlong messages to max_visible lanes.
-                        # Crop the bitmap so layout matches lane assignment.
-                        if nl_vis and nl and nl > nl_vis:
-                            crop_h = max(1, LINE_H * int(nl_vis))
-                            if msg_img.height > crop_h:
-                                msg_img = msg_img.crop((0, 0, msg_img.width, crop_h))
-                            nl = int(nl_vis)
-                        msg_h = LINE_H * nl
-                        y = H - (lane + 1) * LINE_H - 4 - (msg_h - LINE_H)
-                        # 确保 y 不会超出顶部
-                        if y < 0:
-                            y = 0
-                        age = current_t - start
-                        remaining = end - current_t
-                        alpha = 255
-                        if age < FADE_IN_SECONDS:
-                            alpha = int(255 * min(1.0, max(0.0, age / FADE_IN_SECONDS)))
-                        elif remaining < FADE_OUT_SECONDS:
-                            alpha = int(255 * max(0.0, remaining / FADE_OUT_SECONDS))
-
-                        if alpha < 255:
-                            msg_img = msg_img.copy()
-                            r, g, b, a = msg_img.split()
-                            # Bind alpha as default so the lambda does not close over the loop var.
-                            a = a.point(lambda v, alpha=alpha: int(v * alpha / 255))
-                            msg_img = Image.merge("RGBA", (r, g, b, a))
-
-                        frame.paste(msg_img, (2, y), msg_img)
-
-            action = write_or_reuse_frame(frames_dir, out_frame_num, frame, reuse_from=None)
-            stats[action] = stats.get(action, 0) + 1
-            stats["composited"] += 1
-            written_indexes.append(out_frame_num)
-            frame_num += 1
-
-            if static_key is not None:
-                segment_template = frame
-                segment_template_idx = out_frame_num
-                last_static_key = static_key
-                last_static_frame_idx = out_frame_num
-            else:
-                last_static_key = None
-                last_static_frame_idx = None
-
-        # 进度
-        now = time.time()
-        if (cp_idx + 1) % 10 == 0 or cp_idx == len(change_points) - 1 or now - last_progress_time >= 5:
-            # Progress against timeline coverage, not sparse write count.
-            covered = len(set(written_indexes))
-            pct = (covered / total_frames * 100) if total_frames > 0 else 100
-            elapsed = now - render_start_time
-            if covered > 0 and covered < total_frames:
-                eta = elapsed / covered * (total_frames - covered)
-                eta_str = f" ETA {int(eta//60)}m{int(eta%60)}s"
-            else:
-                eta_str = ""
-            print(
-                f"  [{cp_idx+1}/{len(change_points)}] t={cp:.1f}s {len(visible)}msgs "
-                f"{pct:.0f}% write={stats['write']} reuse={stats['reused_static']}{eta_str}",
-                flush=True,
-            )
-            last_progress_time = now
-        if preview_frame_time is not None:
-            break
-
-    # Materialize full contiguous sequence for FFmpeg demuxer when blank gaps were sparse.
-    # Missing frames must fail hard — FFmpeg image2 would otherwise silently emit a short overlay.
-    if preview_frame_time is None and total_frames > 0:
-        fill_stats = expand_frame_sequence_for_ffmpeg(frames_dir, total_frames, written_indexes)
-        stats["filled"] += int(fill_stats.get("filled", 0))
-        stats["hardlink"] += int(fill_stats.get("hardlink", 0))
-        stats["copy"] += int(fill_stats.get("copy", 0))
-        # expand_frame_sequence_for_ffmpeg ends with its own contiguous-coverage
-        # hard guarantee; keep only the on-disk count cross-check before compose.
-        final_count = len(
-            [n for n in os.listdir(frames_dir) if n.startswith("frame_") and n.endswith(".png")]
-        )
-        if final_count != total_frames:
-            raise RuntimeError(
-                f"render_overlay: disk frame count {final_count} != target {total_frames}; "
-                f"refuse incomplete overlay under {frames_dir}"
-            )
-        frame_num = final_count
-
-    elapsed_total = time.time() - render_start_time
-    stats["message_cache_peak"] = cache_peak
-    stats["lazy_message_images"] = int(lazy_images)
-    stats["auto_lazy_message_images"] = int(auto_lazy)
-    config.frame_stats = stats
-    config.stage_timings = dict(getattr(config, "stage_timings", {}) or {})
-    config.stage_timings["render_frames"] = elapsed_total
-    print(
-        f"  完成: {frame_num} 帧, 用时 {int(elapsed_total//60)}m{int(elapsed_total%60)}s "
-        f"(write={stats['write']}, hardlink={stats['hardlink']}, copy={stats['copy']}, "
-        f"static_reuse={stats['reused_static']}, blank_sparse={stats['blank_sparse']}, filled={stats['filled']})",
-        flush=True,
-    )
-    if preview_frame_time is not None:
-        default_name = f"{Path(video_path).stem}_preview_{preview_t:.1f}s.png".replace(".0s", "s")
-        requested_preview = getattr(config, "preview_image", None)
-        # Always write under out_dir first (safe job/temp location).
-        if requested_preview:
-            safe_name = os.path.basename(str(requested_preview)) or default_name
-        else:
-            safe_name = default_name
-        preview_path = os.path.join(out_dir, safe_name)
-        bg_path = os.path.join(out_dir, "preview_video_frame.png")
-        # Accurate single-frame extract for preview alignment. -ss MUST bind to
-        # the input (placed before -i): input seek jumps straight to the nearest
-        # keyframe at/before the target and decodes only from there. Output seek
-        # (-ss after -i) decodes the whole prefix first — O(t) work that reliably
-        # blew the 120s timeout on mid-VOD previews. compose_video's dense/mid
-        # preview seek uses the same input-seek ordering.
-        try:
-            r = subprocess.run(
-                [
-                    require_executable("ffmpeg"), "-y",
-                    "-ss", str(preview_t), "-i", video_path,
-                    "-frames:v", "1", bg_path,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=_PREVIEW_FRAME_TIMEOUT_SECONDS,
-            )
-            preview_error = (r.stderr or "ffmpeg failed")[-300:]
-        except subprocess.TimeoutExpired:
-            r = None
-            preview_error = (
-                f"单帧抽取超过 {_PREVIEW_FRAME_TIMEOUT_SECONDS:g}s，已终止"
-            )
-        if r is not None and r.returncode == 0 and os.path.isfile(bg_path):
-            bg = Image.open(bg_path).convert("RGBA")
-            overlay = Image.open(os.path.join(frames_dir, "frame_00000.png")).convert("RGBA")
-            bg.paste(overlay, (config.x, config.y), overlay)
-            bg.save(preview_path)
-            try:
-                os.remove(bg_path)
-            except OSError:
-                pass
-        else:
-            print(f"  警告: 无法抽取视频帧，改为输出 overlay 透明图: {preview_error}", flush=True)
-            Image.open(os.path.join(frames_dir, "frame_00000.png")).save(preview_path)
-        # If user requested a path outside out_dir, also publish a copy there after
-        # the safe write (explicit user intent; still keep the in-job copy).
-        if requested_preview:
-            try:
-                req_abs = os.path.abspath(str(requested_preview))
-                if not path_is_under(req_abs, out_dir) and os.path.isfile(preview_path):
-                    # Safety: preview is already written under out_dir; this copy
-                    # publishes to the user-requested location as a convenience.
-                    # Refuse OS system directories (Windows + Unix/macOS).
-                    if is_dangerous_publish_path(req_abs):
-                        print(f"  警告: --preview-image 路径在系统目录下，已跳过复制: {req_abs}", flush=True)
-                    else:
-                        os.makedirs(os.path.dirname(req_abs) or ".", exist_ok=True)
-                        shutil.copy2(preview_path, req_abs)
-                        print(f"  预览图已复制到请求路径: {req_abs}", flush=True)
-                        preview_path = req_abs
-            except OSError as e:
-                print(f"  警告: 无法复制预览图到请求路径: {e}", flush=True)
-        # Stash actual path so main() can promote/report the right file.
-        config.preview_image = preview_path
-        print(f"  预览图: {preview_path}", flush=True)
-    return frames_dir, duration
-
-
-# ============================================================
-# 3. 合成视频
-# ============================================================
-
-def detect_frame_start_number(frames_dir):
-    """Return the first numeric frame id in frame_%05d.png sequences."""
-    numbers = []
-    for name in os.listdir(frames_dir):
-        m = re.fullmatch(r"frame_(\d+)\.png", name)
-        if m:
-            numbers.append(int(m.group(1)))
-    return min(numbers) if numbers else 0
-
-
-def get_stream_start_time(video_path, stream_selector):
-    """读取流起始时间；缺失/异常时回退 0。"""
-    try:
-        probe = subprocess.run(
-            [
-                require_executable("ffprobe"), "-v", "error", "-select_streams", stream_selector,
-                "-show_entries", "stream=start_time", "-of", "csv=p=0", video_path,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=_PROBE_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired:
-        return 0.0
-    try:
-        raw = (probe.stdout or "").strip().splitlines()
-        if not raw:
-            return 0.0
-        value = float(raw[0] or 0)
-        return value if math.isfinite(value) else 0.0
-    except ValueError:
-        return 0.0
-
-
-def resolve_source_av_timing(video_path, source_has_audio=None):
-    """Probe container/audio/video timing used by compose + validation.
-
-    Returns dict:
-      source_duration, video_start, audio_start, video_lead_in, has_audio
-      + audio_late: >=0 seconds by which the audio stream starts AFTER the
-        video (mirror of video_lead_in, which measures video after audio).
-        Compose uses it to re-insert the offset the audio branch's asetpts
-        erases (see compose_video).
-    """
-    source_summary = media_probe.probe_media_summary(video_path)
-    has_audio = (
-        bool(source_has_audio)
-        if source_has_audio is not None
-        else bool(source_summary.get("has_audio"))
-    )
-    video_start = get_stream_start_time(video_path, "v:0")
-    audio_start = get_stream_start_time(video_path, "a:0") if has_audio else 0.0
-    video_lead_in = max(0.0, float(video_start) - float(audio_start)) if has_audio else 0.0
-    audio_late = max(0.0, float(audio_start) - float(video_start)) if has_audio else 0.0
-    source_duration = float(source_summary.get("duration") or 0.0)
-    return {
-        "source_duration": source_duration,
-        "video_start": float(video_start or 0.0),
-        "audio_start": float(audio_start or 0.0),
-        "video_lead_in": float(video_lead_in or 0.0),
-        "audio_late": float(audio_late or 0.0),
-        "has_audio": has_audio,
-        "summary": source_summary,
-    }
-
-
-def expected_compose_duration(render_duration):
-    """Target container duration for compose_video.
-
-    Lead-in handling only rewrites timestamps so both streams start at 0 and the
-    first video frame freezes for editors. It does **not** mean we must publish
-    a file longer than the source container / render window. Using
-    render_duration + lead_in here previously false-failed complete encodes
-    (~source length) as "too short", so the never-read ``video_lead_in``
-    parameter was removed.
-    """
-    return max(0.0, float(render_duration or 0.0))
-
-
-def _default_max_extra_seconds(expected_duration):
-    """Tight upper allowance: max(0.5, 0.5% of expected), capped near 0.75s."""
-    expected = max(0.0, float(expected_duration or 0.0))
-    return min(0.75, max(0.5, expected * 0.005))
-
-
-def validate_rendered_output(
-    path,
-    expected_duration,
-    require_audio=False,
-    duration_tolerance=0.35,
-    max_extra_seconds=None,
-    min_width=2,
-    min_height=2,
-    min_duration=None,
-):
-    """Validate a partial/final MP4 before publishing the user-facing name.
-
-    Checks:
-    - readable media with video stream and positive duration
-    - optional audio presence
-    - not too short vs expected (and optional absolute min_duration floor)
-    - not suspiciously long vs expected (catches wrong -t / filter mistakes)
-    - video dimensions present (catches empty/corrupt encodes that still open)
-
-    When source video is delayed vs audio, compose freezes the first frame and
-    rewrites start times to 0. The published duration should still be about the
-    render/source length — pass that as expected_duration, not source+lead_in.
-    Optional min_duration rejects outputs that lost more than a lead-in worth of
-    content (e.g. truncated tails).
-
-    Floor semantics: if both expected and min_duration are set, the short-check
-    uses min_duration as an independent lower bound (not max(min, expected),
-    which previously made min_duration dead when expected was also set).
-    When only expected is set, expected is the short floor.
-    """
-    summary = media_probe.probe_media_summary(path)
-    if not summary["ok"]:
-        return False, summary, summary.get("error") or "output validation failed"
-    if require_audio and not summary["has_audio"]:
-        return False, summary, "expected audio stream is missing"
-
-    actual = float(summary.get("duration") or 0.0)
-    expected = float(expected_duration or 0.0)
-    tol = float(duration_tolerance)
-    if max_extra_seconds is None:
-        max_extra_seconds = _default_max_extra_seconds(expected)
-    else:
-        max_extra_seconds = float(max_extra_seconds)
-
-    # Short-check floors (independent):
-    # - expected: primary target length
-    # - min_duration: optional absolute floor that can be *below* expected
-    #   (e.g. allow losing at most lead-in) without being raised to expected.
-    if expected > 0 and actual + tol < expected:
-        return (
-            False,
-            summary,
-            f"output duration {actual:.3f}s is shorter than expected {expected:.3f}s",
-        )
-    if min_duration is not None and float(min_duration) > 0:
-        floor = float(min_duration)
-        if actual + tol < floor:
-            return (
-                False,
-                summary,
-                f"output duration {actual:.3f}s is shorter than min_duration {floor:.3f}s",
-            )
-
-    if expected > 0 and actual > expected + max(tol, float(max_extra_seconds)):
-        return (
-            False,
-            summary,
-            (
-                f"output duration {actual:.3f}s is longer than expected "
-                f"{expected:.3f}s (+{max_extra_seconds}s allowance)"
-            ),
-        )
-    w = int(summary.get("width") or 0)
-    h = int(summary.get("height") or 0)
-    if w < int(min_width) or h < int(min_height):
-        return False, summary, f"video dimensions too small: {w}x{h}"
-    return True, summary, ""
-
-
-def build_audio_encode_args_for_compose(
-    opts,
-    source_has_audio,
-    *,
-    video_lead_in=0.0,
-    audio_delay_ms=0,
-    notes=None,
-):
-    """Burn-side wrapper around build_audio_encode_args (encode_options.py).
-
-    encode_options builds audio args without knowing the source's audio-late
-    offset (audio_start > video_start): its re-encode branch rewrites the audio
-    stream to 0 via asetpts=PTS-STARTPTS, which plays audio that starts late
-    EARLY by that offset (A/V desync). This wrapper re-inserts the erased
-    offset with adelay AFTER asetpts in the -af value (asetpts stays first).
-    ``-c:a copy`` has no filter slot for adelay, so it falls back to AAC —
-    mirroring the copy→aac fallback encode_options already applies for lead-in.
-    Lives on the burn side only; encode_options is untouched.
-    """
-    args = list(build_audio_encode_args(
-        opts,
-        source_has_audio,
-        video_lead_in=video_lead_in,
-        notes=notes,
-    ))
-    if audio_delay_ms <= 0 or not args:
-        return args
-    af_idx = args.index("-af") if "-af" in args else -1
-    if af_idx >= 0 and af_idx + 1 < len(args):
-        args[af_idx + 1] = f"{args[af_idx + 1]},adelay={audio_delay_ms}:all=1"
-        return args
-    if notes is not None:
-        notes.append(
-            f"audio-codec copy 无法应用 adelay={audio_delay_ms}:all=1，已回退 aac 以恢复音画对齐"
-        )
-    return [
-        "-c:a", "aac",
-        "-b:a", getattr(opts, "audio_bitrate", "192k"),
-        "-af", f"asetpts=PTS-STARTPTS,adelay={audio_delay_ms}:all=1",
-    ]
-
-
-def compose_video(video_path, frames_dir, out_dir, config, duration):
-    """PNG 帧序列 → (可选 WebM alpha) → 叠加到源视频。"""
-    # Fail fast on incomplete frame sequences before encode setup / ffmpeg publish.
-    start_number = detect_frame_start_number(frames_dir)
-    fps = max(1, int(getattr(config, "fps", 30) or 30))
-    expected_frames = max(1, int(math.ceil(float(duration or 0.0) * fps - 1e-9)))
-    missing = missing_frame_indexes(frames_dir, expected_frames, start=start_number)
-    if missing:
-        preview = ", ".join(f"frame_{i:05d}.png" for i in missing[:12])
-        more = "" if len(missing) <= 12 else f" ... (+{len(missing) - 12} more)"
-        raise RuntimeError(
-            f"compose_video: missing {len(missing)} overlay frame(s) for "
-            f"start={start_number} count={expected_frames} under {frames_dir}; "
-            f"first gaps: {preview}{more}. Refuse to publish incomplete overlay."
-        )
-
-    encode = getattr(config, "encode", None)
-    if encode is None:
-        encode = resolve_encode_options()
-        config.encode = encode
-
-    print("[3/4] 合成 overlay 视频...", flush=True)
-    print(f"  编码参数: {summarize_encode_options(encode)}", flush=True)
-    for note in encode.notes:
-        print(f"  [encode] {note}", flush=True)
-
-    stage_timings = dict(getattr(config, "stage_timings", None) or {})
-    frames_pattern = os.path.join(frames_dir, "frame_%05d.png")
-
-    # Overlay path for filter input: either intermediate WebM or direct PNG sequence.
-    overlay_input = None
-    use_png_direct = str(getattr(encode, "overlay_codec", "vp9")).lower() == "png"
-
-    if not use_png_direct:
-        print(f"  步骤 1/2: PNG 帧 → WebM (alpha, cpu-used={encode.webm_cpu_used})...", flush=True)
-        webm_path = os.path.join(out_dir, "overlay_temp.webm")
-        cmd1 = [
-            require_executable("ffmpeg"), "-y",
-            "-framerate", str(config.fps),
-            "-start_number", str(start_number),
-            "-i", frames_pattern,
-            *build_webm_encode_args(encode),
-            "-t", str(duration),
-            webm_path,
-        ]
-        webm_log_path = os.path.join(out_dir, "ffmpeg-webm.log")
-        t0 = time.perf_counter()
-        with open(webm_log_path, "w", encoding="utf-8", errors="replace") as log_file:
-            r = run_tracked(cmd1, stdout=subprocess.DEVNULL, stderr=log_file, text=True)
-        stage_timings["webm_encode"] = time.perf_counter() - t0
-        if r.returncode != 0:
-            try:
-                tail = Path(webm_log_path).read_text(encoding="utf-8", errors="replace")[-1200:]
-            except OSError:
-                tail = "日志不可读取"
-            print(f"  WebM 编码错误；完整日志: {webm_log_path}\n{tail}", flush=True)
-            config.stage_timings = stage_timings
-            return None
-        overlay_input = webm_path
-        print(f"  WebM 完成: {stage_timings['webm_encode']:.1f}s", flush=True)
-        # Validate WebM duration: if the intermediate overlay is shorter than
-        # expected, the final compose will silently lack chat in the tail.
-        webm_summary = media_probe.probe_media_summary(webm_path)
-        if webm_summary["ok"]:
-            webm_dur = float(webm_summary.get("duration") or 0.0)
-            # Allow small encoder margin (VP9 often ±0.1s). Short WebM used to only
-            # warn then compose with eof_action=pass — final MP4 length looked fine
-            # while chat was missing in the tail (silent-wrong). Hard-fail instead.
-            if webm_dur + 0.5 < float(duration or 0.0):
-                print(
-                    f"  错误: WebM overlay 时长 {webm_dur:.3f}s 显著短于预期 {duration:.3f}s；"
-                    f"拒绝合成以免尾段弹幕静默缺失。可改 --overlay-codec png 或检查编码日志: {webm_log_path}",
-                    flush=True,
-                )
-                config.stage_timings = stage_timings
-                return None
-        else:
-            print(
-                f"  错误: WebM 中间文件无法探测 ({webm_summary.get('error', 'unknown')})；"
-                f"拒绝合成。日志: {webm_log_path}",
-                flush=True,
-            )
-            config.stage_timings = stage_timings
-            return None
-    else:
-        print("  步骤 1/2: 跳过 WebM，直接用 PNG 序列作为 overlay 输入", flush=True)
-        stage_timings["webm_encode"] = 0.0
-
-    print(f"  步骤 2/2: overlay 合成到源视频 ({encode.video_codec})...", flush=True)
-
-    # Overlay. Write to a temporary MP4 first so an interrupted FFmpeg run
-    # never leaves a broken file at the user-facing output path.
-    out_path = os.path.join(out_dir, Path(video_path).stem + "_chat.mp4")
-    partial_path = os.path.join(out_dir, Path(video_path).stem + "_chat.partial.mp4")
-    try:
-        os.remove(partial_path)
-    except FileNotFoundError:
-        pass
-    # 源文件可能用时间戳表达“音频先开始、视频稍后进入”。VLC 会遵守，
-    # 但部分剪辑软件会忽略该非零 start_time。把这段差显式编码为首帧冻结，
-    # 让导出的 MP4 两条流都从 0 开始，同时保留原本的内容时序。
-    #
-    # 例外：预览 seek 到片中（preview_clip_start > 0）时，输入已经过了源
-    # 片头 A/V 错位，再 tpad 会把“当前 seek 到的画面”冻 1 秒，表现为卡顿。
-    timing = resolve_source_av_timing(video_path)
-    # Stubs/mocks may return only the original five keys — always .get so a
-    # missing newer field can never KeyError; fall back to the stream starts.
-    source_has_audio = bool(timing.get("has_audio"))
-    source_lead_in = float(timing.get("video_lead_in") or 0.0)
-    audio_late = float(timing.get("audio_late") or 0.0)
-    if source_has_audio and audio_late <= 0.0:
-        audio_late = max(
-            0.0,
-            float(timing.get("audio_start") or 0.0) - float(timing.get("video_start") or 0.0),
-        )
-    seek_ss = float(getattr(config, "preview_clip_start", 0.0) or 0.0)
-    # Only apply lead-in freeze when composing from the true start of the source.
-    video_lead_in = 0.0 if seek_ss > 1e-6 else source_lead_in
-    # Audio-late compensation: the audio branch (encode_options) rewrites the
-    # audio stream to start at 0 (asetpts=PTS-STARTPTS). When the source audio
-    # starts LATER than the video, that erases the offset and plays the audio
-    # (audio_start - video_start) seconds early — A/V desync. Re-insert the
-    # offset with adelay AFTER asetpts (mirror of the lead-in freeze, opposite
-    # direction). Only from the true start: after a preview seek both streams
-    # rebase at the seek point and the head offset no longer exists.
-    audio_delay_ms = 0
-    if source_has_audio and seek_ss <= 1e-6 and audio_late > 0.001:
-        audio_delay_ms = int(round(audio_late * 1000.0))
-        print(
-            f"  检测到音频相对视频延后 {audio_late:.3f}s；"
-            f"音频滤镜 asetpts 后追加 adelay={audio_delay_ms}:all=1 恢复音画对齐",
-            flush=True,
-        )
-    # Lead-in rewrites A/V start times (freeze first frame for editors).
-    # Container duration target stays the render window (~source length),
-    # not source+lead_in — otherwise validation false-fails complete encodes.
-    output_duration = expected_compose_duration(duration)
-    # Floor rejects truly truncated outputs (lost more than a small lead-in).
-    min_output_duration = max(
-        0.0,
-        float(duration) - max(0.0, video_lead_in) - 0.05,
-    )
-    # Final CFR for the published video. Keep chat overlay at config.fps;
-    # do not force the whole encode down to overlay sampling rate.
-    output_fps = media_probe.resolve_output_fps(
-        video_path,
-        explicit=getattr(config, "output_fps", None),
-        fallback=max(1, int(getattr(config, "fps", 30) or 30)),
-    )
-    config.output_fps = output_fps
-    print(f"  成片输出帧率: {output_fps}fps (弹幕层 {config.fps}fps)", flush=True)
-
-    if video_lead_in > 0.001:
-        print(
-            f"  检测到视频相对音频延后 {video_lead_in:.3f}s；"
-            f"首帧冻结并把两条流改写为从 0 开始（编辑器友好）",
-            flush=True,
-        )
-        print(
-            f"  成片目标时长约 {output_duration:.3f}s（与源/渲染窗一致，不额外 +lead-in）",
-            flush=True,
-        )
-        # Pad main with frozen first frame for lead-in, then trim back to
-        # output_duration so container length stays ~source (not source+lead_in).
-        # Chat is delayed by lead-in (setpts+lead_in/TB), so its last lead_in
-        # seconds land past output_duration on the output timeline. The -t cap
-        # below is raised by video_lead_in so the muxer itself cannot clip that
-        # delayed region; streams still end naturally at ~output_duration, so
-        # the published length stays ~render/source.
-        main_filter = (
-            f"[0:v]setpts=PTS-STARTPTS,"
-            f"tpad=start_duration={video_lead_in:.6f}:start_mode=clone,"
-            f"trim=duration={output_duration:.6f},setpts=PTS-STARTPTS[main]"
-        )
-        chat_filter = (
-            f"[1:v]setpts=PTS-STARTPTS+"
-            f"{video_lead_in:.6f}/TB[chat]"
-        )
-    else:
-        if source_lead_in > 0.001 and seek_ss > 1e-6:
-            print(
-                f"  跳过源片头 lead-in 冻结（preview seek={seek_ss:.3f}s，"
-                f"源 lead-in={source_lead_in:.3f}s 仅作用于片头）",
-                flush=True,
-            )
-        main_filter = "[0:v]setpts=PTS-STARTPTS[main]"
-        chat_filter = "[1:v]setpts=PTS-STARTPTS[chat]"
-
-    # eof_action=pass keeps the main video when overlay ends early, instead of
-    # shortest=1 which can silently truncate the finished product.
-    video_filter = (
-        f"{main_filter};"
-        f"{chat_filter};"
-        f"[main][chat]overlay={config.x}:{config.y}:eof_action=pass:shortest=0[outv]"
-    )
-
-    # Dense/mid preview: -ss MUST bind to the source VIDEO input (next -i), not the
-    # overlay. FFmpeg applies input options to the following -i only — putting
-    # -ss after video -i and before overlay -i seeks the wrong stream and leaves
-    # head picture under mid-VOD rebased chat (silent A/V vs chat mismatch).
-    cmd2 = [require_executable("ffmpeg"), "-y"]
-    if seek_ss > 1e-6:
-        cmd2 += ["-ss", f"{seek_ss:.6f}"]
-    cmd2 += ["-i", video_path]
-    if use_png_direct:
-        cmd2 += [
-            "-framerate", str(config.fps),
-            "-start_number", str(start_number),
-            "-i", frames_pattern,
-        ]
-    else:
-        cmd2 += ["-i", overlay_input]
-
-    cmd2 += [
-        "-filter_complex", video_filter,
-        "-map", "[outv]",
-        "-map", "0:a?",
-        *build_video_encode_args(encode),
-        "-r", media_probe.fps_to_ffmpeg_rate(output_fps), "-fps_mode", "cfr",
-        *build_audio_encode_args_for_compose(
-            encode,
-            source_has_audio,
-            video_lead_in=video_lead_in,
-            audio_delay_ms=audio_delay_ms,
-            notes=encode.notes if hasattr(encode, "notes") else None,
-        ),
-        "-movflags", "+faststart",
-        # MP4 的 make_zero 会引入 AAC priming / H.264 重排后的首帧偏移；
-        # 保留重编码后从 0 开始的时间戳，对编辑器兼容性更好。
-        "-avoid_negative_ts", "disabled",
-        # -t 是上限而非目标：lead-in 冻结把 chat 层延后 video_lead_in 秒，
-        # 其最后 lead_in 秒落在 output_duration 之后，若上限不含 lead-in，
-        # muxer 会截掉聊天时间线末尾的消息（流自然结束时实际时长不受影响）。
-        "-t", f"{output_duration + max(0.0, video_lead_in):.6f}",
-        partial_path,
-    ]
-    log_path = os.path.join(out_dir, "ffmpeg-overlay.log")
-    t1 = time.perf_counter()
-    with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
-        r = run_tracked(cmd2, stdout=subprocess.DEVNULL, stderr=log_file, text=True)
-    stage_timings["mux_encode"] = time.perf_counter() - t1
-    config.stage_timings = stage_timings
-
-    if r.returncode != 0:
-        try:
-            tail = Path(log_path).read_text(encoding="utf-8", errors="replace")[-1200:]
-        except OSError:
-            tail = "日志不可读取"
-        print(f"  视频合成错误；完整日志: {log_path}\n{tail}", flush=True)
-        # If hardware encoder failed under auto/nvenc/qsv/amf, surface a clear hint.
-        if encode.resolved_encoder in ("nvenc", "qsv", "amf"):
-            print(
-                "  提示: 硬件编码器失败时可改用 --encoder x264，或检查 GPU 驱动 / ffmpeg 是否支持该 encoder",
-                flush=True,
-            )
-        return None
-
-    ok, summary, reason = validate_rendered_output(
-        partial_path,
-        expected_duration=output_duration,
-        require_audio=source_has_audio,
-        min_duration=min_output_duration if min_output_duration > 0 else None,
-    )
-    # Do not publish a technically playable overlay with malformed timeline
-    # metadata.  This gate is intentionally after FFmpeg but before os.replace.
-    if ok:
-        from media_health import validate_media_health
-        health = validate_media_health(partial_path, mode="fast", require_audio=source_has_audio)
-        if not health.ok:
-            ok = False
-            reason = "媒体健康检查失败: " + health.reason()
-    if not ok:
-        print(
-            f"  输出验证失败: {reason}\n"
-            f"  探测结果: duration={summary.get('duration')} has_video={summary.get('has_video')} "
-            f"has_audio={summary.get('has_audio')}\n"
-            f"  保留临时文件供排查: {partial_path}",
-            flush=True,
-        )
-        return None
-
-    # Back up existing output before overwriting (default behavior).
-    # If the subsequent replace fails, restore .bak when possible.
-    backup = None
-    backup_created = False
-    if not getattr(config, "no_backup_prev", False) and os.path.isfile(out_path):
-        backup = out_path + ".bak"
-        try:
-            if os.path.isfile(backup):
-                os.remove(backup)
-            os.rename(out_path, backup)
-            backup_created = True
-            print(f"  [backup] {backup}", flush=True)
-        except OSError as e:
-            print(f"  warning: cannot backup {out_path}: {e}", flush=True)
-            backup = None
-            backup_created = False
-    try:
-        os.replace(partial_path, out_path)
-    except OSError as e:
-        print(f"  发布失败: 无法将 {partial_path} 替换为 {out_path}: {e}", flush=True)
-        if backup_created and backup and os.path.isfile(backup) and not os.path.isfile(out_path):
-            try:
-                os.rename(backup, out_path)
-                print(f"  已从备份恢复: {out_path}", flush=True)
-            except OSError as restore_err:
-                print(f"  警告: 无法从备份恢复 {backup}: {restore_err}", flush=True)
-        return None
-    size_mb = os.path.getsize(out_path) / (1024 * 1024)
-    print(
-        f"  输出: {out_path} ({size_mb:.1f} MB, {summary['duration']:.2f}s, "
-        f"video={summary['has_video']}, audio={summary['has_audio']})",
-        flush=True,
-    )
-    if stage_timings:
-        print("  阶段耗时:", flush=True)
-        total = sum(stage_timings.values()) or 1.0
-        for name, sec in stage_timings.items():
-            print(f"    - {name}: {sec:.1f}s ({sec / total * 100:.0f}%)", flush=True)
-    return out_path
-
-
 # ============================================================
 # 4. 主入口
 # ============================================================
@@ -1680,13 +461,8 @@ def _validate_runtime_args(args) -> None:
     if not 0 <= args.bg_alpha <= 255:
         raise ValueError("--bg-alpha must be between 0 and 255")
 
-def _main(status_sink=None):
-    """Full CLI pipeline. ``status_sink`` (dict) receives the resolved job out_dir
-    so the public main() wrapper can mark run_meta failed on unexpected crashes."""
-    media_probe.cache_clear()
-    from env_bootstrap import prepend_tools_ffmpeg_to_path
-
-    prepend_tools_ffmpeg_to_path()
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the burn CLI parser (argparse construction extracted from _main)."""
     parser = argparse.ArgumentParser(
         description="Twitch 聊天弹幕覆盖工具 - 从 HTML 聊天记录生成 overlay 并合成到视频",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1870,7 +646,160 @@ def _main(status_sink=None):
         "--blank-hold-seconds", type=float, default=0.5,
         help="空白时段关键帧间隔秒数，默认 0.5；最终仍会补齐给 FFmpeg",
     )
+    return parser
 
+
+def resolve_preview_plan(chat_data, args, config, video_dur):
+    """Preview time-window planning: densest window, filter instant, filtering.
+
+    Extracted verbatim from _main: chooses the densest preview start
+    (--preview-dense + --preview-clip), resolves the clamped preview filter
+    instant (REND-R1), computes the chat window (with the float-mode anchor
+    override), filters messages/emotes for the window and trims float
+    carry-in by lane budget. Runs AFTER translation import so translation
+    indices still refer to the full message list.
+
+    Returns (chat_data, clip_start, win_start, win_end); main() applies
+    ``config.preview_clip_start = clip_start`` at the boundary.
+    """
+    # Preview time-window: only keep messages/emotes that can appear in the window.
+    # Runs AFTER import so translation indices still refer to the full message list.
+    dense_info = None
+    clip_start = 0.0
+    stack_mode_cli = str(getattr(args, "stack_mode", "lanes") or "lanes").lower()
+    # Window membership lifetime for preview filtering vs densest scoring:
+    # - float has no time eviction. Filter must use a large horizon so older
+    #   messages still on the capacity stack survive (clip_len is too short and
+    #   drops carry-in that a full float render would show).
+    # - densest scoring for float should prefer arrivals *inside* the candidate
+    #   window (near-zero life), not the whole history (which marks every past
+    #   message visible in every window).
+    if stack_mode_cli == "float":
+        window_life = max(float(video_dur or 0.0), float(args.msg_lifetime or 14.0), 3600.0)
+        dense_score_life = 0.05  # ~arrival-in-window only
+    else:
+        window_life = float(args.msg_lifetime or 14.0)
+        dense_score_life = window_life
+    if getattr(args, "preview_dense", False) and args.preview_clip is None and not args.export_translation:
+        print("  [WARN] --preview-dense 需要同时指定 --preview-clip，已忽略", flush=True)
+    if (
+        args.preview_clip is not None
+        and args.preview_frame is None
+        and getattr(args, "preview_dense", False)
+        and not args.export_translation
+    ):
+        dense_info = find_densest_preview_start(
+            chat_data.get("messages") or [],
+            float(args.preview_clip),
+            video_duration=video_dur,
+            msg_lifetime=max(0.05, float(dense_score_life)),
+        )
+        clip_start = float(dense_info.get("start") or 0.0)
+        if dense_info.get("warning"):
+            print(f"  [WARN] {dense_info['warning']}", flush=True)
+        print(
+            f"  预览最密段: start={clip_start:.2f}s end={dense_info.get('end'):.2f}s "
+            f"score={dense_info.get('score')} mode={dense_info.get('mode')}",
+            flush=True,
+        )
+
+    # REND-R1: filtering must use the same clamped instant the renderer uses
+    # (min(preview_frame, min(source_dur, clip))). Otherwise a frame past the
+    # preview duration keeps only messages the scheduler then drops → silent
+    # empty (lanes) / misaligned (float) preview.
+    preview_filter_t, preview_time_warning = resolve_preview_frame_time(
+        args.preview_frame,
+        args.preview_clip,
+        video_dur,
+    )
+    if preview_time_warning:
+        print(f"  [WARN] {preview_time_warning}", flush=True)
+    win_start, win_end = preview_window(
+        preview_filter_t,
+        args.preview_clip,
+        window_life,
+        clip_start=clip_start if args.preview_clip is not None else None,
+    )
+    # Float has no lifetime. preview_window(preview_frame) would set start=t-life and
+    # make nearly every message "in-window", defeating capacity carry-in trim.
+    # Anchor the window at the frame instant so pre-window = history before t.
+    if (
+        stack_mode_cli == "float"
+        and preview_filter_t is not None
+        and args.preview_clip is None
+    ):
+        frame_t = max(0.0, float(preview_filter_t))
+        win_start, win_end = frame_t, frame_t + 0.05
+    if win_start is not None and win_end is not None and not args.export_translation:
+        before_n = len(chat_data.get("messages") or [])
+        before_e = len(chat_data.get("emote_map") or {})
+        # Rebase timestamps relative to clip start for densest mid-video clips so
+        # render/compose stay simple (pair with ffmpeg -ss). Negative timestamps
+        # preserve remaining lanes lifetime for carry-in messages.
+        rebase = bool(args.preview_clip is not None and clip_start > 1e-6)
+        float_cap = None
+        if stack_mode_cli == "float":
+            raw_cap = int(getattr(config, "max_visible", 0) or 0)
+            float_cap, _capacity, float_budget_warn = resolve_lane_budget(
+                raw_cap,
+                config.height,
+                config.font_size,
+            )
+            if float_budget_warn:
+                print(f"[WARN] {float_budget_warn}", flush=True)
+        chat_data = filter_chat_for_time_window(
+            chat_data,
+            win_start,
+            win_end,
+            window_life,
+            rebase_to_zero=rebase,
+            float_capacity_lines=float_cap,
+            max_message_lines=int(getattr(config, "max_message_lines", 0) or 0),
+        )
+        # Float safety net: trim pre-window by line budget (prefilter already limits deepcopy).
+        if stack_mode_cli == "float" and float_cap is not None:
+            carry_origin = 0.0 if rebase else float(win_start)
+            before_trim = len(chat_data.get("messages") or [])
+            chat_data = trim_float_carry_in_messages(
+                chat_data,
+                carry_origin,
+                float_cap,
+                max_message_lines=int(getattr(config, "max_message_lines", 0) or 0),
+            )
+            after_trim = len(chat_data.get("messages") or [])
+            prefilter = (chat_data.get("_window") or {}).get("float_prefilter") or {}
+            if prefilter:
+                print(
+                    f"  float 预览 prefilter: pre-window "
+                    f"{prefilter.get('pre_window_before')}->{prefilter.get('pre_window_after')} "
+                    f"(capacity≈{float_cap} lines)",
+                    flush=True,
+                )
+            if after_trim < before_trim:
+                print(
+                    f"  float 预览 carry-in 截断: {before_trim}->{after_trim} "
+                    f"(capacity≈{float_cap})",
+                    flush=True,
+                )
+        after_n = len(chat_data.get("messages") or [])
+        after_e = len(chat_data.get("emote_map") or {})
+        print(
+            f"  预览时间窗 [{win_start:.2f}s, {win_end:.2f}s]"
+            f"{' (rebase→0)' if rebase else ''}: "
+            f"消息 {before_n}->{after_n}, emote {before_e}->{after_e}",
+            flush=True,
+        )
+    return chat_data, clip_start, win_start, win_end
+
+
+def _main(status_sink=None):
+    """Full CLI pipeline. ``status_sink`` (dict) receives the resolved job out_dir
+    so the public main() wrapper can mark run_meta failed on unexpected crashes."""
+    media_probe.cache_clear()
+    from env_bootstrap import prepend_tools_ffmpeg_to_path
+
+    prepend_tools_ffmpeg_to_path()
+    parser = build_arg_parser()
     args = parser.parse_args()
 
     companion_err = clean_companion_flags_error(args)
@@ -2260,132 +1189,15 @@ def _main(status_sink=None):
 
     # Preview time-window: only keep messages/emotes that can appear in the window.
     # Runs AFTER import so translation indices still refer to the full message list.
-    dense_info = None
-    clip_start = 0.0
-    stack_mode_cli = str(getattr(args, "stack_mode", "lanes") or "lanes").lower()
-    # Window membership lifetime for preview filtering vs densest scoring:
-    # - float has no time eviction. Filter must use a large horizon so older
-    #   messages still on the capacity stack survive (clip_len is too short and
-    #   drops carry-in that a full float render would show).
-    # - densest scoring for float should prefer arrivals *inside* the candidate
-    #   window (near-zero life), not the whole history (which marks every past
-    #   message visible in every window).
-    if stack_mode_cli == "float":
-        window_life = max(float(video_dur or 0.0), float(args.msg_lifetime or 14.0), 3600.0)
-        dense_score_life = 0.05  # ~arrival-in-window only
-    else:
-        window_life = float(args.msg_lifetime or 14.0)
-        dense_score_life = window_life
-    if getattr(args, "preview_dense", False) and args.preview_clip is None and not args.export_translation:
-        print("  [WARN] --preview-dense 需要同时指定 --preview-clip，已忽略", flush=True)
-    if (
-        args.preview_clip is not None
-        and args.preview_frame is None
-        and getattr(args, "preview_dense", False)
-        and not args.export_translation
-    ):
-        dense_info = find_densest_preview_start(
-            chat_data.get("messages") or [],
-            float(args.preview_clip),
-            video_duration=video_dur,
-            msg_lifetime=max(0.05, float(dense_score_life)),
-        )
-        clip_start = float(dense_info.get("start") or 0.0)
-        if dense_info.get("warning"):
-            print(f"  [WARN] {dense_info['warning']}", flush=True)
-        print(
-            f"  预览最密段: start={clip_start:.2f}s end={dense_info.get('end'):.2f}s "
-            f"score={dense_info.get('score')} mode={dense_info.get('mode')}",
-            flush=True,
-        )
-        config.preview_clip_start = clip_start
-
-    # REND-R1: filtering must use the same clamped instant the renderer uses
-    # (min(preview_frame, min(source_dur, clip))). Otherwise a frame past the
-    # preview duration keeps only messages the scheduler then drops → silent
-    # empty (lanes) / misaligned (float) preview.
-    preview_filter_t, preview_time_warning = resolve_preview_frame_time(
-        args.preview_frame,
-        args.preview_clip,
-        video_dur,
+    # Ordering contract (deep-audit guard): the translation-import block above
+    # must run BEFORE filter_chat_for_time_window — the actual
+    # filter_chat_for_time_window / trim_float_carry_in_messages calls live in
+    # resolve_preview_plan below, invoked here after both the export and import
+    # translation branches, so indices stay aligned with the full message list.
+    chat_data, clip_start, win_start, win_end = resolve_preview_plan(
+        chat_data, args, config, video_dur,
     )
-    if preview_time_warning:
-        print(f"  [WARN] {preview_time_warning}", flush=True)
-    win_start, win_end = preview_window(
-        preview_filter_t,
-        args.preview_clip,
-        window_life,
-        clip_start=clip_start if args.preview_clip is not None else None,
-    )
-    # Float has no lifetime. preview_window(preview_frame) would set start=t-life and
-    # make nearly every message "in-window", defeating capacity carry-in trim.
-    # Anchor the window at the frame instant so pre-window = history before t.
-    if (
-        stack_mode_cli == "float"
-        and preview_filter_t is not None
-        and args.preview_clip is None
-    ):
-        frame_t = max(0.0, float(preview_filter_t))
-        win_start, win_end = frame_t, frame_t + 0.05
-    if win_start is not None and win_end is not None and not args.export_translation:
-        before_n = len(chat_data.get("messages") or [])
-        before_e = len(chat_data.get("emote_map") or {})
-        # Rebase timestamps relative to clip start for densest mid-video clips so
-        # render/compose stay simple (pair with ffmpeg -ss). Negative timestamps
-        # preserve remaining lanes lifetime for carry-in messages.
-        rebase = bool(args.preview_clip is not None and clip_start > 1e-6)
-        float_cap = None
-        if stack_mode_cli == "float":
-            raw_cap = int(getattr(config, "max_visible", 0) or 0)
-            float_cap, _capacity, float_budget_warn = resolve_lane_budget(
-                raw_cap,
-                config.height,
-                config.font_size,
-            )
-            if float_budget_warn:
-                print(f"[WARN] {float_budget_warn}", flush=True)
-        chat_data = filter_chat_for_time_window(
-            chat_data,
-            win_start,
-            win_end,
-            window_life,
-            rebase_to_zero=rebase,
-            float_capacity_lines=float_cap,
-            max_message_lines=int(getattr(config, "max_message_lines", 0) or 0),
-        )
-        # Float safety net: trim pre-window by line budget (prefilter already limits deepcopy).
-        if stack_mode_cli == "float" and float_cap is not None:
-            carry_origin = 0.0 if rebase else float(win_start)
-            before_trim = len(chat_data.get("messages") or [])
-            chat_data = trim_float_carry_in_messages(
-                chat_data,
-                carry_origin,
-                float_cap,
-                max_message_lines=int(getattr(config, "max_message_lines", 0) or 0),
-            )
-            after_trim = len(chat_data.get("messages") or [])
-            prefilter = (chat_data.get("_window") or {}).get("float_prefilter") or {}
-            if prefilter:
-                print(
-                    f"  float 预览 prefilter: pre-window "
-                    f"{prefilter.get('pre_window_before')}->{prefilter.get('pre_window_after')} "
-                    f"(capacity≈{float_cap} lines)",
-                    flush=True,
-                )
-            if after_trim < before_trim:
-                print(
-                    f"  float 预览 carry-in 截断: {before_trim}->{after_trim} "
-                    f"(capacity≈{float_cap})",
-                    flush=True,
-                )
-        after_n = len(chat_data.get("messages") or [])
-        after_e = len(chat_data.get("emote_map") or {})
-        print(
-            f"  预览时间窗 [{win_start:.2f}s, {win_end:.2f}s]"
-            f"{' (rebase→0)' if rebase else ''}: "
-            f"消息 {before_n}->{after_n}, emote {before_e}->{after_e}",
-            flush=True,
-        )
+    config.preview_clip_start = clip_start
 
     # Persist run metadata early so failures still leave a breadcrumb.
     if not args.export_translation:
@@ -2406,7 +1218,19 @@ def _main(status_sink=None):
         })
 
     # Step 2: 渲染帧
-    frames_dir, duration = render_overlay(chat_data, out_dir, video_path, config)
+    render_result = render_overlay(chat_data, out_dir, video_path, config)
+    # 唯一合法回写点: main 在边界把渲染结果注入 config —— 保持 run_meta 的
+    # config dump (to_dict()) 与 compose 阶段汇总的历史形状，render_overlay
+    # 自身不再有运行时 config 副作用。
+    config.stage_timings = dict(render_result.timings)
+    config.frame_stats = dict(render_result.stats)
+    config.lazy_message_images = bool(
+        int(render_result.stats.get("lazy_message_images", 0) or 0)
+    )
+    if render_result.preview_path:
+        config.preview_image = render_result.preview_path
+    frames_dir = render_result.frames_dir
+    duration = render_result.duration
     if args.preview_clip is not None:
         duration = min(duration, max(0.1, float(args.preview_clip)))
 
@@ -2546,10 +1370,18 @@ def _main(status_sink=None):
         return 0
 
     # Step 3: 合成视频
-    result = compose_video(video_path, frames_dir, out_dir, config, duration)
+    compose_result = compose_video(video_path, frames_dir, out_dir, config, duration)
+    if compose_result is not None:
+        # 唯一合法回写点: compose 结果（成片帧率 / 阶段耗时）经 main 注入 config。
+        # compose 的 timings 已包含渲染阶段耗时（入口从 config.stage_timings 播种）。
+        if compose_result.output_fps is not None:
+            config.output_fps = compose_result.output_fps
+        config.stage_timings = dict(compose_result.timings)
 
     # Promote final video from job dir to out_base when they differ.
-    final_result = promote_to_out_base(result) if result else None
+    final_result = (
+        promote_to_out_base(compose_result.output_path) if compose_result else None
+    )
 
     # Step 4: 清理
     print("[4/4] 清理临时文件...", flush=True)
@@ -2567,7 +1399,7 @@ def _main(status_sink=None):
             out_dir,
             "success",
             output=final_result,
-            job_output=result,
+            job_output=(compose_result.output_path if compose_result else None),
             out_base=out_base,
             keep_temp=bool(args.keep_temp),
         )
@@ -2583,7 +1415,7 @@ def _main(status_sink=None):
             except OSError as e:
                 print(f"  警告: 无法保存 run_meta 到输出目录: {e}", flush=True)
     else:
-        failure_stage = "publish" if result else "compose_or_render"
+        failure_stage = "publish" if compose_result else "compose_or_render"
         mark_run_status(
             out_dir,
             "failed",
