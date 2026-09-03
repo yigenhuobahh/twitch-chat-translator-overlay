@@ -29,6 +29,13 @@ Notable changes to this project are documented in this file.
 - Fixed `--doctor` entering the job media prompts when combined with `--job`, doctor treating a missing `openai` package as a hard failure (now WARN, plus an `openpyxl` WARN check), and `_save_api_config` wiping a stored API key when the field is left empty; added a `crf 0..51` bound to TUI validation.
 - Fixed packaging metadata drift: removed the deprecated `fix_merge` shim (superseded by `--segment`/`--cut`, and importing it exits by design), added the 11 missing modules to isort `known-first-party`, and pinned `textual>=8.2,<9` in the dev extra to match the pinned dev environment.
 
+### Changed
+
+- Restructured the three oversized modules into facade + owner-module layers, moving code verbatim with module-attribute calls so existing monkeypatch targets keep working: `render_cn_chat.py` (~2170 → 1525 lines; `cli_spec.py` for argparse with a single-source defaults dict that a new parser-vs-dict sync test guards, `build_burn_command` deduplicating three command assemblies, and the YAML/profile/output cluster folded into `review_tables.py`), `twitch_chat_burn.py` (3804 → 1510 lines; `chat_text_layout.py`, `chat_schedule.py`, `translation_io.py`, `media_probe.py` with memoized probes, and `overlay_render.py`/`overlay_compose.py` where render/compose now return `RenderResult`/`ComposeResult` instead of writing through `OverlayConfig`), and `twitch_download.py` (1674 → 1019 lines; `vod_merge.py` and `td_cli_install.py`).
+- Batch-era test files renamed to module-based names via `git mv` (e.g. `test_p2_fixes.py` → `test_burn_compose_and_encode.py`, `test_audit_cli_clean.py` → `test_cli_clean_and_contracts.py`); collection count unchanged.
+- CI: top-level least-privilege `contents: read`, a PR-path bandit gate, and `pip-audit` now also auditing dev dependencies; `run_tests --coverage` enforces a per-module 60% floor for scripts with ≥500 statements.
+- In-process test coverage for the job_wizard interactive menu (75 cases, 27% → 63% module coverage) and the doctor() diagnosis body (56% → 97%).
+
 ## [0.2.5] - 2026-08-31
 
 ### Added
