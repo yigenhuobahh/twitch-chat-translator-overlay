@@ -253,9 +253,12 @@ def _numeric_type_error(attr: str, expected: str, value: Any) -> ValueError:
 def _validated_int_field(attr: str, value: Any) -> Any:
     """Mirror argparse type=int for a job YAML value.
 
-    ints pass through unchanged; integral floats (18.0) and numeric strings
-    ("18") coerce exactly as the burn CLI's argparse would; everything else —
-    lists, non-numeric strings, bools — is a load-time ValueError.
+    ints pass through unchanged; integral floats (18.0) coerce (argparse only
+    ever sees strings, so a float can only come from YAML — ``18.0`` carries
+    no extra information and is accepted, ``18.5`` is a load-time ValueError);
+    numeric strings ("18") coerce like argparse's ``int("18")``. Everything
+    else — fractional floats, decimal-point strings, "1e3", bools, lists — is
+    a load-time ValueError.
     """
     if isinstance(value, bool):
         raise _numeric_type_error(attr, "整数", value)

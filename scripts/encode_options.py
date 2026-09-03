@@ -104,7 +104,6 @@ def _trial_encode(codec: str) -> bool:
 
     Returns True if the encoder produces a valid output, False otherwise.
     """
-    import os
     import tempfile
     try:
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:

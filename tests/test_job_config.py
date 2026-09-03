@@ -455,3 +455,28 @@ def test_load_job_numeric_string_and_rational_fps(tmp_path: Path, job_mod):
     p_bad.write_text("output_fps: 30000/zero\n", encoding="utf-8")
     with pytest.raises(ValueError, match="output_fps"):
         job_mod.load_job_file(p_bad)
+
+
+def test_load_job_integral_float_int_field_coerces_fractional_rejected(
+    tmp_path: Path, job_mod
+):
+    """Integral float for an int field coerces (18.0 -> 18); fractional raises.
+
+    argparse only ever sees strings, so a float value can only arrive from
+    YAML: 18.0 carries no extra information and is accepted, 18.5 and the
+    decimal-point string "18.0" (which int() would reject) fail at load time.
+    """
+    p_ok = tmp_path / "float_int.yaml"
+    p_ok.write_text("crf: 18.0\n", encoding="utf-8")
+    data = job_mod.load_job_file(p_ok)
+    assert data["crf"] == 18 and isinstance(data["crf"], int)
+
+    p_frac = tmp_path / "frac_int.yaml"
+    p_frac.write_text("crf: 18.5\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="crf"):
+        job_mod.load_job_file(p_frac)
+
+    p_str = tmp_path / "str_int.yaml"
+    p_str.write_text('crf: "18.0"\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="crf"):
+        job_mod.load_job_file(p_str)

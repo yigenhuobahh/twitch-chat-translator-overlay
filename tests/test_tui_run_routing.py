@@ -18,7 +18,8 @@ if str(SCRIPTS) not in sys.path:
 @pytest.mark.parametrize(
     ("choice", "expected"),
     [
-        ("1", ("--mode", "preview", "--render-original")),
+        # 选择 1 会追加 --preview-clip 10 --yes（默认原文 10s 预览）。
+        ("1", ("--mode", "preview", "--render-original", "--preview-clip", "10", "--yes")),
         ("2", ("--manual-translation", "--yes")),
         ("3", ("--mode", "full", "--yes")),
     ],
@@ -35,7 +36,9 @@ def test_post_download_routes_interactive_choice(monkeypatch, tmp_path: Path, ch
 
     assert pipeline._post_download_next_steps(video, chat, download_only=False, yes=False) == 7
     assert calls and calls[0][0:2] == (video, chat)
-    assert tuple(calls[0][2:]) == expected or tuple(calls[0][2:]) == (*expected, "--preview-clip", "10", "--yes")
+    # 严格相等：不得出现参数缺失/多余/换序（旧写法 A or B 让 choice=1 分支
+    # 永远只走宽松分支，弱化了守门强度）。
+    assert tuple(calls[0][2:]) == expected
 
 
 def test_post_download_noninteractive_stops_without_starting_pipeline(monkeypatch, tmp_path: Path):
