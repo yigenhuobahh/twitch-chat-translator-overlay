@@ -310,6 +310,40 @@ def test_doctor_mentions_next_steps(pipeline, capsys, monkeypatch):
     assert code in (0, 1)
 
 
+def test_doctor_early_exit_runs_before_job_loading(pipeline, monkeypatch, tmp_path, capsys):
+    """--doctor 必须先于 --job 加载与交互提问早退。
+
+    回归门（9f99463 修复）：`--doctor --job style.yaml`（job 缺 video/chat_html）
+    在修复前会先进入 job 媒体路径解析/非交互报错，诊断根本跑不到。
+    这里让 doctor 返回哨兵退出码 7，并用一个缺 video/chat_html 的 job YAML：
+    doctor 早退时 pipeline.main() 必须以 7 退出且 job 加载不发生。
+    """
+    calls = {"doctor": 0}
+
+    def fake_doctor(args):
+        calls["doctor"] += 1
+        return 7
+
+    monkeypatch.setattr(pipeline, "doctor", fake_doctor)
+    job = tmp_path / "style.yaml"
+    job.write_text("x: 5\n", encoding="utf-8")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["render_cn_chat.py", "--doctor", "--job", str(job)],
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        pipeline.main()
+
+    assert calls["doctor"] == 1
+    assert excinfo.value.code == 7
+    # job 未被加载：既无 [job] 加载日志，也无缺媒体的非交互报错
+    out = capsys.readouterr().out
+    assert "[job]" not in out
+    assert "video/chat_html" not in out
+
+
 def test_layout_short_name_compact_resolves():
     layout = load_module("layout_preset", "layout_preset.py")
     preset = layout.load_layout_preset("compact")

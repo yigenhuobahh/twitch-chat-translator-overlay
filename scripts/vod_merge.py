@@ -65,10 +65,6 @@ _COMMENT_ROOT_SPLIT_RE = re.compile(
     r'(?=<pre\b[^>]*\bclass\s*=\s*["\'][^"\']*\bcomment-root\b)',
     re.IGNORECASE,
 )
-_EMOTE_CSS_RULE_RE = re.compile(
-    r"([^{}]+)\{[^{}]*?content\s*:\s*url\(\s*(['\"])data:image/[^'\"]*;base64,([^'\"]+)\2\s*\)[^{}]*\}",
-    re.IGNORECASE | re.DOTALL,
-)
 _EMOTE_CLASS_RE = re.compile(r"\.([A-Za-z0-9_-]+)")
 _EMOTE_PREFIXES = ("first-", "second-", "third-")
 

@@ -539,3 +539,40 @@ def test_fallback_manual_mentions_partial_translations(tmp_path: Path, monkeypat
     assert pipe.current_cli_invocation() in out
     assert sys.executable not in pipe.current_cli_invocation()
     assert "render_cn_chat.py" not in out
+
+
+def test_review_table_export_creates_missing_parent_dirs(tmp_path: Path):
+    """复核表导出到不存在的父目录时必须自动创建（TSV mkdir 修复的守门回归）。
+
+    用户显式传 --review-tsv/--review-xlsx 指向尚不存在的子目录（如
+    <workdir>/review/r.tsv）时，缺 mkdir 会直接 FileNotFoundError，
+    而此时翻译早已完成，损失的是整张复核表。
+    """
+    import render_cn_chat as pipe
+
+    json_path = tmp_path / "t.json"
+    json_path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {
+                        "index": 0,
+                        "author": "a",
+                        "timestamp": 1.0,
+                        "original": "hi",
+                        "translation": "你好",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    nested_tsv = tmp_path / "review" / "deep" / "r.tsv"
+    pipe.export_review_tsv(json_path, nested_tsv)
+    assert nested_tsv.is_file()
+
+    nested_xlsx = tmp_path / "review-x" / "r.xlsx"
+    pipe.export_review_xlsx(json_path, nested_xlsx)
+    assert nested_xlsx.is_file()

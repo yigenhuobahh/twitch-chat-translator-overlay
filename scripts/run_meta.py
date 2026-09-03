@@ -127,6 +127,25 @@ def is_live_run_meta(
     return True
 
 
+def _replace_with_retry(tmp_path: Path, path: Path, *, attempts: int = 5) -> None:
+    """os.replace with a short retry for Windows sharing violations.
+
+    A concurrent reader of run_meta.json (e.g. --clean's liveness probe) holds
+    the destination open without FILE_SHARE_DELETE; MoveFileEx then fails once
+    with WinError 5 and succeeds right after the reader closes. Retrying beats
+    crashing a render that is minutes deep. Retries stay cheap: they only run
+    on the transient PermissionError path, never on success.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(tmp_path, path)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.02 * (attempt + 1))
+
+
 def write_run_meta(job_dir: str | Path, payload: dict[str, Any]) -> Path:
     path = run_meta_path(job_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -143,7 +162,7 @@ def write_run_meta(job_dir: str | Path, payload: dict[str, Any]) -> Path:
             json.dump(data, file, ensure_ascii=False, indent=2)
             file.flush()
             os.fsync(file.fileno())
-        os.replace(tmp_path, path)
+        _replace_with_retry(tmp_path, path)
     finally:
         try:
             tmp_path.unlink(missing_ok=True)

@@ -873,6 +873,72 @@ def test_progress_compatibility_supports_fingerprinted_and_legacy_context():
     assert "context" in tr.progress_compatibility_errors(fingerprinted, **compat_kwargs)
 
 
+def test_first_run_without_progress_file_does_not_warn_incompatible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+):
+    """main() 级守门：首跑（进度文件不存在）不得误报"进度文件不兼容"。
+
+    空进度的身份字段（target_language/provider/model…）本就是空值，
+    修复前会与期望值比较并给每次全新翻译打印一条假不兼容警告。
+    反向对照：进度文件真实存在但身份不匹配时警告仍必须出现。
+    """
+    import translate_chat_openai as tr
+
+    json_path = tmp_path / "fresh.json"
+    json_path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {"index": 0, "author": "a", "original": "hi", "translation": ""}
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    record: dict = {}
+    monkeypatch.setattr(tr, "OpenAI", _success_openai(record, "新译文"))
+    monkeypatch.setattr(tr, "BASE_URL", "https://provider.invalid/v1")
+    monkeypatch.setattr(tr, "API_KEY", "stub-key")
+    monkeypatch.setattr(tr, "MODEL", "stub-model")
+    monkeypatch.setattr(
+        tr.sys,
+        "argv",
+        ["translate_chat_openai.py", str(json_path), "--workers", "1"],
+    )
+
+    tr.main()
+
+    out = capsys.readouterr().out
+    assert "不兼容" not in out
+    assert record["completions"].calls == 1
+
+    # 反向对照：已存在的进度文件身份不匹配 → 警告必须保留。
+    progress_path = tr.progress_path_for(json_path)
+    progress = tr.load_progress(progress_path)
+    progress["model"] = "other-model"
+    tr.save_progress(progress_path, progress)
+    json_path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {"index": 0, "author": "a", "original": "hi", "translation": ""}
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    record2: dict = {}
+    monkeypatch.setattr(tr, "OpenAI", _success_openai(record2, "再译"))
+    tr.main()
+    out2 = capsys.readouterr().out
+    assert "不兼容" in out2
+    assert "model" in out2
+
+
 def test_corrupt_progress_file_warns_to_stderr_and_starts_empty(
     tmp_path: Path,
     capsys,

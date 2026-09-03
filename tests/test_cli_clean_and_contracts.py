@@ -170,6 +170,67 @@ def test_make_job_dir_seed_is_live_for_clean(tmp_path: Path, capsys):
     assert count2 >= 1
 
 
+def test_write_run_meta_survives_windows_replace_sharing_violation(tmp_path, monkeypatch):
+    """Regression: a concurrent reader of run_meta.json (e.g. --clean's liveness
+    probe) must not crash the tool's meta write with WinError 5.
+
+    os.replace against a destination held open without FILE_SHARE_DELETE fails
+    once with PermissionError on Windows; write_run_meta retries briefly.
+    """
+    import run_meta as rm
+
+    real_replace = rm.os.replace
+    state = {"calls": 0}
+
+    def flaky_replace(src, dst):
+        state["calls"] += 1
+        if state["calls"] <= 2:
+            raise PermissionError(5, "拒绝访问。")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(rm.os, "replace", flaky_replace)
+    out = rm.write_run_meta(tmp_path, {"status": "running"})
+    assert out.is_file()
+    assert state["calls"] == 3
+
+    # A permanent PermissionError still propagates (no silent data loss claim).
+    monkeypatch.setattr(
+        rm.os, "replace", lambda src, dst: (_ for _ in ()).throw(PermissionError(5, "拒绝访问。"))
+    )
+    import pytest as _pytest
+
+    with _pytest.raises(PermissionError):
+        rm.write_run_meta(tmp_path, {"status": "running"})
+
+
+def test_write_run_meta_concurrent_writers_keep_valid_json(tmp_path):
+    """Unique tmp names + replace must keep run_meta.json valid under writers."""
+    import json as _json
+    import threading
+
+    from run_meta import write_run_meta
+
+    errors: list[str] = []
+
+    def writer(i: int) -> None:
+        try:
+            for seq in range(25):
+                write_run_meta(tmp_path, {"status": "running", "writer": i, "seq": seq})
+        except Exception as exc:  # pragma: no cover - surfaced via assertion
+            errors.append(repr(exc))
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent writers raised: {errors[:3]}"
+    data = _json.loads((tmp_path / "run_meta.json").read_text(encoding="utf-8"))
+    assert data.get("status") == "running"
+    assert not list(tmp_path.glob("*.tmp")), "tmp files must be cleaned up"
+
+
 def test_is_dangerous_publish_path_cross_platform():
     from process_util import is_dangerous_publish_path
 

@@ -761,12 +761,17 @@ def main():
     )
     if paths_refer_to_same_file(json_path, progress_file):
         parser.error("--progress-file 不能与输入 JSON 指向同一文件")
+    # 首跑没有已持久化的进度文件（或 --no-resume 全新开始）：empty_progress()
+    # 的身份字段本就是空值，跑兼容性比较只会把空值误报成"不兼容"，给每次
+    # 全新翻译都添一条假警告。仅当进度文件真实存在时才需要比较。
+    require_compatible_progress = (
+        bool(resume or args.retry_failed) and progress_file.is_file()
+    )
     progress = (
         load_progress(progress_file)
-        if resume or args.retry_failed
+        if require_compatible_progress
         else empty_progress()
     )
-    require_compatible_progress = bool(resume or args.retry_failed)
     compatibility_errors = (
         progress_compatibility_errors(
             progress,
