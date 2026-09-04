@@ -252,3 +252,175 @@ def test_tui_app_unmount_while_probe_thread_active():
                 # App exits now while thread is still active
 
     asyncio.run(exercise())
+
+
+# ============================================================================
+# Security R-3: untrusted cwd .env providing endpoint + API key must be
+# explicitly confirmed (chat text would be sent to that endpoint).
+# ============================================================================
+
+_DOTENV_KEYS = (
+    "OPENAI_COMPAT_BASE_URL",
+    "OPENAI_COMPAT_MODEL",
+    "OPENAI_COMPAT_API_KEY",
+    "AGNES_BASE_URL",
+    "AGNES_MODEL",
+    "AGNES_API_KEY",
+)
+
+
+def _load_common_utils():
+    import common_utils as cu
+
+    return cu
+
+
+def _prepare_dotenv_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reset dotenv-related state so load_dotenv_if_present actually loads."""
+    cu = _load_common_utils()
+    for key in _DOTENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("_TWITCH_TRANSPARENT_TEST_MODE", raising=False)
+    monkeypatch.setattr(cu, "_DOTENV_LOADED_KEYS", set())
+
+
+def test_untrusted_cwd_dotenv_endpoint_plus_key_rejected_without_tty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """恶意 cwd .env(端点+密钥)在非 TTY stdin 下一律拒绝(fail closed)。"""
+    cu = _load_common_utils()
+    _prepare_dotenv_env(monkeypatch)
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "OPENAI_COMPAT_BASE_URL=https://attacker.example/v1",
+                "OPENAI_COMPAT_API_KEY=sk-attacker",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    repo_env = Path(cu.__file__).resolve().parents[1] / ".env"
+    repo_dotenv = None
+    if repo_env.is_file():
+        repo_dotenv = repo_env.read_text(encoding="utf-8")
+        repo_env.unlink()
+
+    class _NotTty:
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr("sys.stdin", _NotTty())
+
+    try:
+        cu.load_dotenv_if_present()
+
+        assert "OPENAI_COMPAT_BASE_URL" not in os.environ
+        assert "OPENAI_COMPAT_API_KEY" not in os.environ
+        assert not cu._DOTENV_LOADED_KEYS
+    finally:
+        if repo_dotenv is not None:
+            repo_env.write_text(repo_dotenv, encoding="utf-8")
+
+
+def test_untrusted_cwd_dotenv_endpoint_plus_key_tty_confirms_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """TTY 下回答 y/yes 视为用户确认,加载成功;其他回答拒绝并回退 repo .env。"""
+    cu = _load_common_utils()
+    _prepare_dotenv_env(monkeypatch)
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "OPENAI_COMPAT_BASE_URL=https://attacker.example/v1",
+                "OPENAI_COMPAT_API_KEY=sk-attacker",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    class _Tty:
+        def __init__(self, answers):
+            self._answers = list(answers)
+
+        def isatty(self):
+            return True
+
+        def readline(self):
+            return self._answers.pop(0)
+
+    class _TtyInput:
+        def __init__(self, answers):
+            self._answers = list(answers)
+
+        def isatty(self):
+            return True
+
+    repo_env = Path(cu.__file__).resolve().parents[1] / ".env"
+    repo_dotenv = None
+    if repo_env.is_file():
+        repo_dotenv = repo_env.read_text(encoding="utf-8")
+        repo_env.unlink()
+
+    try:
+        for answer, expected in (("y\n", True), ("YES\n", True), ("n\n", False)):
+            monkeypatch.setattr(cu, "_DOTENV_LOADED_KEYS", set())
+            for key in _DOTENV_KEYS:
+                os.environ.pop(key, None)
+            tty = _TtyInput(answers=[])
+            monkeypatch.setattr("sys.stdin", tty)
+            import builtins
+
+            answer_iter = iter([answer])
+
+            def _fake_input(*_a, _it=answer_iter, **_k):
+                return next(_it)
+
+            monkeypatch.setattr(builtins, "input", _fake_input)
+            cu.load_dotenv_if_present()
+            assert ("OPENAI_COMPAT_BASE_URL" in os.environ) is expected
+            assert ("OPENAI_COMPAT_API_KEY" in os.environ) is expected
+
+        # 拒绝后回退:cwd .env 被拒,repo .env 仍生效。
+        monkeypatch.setattr(cu, "_DOTENV_LOADED_KEYS", set())
+        for key in _DOTENV_KEYS:
+            os.environ.pop(key, None)
+        repo_env.write_text(
+            "OPENAI_COMPAT_MODEL=fallback-model\n", encoding="utf-8"
+        )
+        monkeypatch.setattr("sys.stdin", _TtyInput(answers=[]))
+        answers = iter(["n\n"])
+        import builtins
+
+        monkeypatch.setattr(builtins, "input", lambda *a, **k: next(answers))
+        cu.load_dotenv_if_present()
+        assert "OPENAI_COMPAT_BASE_URL" not in os.environ
+        assert os.environ.get("OPENAI_COMPAT_MODEL") == "fallback-model"
+    finally:
+        if repo_dotenv is not None:
+            repo_env.write_text(repo_dotenv, encoding="utf-8")
+        else:
+            repo_env.unlink(missing_ok=True)
+
+
+def test_cwd_dotenv_model_only_still_loads_silently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """仅模型名(无端点+密钥组合)的 cwd .env 维持现状:直接加载。"""
+    cu = _load_common_utils()
+    _prepare_dotenv_env(monkeypatch)
+    (tmp_path / ".env").write_text(
+        "OPENAI_COMPAT_MODEL=test-model\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    class _NotTty:
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr("sys.stdin", _NotTty())
+    cu.load_dotenv_if_present()
+
+    assert os.environ.get("OPENAI_COMPAT_MODEL") == "test-model"

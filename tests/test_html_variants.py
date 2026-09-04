@@ -108,3 +108,34 @@ def test_legacy_twitch_web_html_format(tmp_path: Path):
     assert any(t == "Kappa" for t in summary["emote_titles"]) or any(
         "first-999" in str(c) for c in summary["emote_classes"]
     )
+
+
+# ============================================================================
+# Security R-4: oversized HTML must be rejected before reading (fail-loud).
+# ============================================================================
+
+def test_oversized_html_rejected_with_valueerror(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """HTML above _MAX_HTML_BYTES must raise ValueError instead of being read."""
+    parser = load_module("chat_parser", "chat_parser.py")
+    html_path = tmp_path / "huge.html"
+    html_path.write_text("<html><body>" + "x" * 256 + "</body></html>", encoding="utf-8")
+
+    monkeypatch.setattr(parser, "_MAX_HTML_BYTES", 100)
+    with pytest.raises(ValueError, match="上限"):
+        parser.parse_chat_html(str(html_path), str(tmp_path / "out_huge"))
+
+
+def test_normal_html_under_limit_unaffected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A small HTML below the (lowered) limit parses exactly as before."""
+    parser = load_module("chat_parser", "chat_parser.py")
+    html_path = tmp_path / "small.html"
+    html_path.write_text(
+        '<html><body><div class="message"><span class="author">Alice</span>'
+        '<span class="message-text">Hey</span></div></body></html>',
+        encoding="utf-8",
+    )
+
+    # 1 KiB is comfortably above the sample file yet far below production limit.
+    monkeypatch.setattr(parser, "_MAX_HTML_BYTES", 1024)
+    chat = parser.parse_chat_html(str(html_path), str(tmp_path / "out_small"))
+    assert isinstance(chat.get("messages"), list)

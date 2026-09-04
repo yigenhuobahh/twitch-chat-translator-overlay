@@ -79,6 +79,9 @@ def test_dotenv_still_loads_complete_config_when_process_has_none(
     )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cu, "_DOTENV_LOADED_KEYS", set())
+    # R-3: cwd .env 同时提供端点+密钥时需交互确认;此处模拟用户确认(y),
+    # 使本测试继续覆盖"进程无配置时完整加载"的原有语义。
+    monkeypatch.setattr(cu, "_confirm_untrusted_dotenv", lambda: True)
 
     cu.load_dotenv_if_present()
 
@@ -179,17 +182,31 @@ def test_windows_reparse_attribute_is_treated_as_indirection(
 
 
 def test_live_pid_takes_precedence_over_old_metadata(monkeypatch: pytest.MonkeyPatch):
+    """活 pid 优先于 stale 判定；但 ABSOLUTE_MAX_LIVE_SEC（7 天）绝对时限兜底
+    Windows pid 复用——2000-01-01 的 meta 已超绝对时限，即使 pid 探活为 True
+    也视为非 live（Fix 6）。新鲜 meta + 活 pid 仍是 live。"""
+    import time
+
     import run_meta as rm
 
     monkeypatch.setattr(rm, "pid_is_alive", lambda _pid: True)
-    assert rm.is_live_run_meta(
+    now = time.time()
+    # 超过绝对时限（updated_at=2000-01-01）：pid 复用兜底生效 → 非 live。
+    assert not rm.is_live_run_meta(
         {
             "status": "running",
             "pid": 123,
             "updated_at": "2000-01-01T00:00:00",
         },
         stale_after_sec=1,
-        now=2_000_000_000,
+        now=now,
+    )
+    # 新鲜 meta + 活 pid：原语义保持 → live。
+    fresh = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now))
+    assert rm.is_live_run_meta(
+        {"status": "running", "pid": 123, "updated_at": fresh},
+        stale_after_sec=1,
+        now=now,
     )
 
 
@@ -512,6 +529,13 @@ def test_compatible_progress_preserves_later_human_review_edit(
 ):
     import translate_chat_openai as tr
 
+    # main() 运行时经 translate_api_env_config 重读环境;上游测试若在
+    # monkeypatch undo 之外泄漏过 os.environ 直写,这里必须先清干净,
+    # 否则进度兼容性判定会拿到错误的 base_url/model。
+    _clear_translation_env(monkeypatch)
+    monkeypatch.delenv("_TWITCH_TRANSPARENT_TEST_MODE", raising=False)
+    monkeypatch.setenv("_TWITCH_TRANSPARENT_TEST_MODE", "1")
+
     message = {
         "index": 0,
         "author": "alice",
@@ -712,6 +736,13 @@ def test_default_resume_preserves_human_edit_of_failed_row(
     monkeypatch: pytest.MonkeyPatch,
 ):
     import translate_chat_openai as tr
+
+    # main() 运行时经 translate_api_env_config 重读环境;上游测试若在
+    # monkeypatch undo 之外泄漏过 os.environ 直写,这里必须先清干净,
+    # 否则进度兼容性判定会拿到错误的 base_url/model。
+    _clear_translation_env(monkeypatch)
+    monkeypatch.delenv("_TWITCH_TRANSPARENT_TEST_MODE", raising=False)
+    monkeypatch.setenv("_TWITCH_TRANSPARENT_TEST_MODE", "1")
 
     message = {
         "index": 0,
