@@ -163,16 +163,26 @@ def _make_video_late_offset_video(out_path: Path, content_s: float = 3.0, lead_i
 
     make_leadin_video freezes via tpad and ends up with both stream starts at 0
     after remux; a real VOD reports video start_time > 0. This reproduces that
-    shape: -itsoffset on the video input, audio from 0.
+    shape: the video PTS is shifted forward with setpts (muxer records an elst
+    edit list so ffprobe reports video start_time≈lead_in) while audio starts
+    at 0.
+
+    Note: ``-itsoffset`` was previously used here, but some ffmpeg builds
+    (Ubuntu apt builds seen on CI) drop the input offset for the video stream
+    at mux time, yielding start_time=0 and silently disabling the lead-in
+    branch this fixture must exercise. The filter-level setpts shift survives
+    across builds; a post-generation probe asserts the shift took effect so a
+    build regression fails loudly here instead of as a confusing compose
+    assertion later.
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         "ffmpeg", "-y",
         "-f", "lavfi", "-i", f"sine=frequency=880:duration={content_s + lead_in}",
-        "-itsoffset", str(lead_in),
         "-f", "lavfi", "-i", f"color=c=black:s=320x180:r={fps}:d={content_s}",
-        "-map", "1:v:0", "-map", "0:a:0",
+        "-filter_complex", f"[1:v]setpts=PTS+{lead_in}/TB[v]",
+        "-map", "[v]", "-map", "0:a:0",
         "-c:v", "libx264", "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-t", str(content_s + lead_in),
@@ -180,6 +190,16 @@ def _make_video_late_offset_video(out_path: Path, content_s: float = 3.0, lead_i
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     assert out_path.is_file()
+    info = ffprobe_json(out_path)
+    starts = [
+        float(s.get("start_time") or 0.0)
+        for s in info.get("streams") or []
+        if s.get("codec_type") == "video"
+    ]
+    assert starts and abs(starts[0] - lead_in) <= 0.05, (
+        f"fixture build failed: video start_time did not pick up the setpts "
+        f"shift (got {starts}; ffmpeg build drops it?)"
+    )
     return out_path
 
 

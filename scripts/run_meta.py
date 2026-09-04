@@ -142,14 +142,16 @@ def is_live_run_meta(
     return True
 
 
-def _replace_with_retry(tmp_path: Path, path: Path, *, attempts: int = 5) -> None:
+def _replace_with_retry(tmp_path: Path, path: Path, *, attempts: int = 10) -> None:
     """os.replace with a short retry for Windows sharing violations.
 
     A concurrent reader of run_meta.json (e.g. --clean's liveness probe) holds
     the destination open without FILE_SHARE_DELETE; MoveFileEx then fails once
-    with WinError 5 and succeeds right after the reader closes. Retrying beats
-    crashing a render that is minutes deep. Retries stay cheap: they only run
-    on the transient PermissionError path, never on success.
+    with WinError 5 and succeeds right after the reader closes. With many
+    concurrent writers (6 threads x 25 writes in the CI stress test) a writer
+    can lose the race several times in a row, so the retry budget is generous
+    and the backoff grows to ~2.3s worst case. Retries only run on the
+    transient PermissionError path, never on success.
     """
     for attempt in range(attempts):
         try:
@@ -158,7 +160,7 @@ def _replace_with_retry(tmp_path: Path, path: Path, *, attempts: int = 5) -> Non
         except PermissionError:
             if attempt == attempts - 1:
                 raise
-            time.sleep(0.02 * (attempt + 1))
+            time.sleep(0.02 * (2**attempt))
 
 
 def write_run_meta(job_dir: str | Path, payload: dict[str, Any]) -> Path:
