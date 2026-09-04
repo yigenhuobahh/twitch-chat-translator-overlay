@@ -34,6 +34,11 @@ class PipelineError(SystemExit):
     """
 
 
+# 复核表 severity 单调升级顺序：同一条消息命中多条规则时取最严重者，
+# 而不是被后到的 OK/WARN 覆盖。
+_SEVERITY_RANK = {"OK": 0, "WARN": 1, "FAIL": 2}
+
+
 def _review_issue_map(json_path: Path, max_chars: int = 90, data: dict | None = None, lint_fn=None):
     """Map message index -> (severity, codes, notes) from lint, without printing a full report.
 
@@ -67,12 +72,11 @@ def _review_issue_map(json_path: Path, max_chars: int = 90, data: dict | None = 
     for issue in issues:
         idx = issue.get("index")
         bucket = by_index.setdefault(idx, {"severity": "OK", "codes": [], "notes": []})
-        sev = issue.get("severity", "WARN")
-        if sev == "FAIL" or bucket["severity"] != "FAIL":
-            if sev == "FAIL":
-                bucket["severity"] = "FAIL"
-            elif bucket["severity"] != "FAIL":
-                bucket["severity"] = sev
+        sev = str(issue.get("severity", "WARN")).upper()
+        if sev not in _SEVERITY_RANK:
+            sev = "WARN"
+        if _SEVERITY_RANK[sev] > _SEVERITY_RANK[bucket["severity"]]:
+            bucket["severity"] = sev
         code = str(issue.get("code", ""))
         if code:
             bucket["codes"].append(code)
@@ -80,6 +84,24 @@ def _review_issue_map(json_path: Path, max_chars: int = 90, data: dict | None = 
         if note:
             bucket["notes"].append(note)
     return by_index
+
+
+def _xlsx_formula_sanitize(value):
+    """对以 = + - @ \\t 开头的字符串前置单引号，阻断 Excel 电子表格注入。
+
+    只处理 str 类型；单引号是 Excel 官方"按文本处理"的标记，导入侧
+    _strip_formula_quote 会剥掉它，保真往返。
+    """
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t"):
+        return "'" + value
+    return value
+
+
+def _strip_formula_quote(value):
+    """剥掉导出侧为防注入添加的前置单引号（只在我们自己加的约定内剥离）。"""
+    if isinstance(value, str) and value.startswith("'") and len(value) > 1 and value[1:2] in ("=", "+", "-", "@", "\t"):
+        return value[1:]
+    return value
 
 
 def _review_rows(
@@ -142,7 +164,14 @@ def export_review_tsv(
         return
     lines = ["index\ttimestamp\tauthor\toriginal\ttranslation\tlint_severity\tlint_codes\tlint_notes"]
     for row in _review_rows(json_path, include_lint=True, data=data, issue_map=issue_map):
-        lines.append("\t".join(map(str, row)))
+        # 防 Excel 公式注入：以 = + - @ \t 开头的字符串前置单引号（TSV 里
+        # 同样生效——Excel 打开 TSV 时也会执行公式）。
+        lines.append(
+            "\t".join(
+                str(_xlsx_formula_sanitize(v)) if i in (2, 3, 4) else str(v)
+                for i, v in enumerate(row)
+            )
+        )
     review_path.parent.mkdir(parents=True, exist_ok=True)
     review_path.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
     print(f"\n[人工复核] 已导出中英对照 TSV: {review_path}")
@@ -176,7 +205,9 @@ def export_review_xlsx(
     header = ["index", "timestamp", "author", "original", "translation", "lint_severity", "lint_codes", "lint_notes"]
     ws.append(header)
     for row in _review_rows(json_path, include_lint=True, data=data, issue_map=issue_map):
-        ws.append(row)
+        # 防 Excel 公式注入：在 _review_rows 的 \t\r\n 归一之后、append 之前
+        # 处理（仅 str 列 C=author / D=original / E=translation）。
+        ws.append([_xlsx_formula_sanitize(v) if i in (2, 3, 4) else v for i, v in enumerate(row)])
 
     header_fill = PatternFill("solid", fgColor="D9EAF7")
     fail_fill = PatternFill("solid", fgColor="F8CBAD")
@@ -196,6 +227,10 @@ def export_review_xlsx(
         for cell in row:
             cell.font = Font(name="Arial")
             cell.alignment = Alignment(vertical="top", wrap_text=True)
+        # 类型漂移防护：original/translation 一律按文本存储，防止 "=1+1"
+        # 之类内容被 Excel 重解释成数字/公式后类型丢失。
+        row[3].number_format = "@"
+        row[4].number_format = "@"
         row[3].alignment = Alignment(vertical="top", wrap_text=True)
         row[4].alignment = Alignment(vertical="top", wrap_text=True)
         sev = str(row[5].value or "").upper()
@@ -227,6 +262,10 @@ def import_review_xlsx(json_path: Path, review_path: Path, *, dry_run: bool = Fa
     by_index = {int(m.get("index")): m for m in data.get("messages", []) if str(m.get("index", "")).isdigit()}
     wb = load_workbook(review_path)
     ws = wb.active
+    # 维度预检：损坏/伪造文件可能声明天文数字的维度，max_row 驱动的逐行
+    # 遍历会变成小时级假死；超阈值直接判损坏拒绝处理。
+    if ws.max_row > 1_000_000 or ws.max_column > 64:
+        raise SystemExit("复核表维度异常，疑似损坏文件")
     header = [ws.cell(row=1, column=i).value for i in range(1, 9)]
     required = ["index", "timestamp", "author", "original", "translation"]
     if header[:5] != required:
@@ -252,6 +291,8 @@ def import_review_xlsx(json_path: Path, review_path: Path, *, dry_run: bool = Fa
             continue
         raw_cell = ws.cell(row=row_no, column=5).value
         translation = str(raw_cell or "").strip()
+        # 剥掉导出侧防注入添加的前置单引号，保真往返（只剥我们自己的约定）。
+        translation = _strip_formula_quote(translation)
         # Empty cells must not wipe existing non-empty translations on writeback.
         existing = str(by_index[idx].get("translation", "") or "").strip()
         if not translation and existing:
@@ -297,7 +338,8 @@ def import_review_tsv(json_path: Path, review_path: Path, *, dry_run: bool = Fal
         if idx not in by_index:
             print(f"警告: 第 {line_no} 行 index={idx} 不存在，已跳过")
             continue
-        translation = parts[4].strip()
+        # TSV 导出同样加了防注入 ' 前缀；回写时与 XLSX 侧对称剥掉。
+        translation = _strip_formula_quote(parts[4].strip())
         # Empty cells must not wipe existing non-empty translations on writeback.
         existing = str(by_index[idx].get("translation", "") or "").strip()
         if not translation and existing:

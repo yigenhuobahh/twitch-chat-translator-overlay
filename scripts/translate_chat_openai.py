@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Twitch chat translator - OpenAI-compatible backend
@@ -113,7 +113,9 @@ Every message must have a corresponding entry with the same index. Each translat
 
 
 def load_json(path):
-    with open(path, encoding="utf-8") as f:
+    # utf-8-sig: 手工编辑器常在文件头写 BOM，plain utf-8 会让 json.load 抛
+    # "Expecting value" 而误报文件损坏；对无 BOM 文件行为不变。
+    with open(path, encoding="utf-8-sig") as f:
         return json.load(f)
 
 
@@ -492,6 +494,12 @@ def translate_batch(client, batch, batch_num, context, target_language, cache=No
                     f"duplicate indexes in model response: {returned_indexes}"
                 )
             returned_set = set(returned_indexes)
+            # 合法 JSON 但 translations 为空数组（且无无效行）时，下面的
+            # returned_total 为 0，修复分支整体被跳过、空结果被当成成功返回。
+            # 必须显式判空走重试（raise 会被本层 except Exception 捕获，
+            # classify 后进入既有退避重试语义）。
+            if need_model and not translations and not invalid_index_count:
+                raise ValueError("empty translations in model response")
             # Dropped non-numeric-index rows still count toward the response
             # size, so one garbage row is not misread as a missing translation.
             # A response where every row was dropped stays a failed response
@@ -667,7 +675,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cache-dir",
         default=None,
-        help="可选翻译磁盘缓存目录（按 原文+语言+model+context 哈希）",
+        help="可选翻译磁盘缓存目录（按 原文+语言+model+context 哈希）。"
+        "注意：缓存文件明文含聊天原文，目录视为敏感数据，勿放入公开同步盘",
     )
     parser.add_argument(
         "--no-cache",
@@ -924,6 +933,10 @@ def main():
     error_counts = {}
     progress_lock = threading.Lock()
     error_counts_lock = threading.Lock()
+    # O·全局熔断:AUTH/CLIENT 是配置类错误,重试也不会好;一旦任何批遇到,
+    # 停止提交新批次、不再消费剩余 future,避免 N 个 worker 各自把全部批次
+    # 打一遍 API(批次数×配置错误的放大)。
+    abort_event = threading.Event()
     try:
         from task_events import emit_task_event
     except ImportError:  # pragma: no cover - script remains standalone
@@ -934,6 +947,8 @@ def main():
     def bump_error(kind: str) -> None:
         with error_counts_lock:
             error_counts[kind] = error_counts.get(kind, 0) + 1
+        if kind in (TranslationErrorKind.AUTH, TranslationErrorKind.CLIENT):
+            abort_event.set()
 
     # Input fingerprints authenticate every row, including failed rows.
     # JSON-value snapshots let resume recognize edits made after this save.
@@ -998,6 +1013,8 @@ def main():
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
             futures = {}
             for batch_num, batch in batches:
+                if abort_event.is_set():
+                    break
                 future = executor.submit(
                     translate_batch,
                     client,
@@ -1012,6 +1029,11 @@ def main():
                 futures[future] = (batch_num, batch)
 
             for future in concurrent.futures.as_completed(futures):
+                if abort_event.is_set():
+                    # 已熔断:不再 result() 剩余 future(等只会放大配置错误的
+                    # API 调用),直接跳出;未消费的 future 由 executor 退出时
+                    # 统一等待收尾。对应批次仍会被下方 missing 标记为失败。
+                    break
                 batch_num, batch = futures[future]
                 try:
                     translations = future.result()

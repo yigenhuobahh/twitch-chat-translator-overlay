@@ -576,3 +576,238 @@ def test_review_table_export_creates_missing_parent_dirs(tmp_path: Path):
     nested_xlsx = tmp_path / "review-x" / "r.xlsx"
     pipe.export_review_xlsx(json_path, nested_xlsx)
     assert nested_xlsx.is_file()
+
+
+# ---------------------------------------------------------------------------
+# C2·BOM: 手工编辑器写入的 BOM 不得让护栏失效
+# ---------------------------------------------------------------------------
+
+
+def _write_bom_json(path: Path, payload: dict) -> None:
+    path.write_bytes(b"\xef\xbb\xbf" + json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+
+def test_bom_translation_json_counts_nonempty(tmp_path: Path):
+    """带 BOM 的翻译 JSON 也要被 nonempty 计数识别（护栏前提）。"""
+    import translation_io
+
+    path = tmp_path / "t.json"
+    _write_bom_json(
+        path,
+        {"messages": [{"index": 0, "translation": "你好"}]},
+    )
+    assert translation_io.translation_json_nonempty_count(path) == 1
+
+
+def test_write_export_refuses_existing_bom_nonempty_without_force(tmp_path: Path):
+    """已有 BOM 且非空译文的 JSON，force=False 导出必须拒绝覆盖。"""
+    import translation_io
+
+    path = tmp_path / "t.json"
+    _write_bom_json(
+        path,
+        {"messages": [{"index": 0, "translation": "手翻成果"}]},
+    )
+    chat = {
+        "messages": [
+            {
+                "author": "a",
+                "timestamp": 1.0,
+                "stream_timestamp": 1.0,
+                "fragments": [{"type": "text", "text": ": hi"}],
+            }
+        ]
+    }
+    with pytest.raises(FileExistsError, match="非空 translation"):
+        translation_io.write_export_translation_json(path, chat, force=False)
+
+
+def test_load_json_reads_bom_file(tmp_path: Path):
+    """translate_chat_openai.load_json 必须能读带 BOM 的翻译 JSON。"""
+    import translate_chat_openai as tr
+
+    path = tmp_path / "t.json"
+    _write_bom_json(path, {"messages": [{"index": 0, "original": "hi"}]})
+    data = tr.load_json(path)
+    assert data["messages"][0]["original"] == "hi"
+
+
+def test_bom_json_roundtrip_via_burn_import(tmp_path: Path):
+    """BOM 翻译 JSON 经 burn 导入门面（open+json.load）正常回填。"""
+    import twitch_chat_burn as burn
+
+    chat = {
+        "messages": [
+            {
+                "author": "alice",
+                "timestamp": 1000.0,
+                "fragments": [{"type": "text", "text": ": hello"}],
+            }
+        ]
+    }
+    path = tmp_path / "t.json"
+    _write_bom_json(
+        path,
+        {
+            "messages": [
+                {
+                    "index": 0,
+                    "author": "alice",
+                    "timestamp": 1000.0,
+                    "original": "hello",
+                    "translation": "你好",
+                }
+            ]
+        },
+    )
+    with open(path, encoding="utf-8-sig") as f:
+        trans_data = json.load(f)
+    replaced, _stripped, warnings = burn.apply_imported_translations(chat, trans_data)
+    assert replaced == 1
+    assert chat["messages"][0]["fragments"][0]["text"] == "你好"
+    assert not any("不一致" in w for w in warnings)
+
+
+# ---------------------------------------------------------------------------
+# O·导出 tmp 唯一化: 并发写同一 export_path 不得互踩
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_export_writes_same_path_atomically(tmp_path: Path):
+    import threading
+
+    import translation_io
+
+    export_path = tmp_path / "t.json"
+    chat = {
+        "messages": [
+            {
+                "author": "a",
+                "timestamp": 1.0,
+                "stream_timestamp": 1.0,
+                "fragments": [{"type": "text", "text": ": hi"}],
+            }
+        ]
+    }
+    errors: list[Exception] = []
+
+    def worker():
+        try:
+            translation_io.write_export_translation_json(export_path, chat, force=True)
+        except Exception as e:  # pragma: no cover - 失败时聚到断言里
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    data = json.loads(export_path.read_text(encoding="utf-8"))
+    assert data["schema_version"] == 2
+    assert len(data["messages"]) == 1
+    # 无残留 .tmp（mkstemp 唯一名 + finally unlink）
+    assert not list(tmp_path.glob("*.json.*.tmp"))
+
+
+# ---------------------------------------------------------------------------
+# R3·XLSX 公式注入: 以 = + - @ 开头的内容不得被 Excel 当公式执行
+# ---------------------------------------------------------------------------
+
+
+def test_review_xlsx_formula_injection_roundtrip(tmp_path: Path):
+    """original="=1+1" 导出后不得成为公式；导入剥掉防注入前缀保真还原。"""
+    from openpyxl import load_workbook
+
+    import render_cn_chat as pipeline
+
+    src = {
+        "messages": [
+            {
+                "index": 0,
+                "timestamp": 1.0,
+                "author": "a",
+                "original": "=1+1",
+                "translation": "已译",
+            }
+        ]
+    }
+    json_path = tmp_path / "t.json"
+    json_path.write_text(json.dumps(src, ensure_ascii=False), encoding="utf-8")
+    xlsx = tmp_path / "r.xlsx"
+
+    pipeline.export_review_xlsx(json_path, xlsx)
+
+    wb = load_workbook(xlsx)
+    ws = wb.active
+    # 回读断言：original 单元格不是公式（data_type 'f' 即公式）
+    original_cell = ws.cell(row=2, column=4)
+    assert original_cell.data_type != "f"
+    assert str(original_cell.value).startswith("'")
+
+    # 回写 translation 后导入：剥离防注入前缀，还原原文内容
+    src["messages"][0]["translation"] = "=2+2"
+    json_path.write_text(json.dumps(src, ensure_ascii=False), encoding="utf-8")
+    pipeline.export_review_xlsx(json_path, xlsx)
+    pipeline.import_review_xlsx(json_path, xlsx)
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    assert data["messages"][0]["translation"] == "=2+2"
+
+
+def test_review_xlsx_original_stays_text_type(tmp_path: Path):
+    """original/translation 列必须按文本（'@'）存储，防止类型漂移。"""
+    from openpyxl import load_workbook
+
+    import render_cn_chat as pipeline
+
+    src = {
+        "messages": [
+            {
+                "index": 0,
+                "timestamp": 1.0,
+                "author": "a",
+                "original": "2024-01-02",
+                "translation": "1.5倍上分",
+            }
+        ]
+    }
+    json_path = tmp_path / "t.json"
+    json_path.write_text(json.dumps(src, ensure_ascii=False), encoding="utf-8")
+    xlsx = tmp_path / "r.xlsx"
+    pipeline.export_review_xlsx(json_path, xlsx)
+
+    wb = load_workbook(xlsx)
+    ws = wb.active
+    assert ws.cell(row=2, column=4).number_format == "@"
+    assert ws.cell(row=2, column=5).number_format == "@"
+
+
+# ---------------------------------------------------------------------------
+# R5·severity 合并单调升级
+# ---------------------------------------------------------------------------
+
+
+def test_review_issue_map_severity_monotonic_upgrade(tmp_path: Path):
+    """同 index 多条 issue：severity 只升不降（[OK, WARN]→WARN 等）。"""
+    import review_tables as rt
+
+    json_path = tmp_path / "t.json"
+    json_path.write_text("{}", encoding="utf-8")
+
+    def issue(sev: str) -> dict:
+        return {"index": 0, "severity": sev, "code": f"c_{sev}", "message": sev}
+
+    def merge(*sevs: str) -> dict:
+        return rt._review_issue_map(
+            json_path,
+            data={"messages": []},
+            lint_fn=lambda *_a, **_k: [issue(s) for s in sevs],
+        )[0]
+
+    assert merge("WARN", "OK")["severity"] == "WARN"
+    assert merge("OK", "WARN")["severity"] == "WARN"
+    assert merge("WARN", "FAIL")["severity"] == "FAIL"
+    assert merge("FAIL", "WARN", "OK")["severity"] == "FAIL"
+    # 未知 severity 归一为 WARN，不抛异常
+    assert merge("OK", "WEIRD")["severity"] == "WARN"

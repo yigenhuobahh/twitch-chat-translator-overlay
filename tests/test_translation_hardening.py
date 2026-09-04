@@ -372,6 +372,38 @@ def test_translate_batch_still_retries_when_model_omits_a_row(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# R1: 合法 JSON 但 translations 为空数组时必须走重试，不得静默返回 []
+# ---------------------------------------------------------------------------
+
+
+def test_translate_batch_retries_on_valid_empty_translations(monkeypatch):
+    import translate_chat_openai as tr
+
+    monkeypatch.setattr(tr.time, "sleep", lambda _s: None)
+    # 恒返回合法 JSON 但空数组：历史实现会跳过修复/重试分支直接返回 []，
+    # 让"批成功但零译文"骗过 main() 的失败标记。
+    payload = json.dumps({"translations": []}, ensure_ascii=False)
+    record = {"calls": 0}
+    client = _client_returning([payload], record)()
+    error_counts: dict[str, int] = {}
+
+    result = tr.translate_batch(
+        client,
+        [{"index": 5, "original": "a"}, {"index": 9, "original": "b"}],
+        1,
+        "ctx",
+        "zh",
+        cache=tr.TranslationCache(None),
+        error_counts=error_counts,
+    )
+
+    # 3 次重试全部耗尽后必须返回 None（缓存项也没有），且确实调了 3 次 API。
+    assert record["calls"] == 3
+    assert result is None
+    assert error_counts.get("unknown") == 3
+
+
+# ---------------------------------------------------------------------------
 # PARSE-N4: non-string progress translation values must not be reused
 # ---------------------------------------------------------------------------
 
@@ -564,6 +596,9 @@ def test_dotenv_parses_export_prefix_and_inline_comments(
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
+    # R-3: cwd .env 同时提供端点+密钥时需交互确认;此处模拟用户确认(y),
+    # 使本解析语义测试继续覆盖 export 前缀/行内注释的处理。
+    monkeypatch.setattr(cu, "_confirm_untrusted_dotenv", lambda: True)
 
     cu.load_dotenv_if_present()
 
@@ -817,3 +852,69 @@ def test_keyboard_interrupt_forces_progress_persist_of_completed_batches(
     # 中断发生在收尾之前:JSON 快照未写回,译文只在 progress 中。
     updated = json.loads(json_path.read_text(encoding="utf-8"))
     assert [m["translation"] for m in updated["messages"]] == ["", "", ""]
+
+
+# ---------------------------------------------------------------------------
+# O·AUTH/CLIENT 全局熔断: 配置类错误不得让每个 worker 把全部批次打一遍 API
+# ---------------------------------------------------------------------------
+
+
+def test_main_aborts_remaining_batches_on_auth_error(tmp_path: Path, monkeypatch):
+    """首批返回 401 后：所有批次都标记失败，但 API 实际调用远小于批次数。"""
+    import translate_chat_openai as tr
+
+    messages = [
+        {"index": i, "author": "a", "original": f"m{i}", "translation": ""}
+        for i in range(8)
+    ]
+    json_path = tmp_path / "auth_abort.json"
+    json_path.write_text(
+        json.dumps({"messages": messages}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    class AuthError(Exception):
+        status_code = 401
+
+    class Completions:
+        calls = 0
+
+        def create(self, **_kwargs):
+            Completions.calls += 1
+            raise AuthError("401 unauthorized: invalid api key")
+
+    class Client:
+        def __init__(self, **_kwargs):
+            self.chat = SimpleNamespace(completions=Completions())
+
+    monkeypatch.setattr(tr.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(tr, "OpenAI", Client)
+    monkeypatch.setattr(tr, "BASE_URL", "https://provider.invalid/v1")
+    monkeypatch.setattr(tr, "API_KEY", "stub-key")
+    monkeypatch.setattr(tr, "MODEL", "stub-model")
+    monkeypatch.setattr(
+        tr.sys,
+        "argv",
+        [
+            "translate_chat_openai.py",
+            str(json_path),
+            "--workers",
+            "4",
+            "--batch-size",
+            "1",
+        ],
+    )
+
+    # 缺失译文时 main() 以 SystemExit(1) 退出
+    with pytest.raises(SystemExit) as exc_info:
+        tr.main()
+
+    assert exc_info.value.code == 1
+
+    # 全部 8 批（8 条非保留消息）都失败
+    progress = tr.load_progress(tr.progress_path_for(json_path))
+    assert sorted(progress["failed"]) == list(range(8))
+    # 熔断生效：8 批 × workers 4 本可放大到 ~8+ 次 API 调用；熔断后 1-2 次。
+    assert Completions.calls < 8, Completions.calls
+    updated = json.loads(json_path.read_text(encoding="utf-8"))
+    assert all(m["translation"] == m["original"] for m in updated["messages"])

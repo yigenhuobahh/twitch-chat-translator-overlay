@@ -41,6 +41,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from chat_parser import parse_chat_html
+import chat_window
 from chat_window import (
     apply_time_offset,
     compute_time_offset,
@@ -99,6 +100,7 @@ from process_util import (
     is_dangerous_publish_path,
     make_job_dir,
     path_is_under,
+    redact_command,
     run_tracked,  # noqa: F401  (re-exported; owner use in overlay_compose)
 )
 from render_perf import (  # noqa: F401  (frame-store helpers re-exported)
@@ -427,7 +429,7 @@ def _validate_runtime_args(args) -> None:
     validate_positive_int("--h/--height", args.height, minimum=16, maximum=4320)
     validate_positive_int("--font-size", args.font_size, minimum=8, maximum=128)
     validate_positive_int("--emote-height", args.emote_height, minimum=8, maximum=256)
-    validate_positive_int("--max-visible", args.max_visible, minimum=0, maximum=100)
+    validate_positive_int("--max-visible", args.max_visible, minimum=0, maximum=100)  # minimum=0 实为非负校验，名称沿用历史
     validate_positive_int(
         "--message-image-cache-size",
         args.message_image_cache_size,
@@ -440,7 +442,7 @@ def _validate_runtime_args(args) -> None:
     args.stack_mode = stack_mode
     if stack_mode == "lanes":
         validate_positive_float("--msg-lifetime", args.msg_lifetime, minimum=0.1, maximum=600.0)
-    validate_positive_int("--max-message-lines", args.max_message_lines, minimum=0, maximum=100)
+    validate_positive_int("--max-message-lines", args.max_message_lines, minimum=0, maximum=100)  # minimum=0 实为非负校验，名称沿用历史
     validate_non_negative_float("--min-visible-seconds", args.min_visible_seconds, maximum=600.0)
     validate_non_negative_float("--arrival-interval", args.arrival_interval, maximum=600.0)
     for ratio_arg in ("x_ratio", "y_ratio", "width_ratio", "height_ratio", "font_size_ratio"):
@@ -729,7 +731,7 @@ def resolve_preview_plan(chat_data, args, config, video_dur):
         and args.preview_clip is None
     ):
         frame_t = max(0.0, float(preview_filter_t))
-        win_start, win_end = frame_t, frame_t + 0.05
+        win_start, win_end = frame_t, frame_t + chat_window._PREVIEW_WINDOW_SLACK_S
     if win_start is not None and win_end is not None and not args.export_translation:
         before_n = len(chat_data.get("messages") or [])
         before_e = len(chat_data.get("emote_map") or {})
@@ -1042,23 +1044,27 @@ def _main(status_sink=None):
             print("错误: 需要 Pillow 库，请运行 pip install pillow")
             sys.exit(1)
 
-    apply_relative_layout(config, video_path)
-    # run.bat / layout_default use absolute 1080p pixels; scale into non-1080p frames.
-    adapt_note = adapt_absolute_layout_to_source(config, video_path)
-    if adapt_note:
-        print(f"[INFO] {adapt_note}", flush=True)
+    # 仅渲染/出片流程需要源视频布局适配与成片帧率；纯导出翻译模式
+    # （--export-translation）没有可用的视频也不渲染，跳过这些探测与打印。
+    if not args.export_translation:
+        apply_relative_layout(config, video_path)
+        # run.bat / layout_default use absolute 1080p pixels; scale into non-1080p frames.
+        adapt_note = adapt_absolute_layout_to_source(config, video_path)
+        if adapt_note:
+            print(f"[INFO] {adapt_note}", flush=True)
     print(f"视频: {video_path}")
     print(f"聊天: {html_path}")
     print(f"区域: x={config.x} y={config.y} w={config.width} h={config.height}")
-    for warn in layout_bounds_warnings(config, video_path):
-        print(f"[WARN] {warn}", flush=True)
-    resolved_out_fps = media_probe.resolve_output_fps(video_path, explicit=config.output_fps, fallback=30)
-    config.output_fps = resolved_out_fps
-    print(
-        f"字体: {config.font_size}px, 弹幕帧率: {config.fps}fps, "
-        f"成片帧率: {config.output_fps}fps"
-        + (" (跟随源视频)" if args.output_fps is None else "")
-    )
+    if not args.export_translation:
+        for warn in layout_bounds_warnings(config, video_path):
+            print(f"[WARN] {warn}", flush=True)
+        resolved_out_fps = media_probe.resolve_output_fps(video_path, explicit=config.output_fps, fallback=30)
+        config.output_fps = resolved_out_fps
+        print(
+            f"字体: {config.font_size}px, 弹幕帧率: {config.fps}fps, "
+            f"成片帧率: {config.output_fps}fps"
+            + (" (跟随源视频)" if args.output_fps is None else "")
+        )
     print(
         f"性能: static_reuse={'on' if config.reuse_static_frames else 'off'}, "
         f"blank_skip={'on' if config.skip_blank_frames else 'off'}, "
@@ -1152,7 +1158,8 @@ def _main(status_sink=None):
     # 否则 filter 会缩短 messages 列表，JSON 的全局 index 会对错消息（静默错贴）。
     if args.import_translation:
         import_path = os.path.abspath(args.import_translation)
-        with open(import_path, encoding="utf-8") as f:
+        # utf-8-sig: 兼容手工编辑器写入的 BOM 头，无 BOM 文件行为不变。
+        with open(import_path, encoding="utf-8-sig") as f:
             trans_data = json.load(f)
         try:
             replaced, stripped_placeholders, import_warnings = apply_imported_translations(
@@ -1214,7 +1221,7 @@ def _main(status_sink=None):
             "window": {"start": win_start, "end": win_end},
             "config": config.to_dict(),
             "encode": encode_opts.to_dict() if encode_opts else None,
-            "argv": list(sys.argv),
+            "argv": redact_command(sys.argv),
         })
 
     # Step 2: 渲染帧
@@ -1247,27 +1254,19 @@ def _main(status_sink=None):
             return src_path
         base_name = os.path.basename(src_path)
         promoted = os.path.join(out_base, base_name)
-        # Another process may own the same default name under out_base. Prefer a
-        # job-tagged filename when the target exists and is not our own prior output.
+        # 另一并发任务可能占用了同名默认输出。默认名被占且 alt（job 唯一名）
+        # 空闲时才改用 alt 名；alt 也被占用时沿用默认名，走下方 .bak 备份流程。
         if os.path.isfile(promoted):
             job_tag = os.path.basename(os.path.abspath(out_dir))
             if job_tag.startswith("job_") or job_tag.startswith("batch_"):
                 stem, ext = os.path.splitext(base_name)
                 alt = os.path.join(out_base, f"{stem}__{job_tag}{ext}")
-                # Only switch when alt is free or we are re-promoting into alt.
-                if not os.path.isfile(alt) or os.path.abspath(src_path) != os.path.abspath(promoted):
-                    # If promoted exists from a concurrent job, use unique name.
-                    # Heuristic: if mtime is very recent and path differs from src, collide.
-                    try:
-                        same_file = os.path.samefile(src_path, promoted)
-                    except OSError:
-                        same_file = False
-                    if not same_file:
-                        print(
-                            f"  [concurrent] 输出目录已有 {base_name}，改用唯一名: {os.path.basename(alt)}",
-                            flush=True,
-                        )
-                        promoted = alt
+                if not os.path.isfile(alt):
+                    print(
+                        f"  [concurrent] 输出目录已有 {base_name}，改用唯一名: {os.path.basename(alt)}",
+                        flush=True,
+                    )
+                    promoted = alt
         backup = None
         backup_created = False
         # Back up existing output before overwriting (default behavior).

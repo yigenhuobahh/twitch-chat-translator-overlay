@@ -187,11 +187,16 @@ class TranslationCache:
             prompt_version=prompt_version,
         )
         path = self.cache_dir / f"{key}.json"
+        # O·敏感数据:context 可能含用户的 glossary/隐私信息,明文落盘会把
+        # 缓存目录变成敏感数据源;key 已由 context 参与哈希(get 用同样输入
+        # 计算,不读 payload),因此 payload 里只存指纹即可。
         payload = {
             "original": original,
             "target_language": target_language,
             "model": model,
-            "context": context,
+            "context_fingerprint": hashlib.sha256(
+                str(context or "").encode("utf-8")
+            ).hexdigest(),
             "provider": provider,
             "prompt_version": prompt_version,
             "translation": translation,

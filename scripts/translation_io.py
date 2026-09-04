@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import tempfile
 
 from translation_support import clean_translation_text as clean_imported_translation
 
@@ -56,7 +57,10 @@ def translation_json_nonempty_count(path: str | Path) -> int:
     if not p.is_file():
         return 0
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        # utf-8-sig: 手工编辑（记事本等）常在文件头留下 BOM；带 BOM 时 utf-8
+        # 解码出的 "\ufeff" 会让 json.loads 抛异常，护栏被当成"文件不可读"
+        # 而放行覆盖。utf-8-sig 对无 BOM 文件行为不变，有 BOM 时自动剥离。
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
     except Exception:
         return 0
     items = data.get("messages") if isinstance(data, dict) else None
@@ -120,9 +124,21 @@ def write_export_translation_json(
         )
     payload = build_export_translation_payload(chat_data, offset_info=offset_info)
     export_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = export_path.with_suffix(export_path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, export_path)
+    # mkstemp 唯一临时名（样板=run_meta.write_run_meta）：固定 ".json.tmp"
+    # 名在并发写同一 export_path 时会互相截断/互踩，产物可能损坏。
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{export_path.name}.", suffix=".tmp", dir=str(export_path.parent)
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, export_path)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
     return payload
 
 

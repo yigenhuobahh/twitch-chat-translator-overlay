@@ -296,6 +296,26 @@ class TestTranslationCleaning:
         assert mod.clean_translation_text("译文A / 译文B") == "译文A"
 
 
+class TestRedactCommand:
+    """run_meta/argv redaction (process_util.redact_command)."""
+
+    def test_redact_command_hides_separated_oauth_value(self):
+        from process_util import redact_command
+
+        assert redact_command(["x", "--oauth", "abc123"]) == ["x", "--oauth", "[redacted]"]
+
+    def test_redact_command_hides_inline_oauth_value(self):
+        from process_util import redact_command
+
+        assert redact_command(["x", "--oauth=abc123"]) == ["x", "--oauth=[redacted]"]
+
+    def test_redact_command_keeps_non_secret_flags(self):
+        from process_util import redact_command
+
+        command = ["python", "render.py", "--offset", "1.5", "--download", "123"]
+        assert redact_command(command) == command
+
+
 class TestOutputPublish:
     """Pipeline final-path publishing should create parents and replace atomically."""
 
