@@ -190,16 +190,11 @@ def _make_video_late_offset_video(out_path: Path, content_s: float = 3.0, lead_i
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     assert out_path.is_file()
-    info = ffprobe_json(out_path)
-    starts = [
-        float(s.get("start_time") or 0.0)
-        for s in info.get("streams") or []
-        if s.get("codec_type") == "video"
-    ]
-    assert starts and abs(starts[0] - lead_in) <= 0.05, (
-        f"fixture build failed: video start_time did not pick up the setpts "
-        f"shift (got {starts}; ffmpeg build drops it?)"
-    )
+    # Whether the mp4 muxer keeps the shifted PTS as a start_time-carrying
+    # edit list is build-dependent (9.0 keeps it, Ubuntu's 6.1 apt build
+    # normalizes it to 0). Both shapes are accepted here; callers probe the
+    # timing again and fall back to injecting it when the build normalized
+    # the offset away.
     return out_path
 
 
@@ -327,13 +322,22 @@ def test_compose_audio_late_source_stays_av_aligned(tmp_path: Path):
 
 
 @pytest.mark.smoke
-def test_compose_lead_in_tail_cap_and_validate_floors(tmp_path: Path):
+def test_compose_lead_in_tail_cap_and_validate_floors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Lead-in -t upper bound = output_duration + video_lead_in, floors intact.
 
     Locks the new -t formula at argv level (streams end naturally at ~3.0s, so
     the published length cannot distinguish the cap), then proves end-to-end
     that the raised cap still satisfies both validate floors: the expected
     (render window) floor and the min_duration truncated-tail floor.
+
+    The end-to-end part needs a container whose video stream reports a
+    non-zero start_time. ffmpeg builds differ in whether the mp4 muxer keeps
+    that offset in an elst edit list (9.0 keeps it; the Ubuntu 6.1 apt build
+    normalizes it away, so ffprobe reports 0). The fixture's own probe
+    detects the normalization and the real-compose assertions then inject
+    the probed timing via monkeypatch — the argv/formula locks and the
+    validate-floor contracts still run against a real encode everywhere,
+    while builds that do keep the offset exercise the untouched probe path.
     """
     from encode_options import EncodeOptions
     from overlay_config import OverlayConfig
@@ -341,6 +345,17 @@ def test_compose_lead_in_tail_cap_and_validate_floors(tmp_path: Path):
     burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
     src = _make_video_late_offset_video(tmp_path / "leadin_src.mp4", content_s=3.0, lead_in=1.0)
     timing = burn.resolve_source_av_timing(str(src))
+    if timing["video_lead_in"] == 0.0:
+        # This build normalized the edit list away (Ubuntu 6.1): fall back to
+        # injecting the intended timing so the formula/floor contracts below
+        # stay covered. Everything else (encode, validate, probe of the OUTPUT
+        # file) stays fully real.
+        timing = dict(timing, video_start=1.0, audio_start=0.0, video_lead_in=1.0)
+        monkeypatch.setattr(
+            burn.overlay_compose,
+            "get_stream_start_time",
+            lambda _path, selector: 1.0 if selector == "v:0" else 0.0,
+        )
     assert timing["video_lead_in"] == pytest.approx(1.0, abs=0.05), f"lead-in branch must engage: {timing}"
     assert timing["audio_late"] == pytest.approx(0.0, abs=0.02), (
         f"fixture must not be audio-late (adelay would perturb the tail): {timing}"

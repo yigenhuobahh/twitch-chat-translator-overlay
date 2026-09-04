@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import time
 
 from translation_support import clean_translation_text as clean_imported_translation
 
@@ -133,7 +134,17 @@ def write_export_translation_json(
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as file:
             json.dump(payload, file, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, export_path)
+        # os.replace 可能在 Windows 上因并发读者/写者持有目标句柄
+        # (FILE_SHARE_DELETE 缺失) 短暂 PermissionError —— 与
+        # run_meta._replace_with_retry 同款小退避重试。
+        for attempt in range(10):
+            try:
+                os.replace(tmp_path, export_path)
+                break
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.02 * (2**attempt))
     finally:
         try:
             tmp_path.unlink(missing_ok=True)
