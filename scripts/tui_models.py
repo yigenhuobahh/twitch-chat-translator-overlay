@@ -86,8 +86,20 @@ _MODE_JOB_FIELDS: dict[str, dict[str, Any]] = {
 }
 _MODE_JOB_FIELDS_DEFAULT = {"mode": "full"}
 
-# Preview modes additionally carry the requested preview window.
-# （--preview-clip 已对任意任务模式无条件投影；见 to_job_fields。）
+# 预览模式（含 legacy 预览别名）才携带/校验预览时长；出片模式既不投影
+# preview_clip 也不校验它（曾因无条件投影把一键出片截成 10 秒）。
+_PREVIEW_MODES = frozenset({
+    MODE_QUICK_PREVIEW_ORIGINAL,
+    MODE_QUICK_PREVIEW_TRANSLATED,
+    MODE_ORIGINAL_PREVIEW,
+    MODE_TRANSLATED_PREVIEW,
+})
+
+
+def is_preview_mode(mode: str) -> bool:
+    """True when the task mode renders a short preview clip (carries preview_clip)."""
+    return mode in _PREVIEW_MODES
+
 
 # Modes that call the translation API unless a manual/render/reuse override
 # short-circuits it first (see TuiJobDraft.requires_translation).
@@ -283,9 +295,11 @@ class TuiJobDraft:
             "manual_translation": self.manual_translation,
         })
         fields.update(dict(_MODE_JOB_FIELDS.get(self.mode, _MODE_JOB_FIELDS_DEFAULT)))
-        # 管线对任意模式都支持 --preview-clip，因此无条件投影；
-        # 预览时长合法性仍由 validate 负责。
-        fields["preview_clip"] = self.preview_clip
+        # 仅预览模式携带 --preview-clip；出片模式投影该字段会把整片截成
+        # 预览时长（一键出片 10 秒 bug 的根因），因此这里按模式过滤，
+        # 表单里填的值在出片模式下被直接忽略。
+        if self.mode in _PREVIEW_MODES:
+            fields["preview_clip"] = self.preview_clip
         if self.render_original:
             fields["render_original"] = True
         if self.reuse_translation:
@@ -326,11 +340,13 @@ class TuiJobDraft:
             problems.append("聊天文件必须是 .html 或 .htm。")
         if self.mode not in MODES:
             problems.append("请选择一个受支持的任务模式。")
-        try:
-            if float(self.preview_clip) <= 0:
-                problems.append("预览时长必须大于 0。")
-        except (TypeError, ValueError):
-            problems.append("预览时长必须是数字。")
+        if self.mode in _PREVIEW_MODES:
+            # 出片模式不使用预览时长：填什么都不报错也不生效（字段已隐藏）。
+            try:
+                if float(self.preview_clip) <= 0:
+                    problems.append("预览时长必须大于 0。")
+            except (TypeError, ValueError):
+                problems.append("预览时长必须是数字。")
         if self.crf.strip():
             try:
                 crf_value = int(self.crf)

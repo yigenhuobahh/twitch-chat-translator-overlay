@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import atexit
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 import contextlib
 import errno
 import json
@@ -27,6 +27,34 @@ _lock = threading.Lock()
 _active: list[subprocess.Popen] = []
 _handlers_installed = False
 _file_lock_local = threading.RLock()
+
+# Secrets whose *value* is the following argv element must never reach UI logs,
+# run_meta dumps or shareable diagnostics. Single source of truth shared by the
+# Textual launcher (tui_task/tui_run) and the pipeline's run_meta writer.
+_SECRET_ARGUMENT_FLAGS = {"--oauth"}
+
+
+def redact_command(command: Iterable[str]) -> list[str]:
+    """Redact sensitive option values before a command enters UI logs."""
+    safe: list[str] = []
+    redact_next = False
+    for part in command:
+        text = str(part)
+        if redact_next:
+            safe.append("[redacted]")
+            redact_next = False
+            continue
+        if text.lower().startswith("--oauth="):
+            safe.append("--oauth=[redacted]")
+            continue
+        safe.append(text)
+        if text.lower() in _SECRET_ARGUMENT_FLAGS:
+            redact_next = True
+    return safe
+
+
+# Internal alias kept so re-export shims (tui_task) can delegate explicitly.
+_redact_command_impl = redact_command
 
 
 class FileLockTimeoutError(TimeoutError):
@@ -221,7 +249,16 @@ def kill_active_processes(force: bool = True) -> int:
 
 
 def _signal_handler(signum, frame):
-    kill_active_processes(force=True)
+    # 非阻塞抢锁：信号可能恰好在别的线程持有 _lock 的临界区中间到达。
+    # _lock 是非重入 threading.Lock，而 kill_active_processes 内部也会
+    # with _lock —— 若在这里阻塞等待或已持锁再调它，都会永久死锁。
+    # 锁只保护 _active 列表读写：抢到锁说明当前没有别的临界区，先释放
+    # 再调用 kill_active_processes 是安全的；抢不到则跳过本次进程内
+    # 清理，靠下方重抛默认终止。注意 SIG_DFL 默认终止不会跑 atexit——
+    # 这条路径上子进程可能残留，但优于旧方案的 Ctrl+C 挂死。
+    if _lock.acquire(blocking=False):
+        _lock.release()
+        kill_active_processes(force=True)
     # Re-raise default behavior after cleanup.
     signal.signal(signum, signal.SIG_DFL)
     try:
@@ -466,6 +503,13 @@ def _is_partial_artifact(name: str) -> bool:
         return True
     # Exact temp suffix used by some paths; avoid bare ".partial" collateral.
     if lower.endswith(".partial") and (".mp4" in lower or lower.endswith(".webm.partial")):
+        return True
+    # 下载事务 claim 前硬崩溃遗留的分段暂存
+    # （twitch_download._new_download_staging_path: ".<name>.download-<hex8>.<ext>"，
+    # uuid4().hex 为 32 位，故 hex 段下限放宽到 8）。
+    if re.fullmatch(
+        r"\..+\.download-[0-9a-f]{8,}\.(mp4|html|htm|json|mkv|webm|avi|mov|m4v)", lower
+    ):
         return True
     return False
 

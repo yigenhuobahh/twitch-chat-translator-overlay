@@ -440,7 +440,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--preview-clip",
         type=float,
         default=None,
-        help="只渲染 N 秒短片；默认真从 0 秒开始，可用 --preview-dense 选弹幕最密段",
+        help="只渲染 N 秒短片；默认真从 0 秒开始，可用 --preview-dense 选弹幕最密段；仅预览模式使用，正式出片请勿依赖它截断时长",
     )
     parser.add_argument(
         "--preview-dense",

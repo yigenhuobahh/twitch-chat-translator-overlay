@@ -14,8 +14,10 @@ if str(SCRIPTS) not in sys.path:
 
 from tui_models import (
     MODE_AUTO,
+    MODE_FULL_PRODUCTION,
     MODE_FULL_RENDER,
     MODE_ORIGINAL_PREVIEW,
+    MODE_QUICK_PREVIEW_ORIGINAL,
     MODE_RENDER_ONLY,
     MODE_REUSE_RENDER,
     MODE_TRANSLATE_ONLY,
@@ -294,6 +296,41 @@ def test_manual_translation_and_legacy_api_do_not_fail_api_preflight(tmp_path: P
 def test_malformed_preview_clip_yaml_is_a_clear_validation_error():
     with pytest.raises(ValueError, match="preview_clip"):
         TuiJobDraft.from_fields({"preview_clip": []})
+
+
+def test_production_draft_does_not_project_preview_clip(tmp_path: Path):
+    """出片模式 to_job_fields 不携带 preview_clip（一键出片 10 秒截断 bug 回归）。"""
+    video = tmp_path / "source.mp4"
+    chat = tmp_path / "chat.html"
+    video.write_text("x", encoding="utf-8")
+    chat.write_text("x", encoding="utf-8")
+    draft = TuiJobDraft(
+        video=str(video),
+        chat_html=str(chat),
+        mode=MODE_FULL_PRODUCTION,
+        preview_clip=10.0,
+    )
+    fields = draft.to_job_fields()
+    assert "preview_clip" not in fields
+    command = draft.build_command("python", "render_cn_chat.py")
+    assert "--preview-clip" not in command
+
+
+def test_preview_draft_keeps_preview_clip_and_validates_it(tmp_path: Path):
+    """预览模式保留 preview_clip 投影，且合法值不产生校验问题。"""
+    video = tmp_path / "source.mp4"
+    chat = tmp_path / "chat.html"
+    video.write_text("x", encoding="utf-8")
+    chat.write_text("x", encoding="utf-8")
+    draft = TuiJobDraft(
+        video=str(video),
+        chat_html=str(chat),
+        mode=MODE_QUICK_PREVIEW_ORIGINAL,
+        preview_clip=10.0,
+    )
+    fields = draft.to_job_fields()
+    assert fields["preview_clip"] == 10.0
+    assert not any("预览时长" in problem for problem in draft.validate(check_api=False, check_environment=False))
 
 
 def test_download_draft_requires_bounded_segments_and_builds_multi_segment_command(tmp_path: Path):

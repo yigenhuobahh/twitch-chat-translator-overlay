@@ -23,6 +23,9 @@ import shutil
 import subprocess
 import time
 
+# 模块级设置 PIL 炸弹告警上限（见下方常量区注释）；延迟导入仅用于该全局配置。
+from PIL import Image as _PILImage
+
 from chat_schedule import (
     _LaneVisibilityCursor,
     active_float_stack,
@@ -59,6 +62,11 @@ _MAX_EMOTE_ANIMATION_FRAMES = 300
 _MAX_EMOTE_SOURCE_PIXELS = 4_000_000
 _MAX_EMOTE_DECODED_BYTES_PER_ASSET = 32 * 1024 * 1024
 _MAX_EMOTE_DECODED_BYTES_TOTAL = 256 * 1024 * 1024
+
+# PIL 默认在 ~89M 像素附近抛 DecompressionBombWarning/Error。本项目只画小
+# emote 和消息贴图，把上限抬到 64M 像素（=8000x8000，远超任何合理表情
+# 资产）可避开误伤，同时仍低于 PIL 的炸弹告警区间。注意：这是进程级全局。
+_PILImage.MAX_IMAGE_PIXELS = 64_000_000
 
 # Chat fade envelope (seconds): message alpha ramps in over FADE_IN_SECONDS from
 # its first visible frame and out over FADE_OUT_SECONDS before it leaves.
@@ -595,6 +603,8 @@ def render_overlay(chat_data, out_dir, video_path, config):
         assert preview_t is not None
         change_points = [preview_t, min(duration, preview_t + 1 / max(FPS, 1))]
         if change_points[1] <= change_points[0]:
+            # 守卫：预览帧只消费 change_points[0]，右端点仅用于保持
+            # change_points 单调（非降序），防止下游边界假设被破坏。
             change_points[1] = change_points[0] + 1 / max(FPS, 1)
         print(f"  预览帧模式: t={preview_t:.2f}s", flush=True)
     else:
@@ -686,7 +696,8 @@ def render_overlay(chat_data, out_dir, video_path, config):
                 break
 
             out_frame_num = 0 if preview_frame_time is not None else frame_i
-            if frame_num % 256 == 0:
+            # 预览帧模式只写一帧，无需周期性磁盘水位检查。
+            if preview_frame_time is None and frame_num % 256 == 0:
                 ensure_render_disk_headroom(frames_dir)
 
             # Reuse previous identical static frame without re-compositing.
@@ -831,9 +842,22 @@ def _extract_and_publish_preview(frames_dir, out_dir, video_path, config, previe
 
     default_name = f"{Path(video_path).stem}_preview_{preview_t:.1f}s.png".replace(".0s", "s")
     requested_preview = getattr(config, "preview_image", None)
+
+    def _safe_preview_name(raw: str) -> str:
+        """Reject path-trick / option-injection basenames; fall back to default."""
+        name = os.path.basename(str(raw or "").strip())
+        if (
+            not name
+            or name in (".", "..")
+            or ":" in name
+            or name.startswith("-")
+        ):
+            return default_name
+        return name
+
     # Always write under out_dir first (safe job/temp location).
     if requested_preview:
-        safe_name = os.path.basename(str(requested_preview)) or default_name
+        safe_name = _safe_preview_name(requested_preview)
     else:
         safe_name = default_name
     preview_path = os.path.join(out_dir, safe_name)

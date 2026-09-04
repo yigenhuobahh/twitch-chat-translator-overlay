@@ -22,14 +22,23 @@ _MAX_EMOTE_BYTES = 8 * 1024 * 1024
 _MAX_TOTAL_EMOTE_BYTES = 128 * 1024 * 1024
 # A padded base64 payload needs four characters for every three decoded bytes.
 _MAX_EMOTE_BASE64_CHARS = 4 * ((_MAX_EMOTE_BYTES + 2) // 3)
+_MAX_HTML_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB;TwitchDownloader 导出远小于此,超出即视为损坏/恶意输入
 
 
 def _read_html_text(html_path: str) -> str:
     """Read chat HTML robustly: prefer UTF-8 (with BOM), fall back to latin-1.
 
     Never hard-crash on residual non-UTF8 bytes; replace or re-decode.
+    Refuses to read files above ``_MAX_HTML_BYTES`` (fail-loud ValueError,
+    same strategy as the ReDoS guards for oversized emote payloads).
     """
     with open(html_path, "rb") as bf:
+        size = os.fstat(bf.fileno()).st_size
+        if size > _MAX_HTML_BYTES:
+            limit = _MAX_HTML_BYTES
+            raise ValueError(
+                f"聊天 HTML 超过 {limit / 2**30:.0f} GiB 上限({size / 2**30:.1f} GiB),拒绝解析"
+            )
         raw = bf.read()
     if raw.startswith(b"\xef\xbb\xbf"):
         return raw.decode("utf-8-sig", errors="replace")

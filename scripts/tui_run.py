@@ -58,6 +58,7 @@ from tui_models import (
     MODE_TRANSLATED_PREVIEW,
     TuiDownloadDraft,
     TuiJobDraft,
+    is_preview_mode,
 )
 from tui_task import TaskSession, redact_command, redact_text, sanitize_diagnostic_file
 
@@ -173,6 +174,7 @@ class OverlayTui(App[None]):
     #form-validation.ready { color: $success; }
     #form-validation.invalid { color: $warning; }
     #api-status-feedback { margin: 1 0; }
+    .hidden { display: none; }
     """
     TITLE = "Twitch Chat Overlay"
     ISSUE_TEMPLATE_URL = "https://github.com/yigenhuobahh/twitch-chat-translator-overlay/issues/new?template=bug_report.yml"
@@ -265,7 +267,7 @@ class OverlayTui(App[None]):
                     with Horizontal(classes="field-row"):
                         yield Label("输出视频（可选）", classes="field-label")
                         yield Input(placeholder="输出视频路径（可选，默认源视频同目录）", id="output")
-                    with Horizontal(classes="field-row"):
+                    with Horizontal(classes="field-row", id="preview-clip-row"):
                         yield Label("预览时长（秒）", classes="field-label")
                         yield Input(value="10", placeholder="预览时长（秒）", id="preview-clip")
                     with Horizontal(classes="field-row"):
@@ -378,8 +380,41 @@ class OverlayTui(App[None]):
         self._refresh_history()
         self._load_api_config_into_ui()
         self._refresh_form_validation()
+        self._update_preview_clip_visibility()
         # 保留句柄，on_unmount 时显式 stop，避免 teardown 期回调继续触发。
         self.poll_timer = self.set_interval(0.15, self._poll_session)
+
+    def _update_preview_clip_visibility(self) -> None:
+        """Hide the preview-clip row outside preview modes (display:none).
+
+        Correctness does not depend on this UI nicety: to_job_fields filters
+        preview_clip by mode anyway; hiding only prevents the impression that
+        the value still applies to full renders.
+        收起动作延迟到鼠标/键盘空闲（set_timer 0.5s，可被后续交互重置）：
+        若在 Select.Changed 处理中立即 display:none，按下-抬起之间的布局
+        重排会让进行中的点击命中到别的控件（pilot.click 等真实点击链路
+        依赖按下/抬起落在同一控件上）。
+        """
+        row = self._query_optional("#preview-clip-row", Horizontal)
+        if row is None:
+            return
+        mode = self._select_value("#task-mode") or (
+            self.imported_draft.mode if self.imported_draft else MODE_QUICK_PREVIEW_ORIGINAL
+        )
+        if mode == getattr(self, "_preview_clip_row_mode", None):
+            return  # 模式未变，无需重复调度
+        self._preview_clip_row_mode = mode
+        def _apply() -> None:
+            if is_preview_mode(mode):
+                row.remove_class("hidden")
+            else:
+                row.add_class("hidden")
+        if getattr(self, "_preview_clip_row_timer", None) is not None:
+            try:
+                self._preview_clip_row_timer.stop()
+            except Exception:
+                pass
+        self._preview_clip_row_timer = self.set_timer(0.5, _apply)
 
     def _load_api_config_into_ui(self) -> None:
         try:
@@ -402,6 +437,9 @@ class OverlayTui(App[None]):
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id in {"task-mode", "source-media-check", "layout-preset", "render-preset", "encoder"}:
+            if event.select.id == "task-mode":
+                # 模式切换联动：预览时长只在预览模式下有意义。
+                self._update_preview_clip_visibility()
             self._refresh_form_validation()
 
     def on_checkbox_changed(self, event: Checkbox.Changed) -> None:

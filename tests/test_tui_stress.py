@@ -288,6 +288,8 @@ def test_tui_all_workflow_modes_command_generation(tmp_path: Path):
             await pilot.pause(0.02)
             cmd = app._draft().build_command("python", "render_cn_chat.py")
             assert "--mode" in cmd and "full" in cmd
+            # 出片模式绝不携带 --preview-clip（曾把整片截成 10 秒）。
+            assert "--preview-clip" not in cmd
 
             # 4. Core Path: Original Production
             app._set_task_mode_options(value=MODE_ORIGINAL_PRODUCTION)
@@ -295,18 +297,21 @@ def test_tui_all_workflow_modes_command_generation(tmp_path: Path):
             cmd = app._draft(render_original=True).build_command("python", "render_cn_chat.py")
             assert "--mode" in cmd and "render" in cmd
             assert "--render-original" in cmd
+            assert "--preview-clip" not in cmd
 
             # 5. Core Path: Step Export Manual
             app._set_task_mode_options(value=MODE_STEP_EXPORT_MANUAL)
             await pilot.pause(0.02)
             cmd = app._draft().build_command("python", "render_cn_chat.py")
             assert "--manual-translation" in cmd
+            assert "--preview-clip" not in cmd
 
             # 6. Core Path: Step API and Review
             app._set_task_mode_options(value=MODE_STEP_API_AND_REVIEW)
             await pilot.pause(0.02)
             cmd = app._draft().build_command("python", "render_cn_chat.py")
             assert "--review" in cmd
+            assert "--preview-clip" not in cmd
 
             # 7. Core Path: Step Resume Render
             app._set_task_mode_options(value=MODE_STEP_RESUME_RENDER)
@@ -314,6 +319,7 @@ def test_tui_all_workflow_modes_command_generation(tmp_path: Path):
             cmd = app._draft().build_command("python", "render_cn_chat.py")
             assert "--mode" in cmd and "render" in cmd
             assert "--reuse-translation" in cmd
+            assert "--preview-clip" not in cmd
 
     asyncio.run(exercise())
 

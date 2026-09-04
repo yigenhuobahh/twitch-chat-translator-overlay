@@ -76,6 +76,16 @@ def get_stream_start_time(video_path, stream_selector):
             timeout=media_probe._PROBE_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
+        print(
+            f"  [WARN] ffprobe start_time 探测超时,按 0 处理: {video_path}",
+            flush=True,
+        )
+        return 0.0
+    if probe.returncode != 0:
+        print(
+            f"  [WARN] ffprobe start_time 探测失败({probe.returncode}),按 0 处理: {video_path}",
+            flush=True,
+        )
         return 0.0
     try:
         raw = (probe.stdout or "").strip().splitlines()

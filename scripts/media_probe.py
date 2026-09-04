@@ -160,6 +160,10 @@ def probe_video_fps(video_path):
         val = _parse_rate(stream.get(key))
         if val and 1.0 <= val <= 240.0:
             return val
+    print(
+        "  [WARN] 无法探测源帧率，回退 30fps；延时摄影源请显式 --output-fps",
+        flush=True,
+    )
     return None
 
 

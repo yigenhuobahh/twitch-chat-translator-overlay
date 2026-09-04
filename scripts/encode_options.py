@@ -174,6 +174,7 @@ def resolve_encode_options(
 
     if encoder == "auto":
         if prefer_hw:
+            found_hw = False
             for key in ("nvenc", "amf", "qsv"):
                 if key in available:
                     candidate_concrete = available[key]
@@ -181,13 +182,13 @@ def resolve_encode_options(
                         resolved = key
                         concrete = candidate_concrete
                         notes.append(f"auto selected hardware encoder: {key} ({concrete})")
+                        found_hw = True
                         break
-                    else:
-                        notes.append(
-                            f"auto: {key} ({candidate_concrete}) listed by ffmpeg but trial encode failed; "
-                            f"skipping (driver/GPU may be unavailable)"
-                        )
-            else:
+                    notes.append(
+                        f"auto: {key} ({candidate_concrete}) listed by ffmpeg but trial encode failed; "
+                        f"skipping (driver/GPU may be unavailable)"
+                    )
+            if not found_hw:
                 resolved = "x264"
                 concrete = available.get("x264", "libx264")
                 notes.append("auto: no working hardware H.264 encoder found, using libx264")

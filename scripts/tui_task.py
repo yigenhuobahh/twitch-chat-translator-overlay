@@ -15,7 +15,10 @@ import subprocess
 import tempfile
 import threading
 
-from process_util import kill_process_tree
+from process_util import (  # noqa: F401  (redact_command re-exported; single source in process_util)
+    kill_process_tree,
+    redact_command,
+)
 from task_results import read_task_result
 
 EVENT_DIRECTORY = Path("outputs") / ".tui-events"
@@ -43,7 +46,7 @@ _OAUTH_ARGUMENT = re.compile(r"(?i)(--oauth(?:\s+|=))(?:\"[^\"]*\"|'[^']*'|[^\s,
 _ENVIRONMENT_VARIABLE = re.compile(
     r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_(?:KEY|TOKEN|SECRET|PASSWORD)\b"
 )
-_SECRET_ARGUMENT_FLAGS = {"--oauth"}
+# 现由 process_util.redact_command / _SECRET_ARGUMENT_FLAGS 单源维护。
 
 
 def redact_text(value: str) -> str:
@@ -74,25 +77,6 @@ def sanitize_diagnostic_file(path: str | Path) -> Path:
         temporary.write_text(cleaned, encoding="utf-8")
         temporary.replace(target)
     return target
-
-
-def redact_command(command: Iterable[str]) -> list[str]:
-    """Redact sensitive option values before a command enters UI logs."""
-    safe: list[str] = []
-    redact_next = False
-    for part in command:
-        text = str(part)
-        if redact_next:
-            safe.append("[redacted]")
-            redact_next = False
-            continue
-        if text.lower().startswith("--oauth="):
-            safe.append("--oauth=[redacted]")
-            continue
-        safe.append(text)
-        if text.lower() in _SECRET_ARGUMENT_FLAGS:
-            redact_next = True
-    return safe
 
 
 def format_event(record: dict) -> str:

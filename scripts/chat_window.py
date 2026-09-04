@@ -7,6 +7,10 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+# 预览窗口右端余量（秒）：窗口按闭右端 [start, t + slack] 过滤，
+# 保证恰好落在预览时刻的消息仍可见。
+_PREVIEW_WINDOW_SLACK_S = 0.05
+
 
 def compute_time_offset(
     messages: list[dict],
@@ -275,7 +279,7 @@ def preview_window(
     if preview_frame is not None:
         t = max(0.0, float(preview_frame))
         # Keep messages that can still be visible at t.
-        return max(0.0, t - life), t + 0.05
+        return max(0.0, t - life), t + _PREVIEW_WINDOW_SLACK_S
     if preview_clip is not None:
         length = max(0.0, float(preview_clip))
         start = max(0.0, float(clip_start or 0.0))
