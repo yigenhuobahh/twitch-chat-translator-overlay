@@ -563,8 +563,16 @@ def load_yaml_rules(rules_path: Path):
             f"Invalid rules YAML {rules_path}: preserve_patterns must be a list"
         )
     for pattern_index, pat in enumerate(preserve_raw):
+        text = str(pat)
+        # 灾难性回溯防护:超长 pattern(嵌套量词类)编译/搜索代价不可控,
+        # rules YAML 属用户自担配置,但仍在编译入口设硬上限并明确报错。
+        if len(text) > 500:
+            raise PipelineError(
+                f"Invalid rules YAML {rules_path}: preserve_patterns[{pattern_index}] "
+                f"超过 {500} 字符上限({len(text)}),拒绝编译(疑似灾难性回溯风险)"
+            )
         try:
-            preserve.append(re.compile(str(pat)))
+            preserve.append(re.compile(text))
         except re.error as e:
             raise PipelineError(
                 f"Invalid rules YAML {rules_path}: preserve_patterns[{pattern_index}] is not a valid regex: {e}"

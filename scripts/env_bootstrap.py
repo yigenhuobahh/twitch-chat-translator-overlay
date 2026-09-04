@@ -593,6 +593,10 @@ def save_dotenv_api_config(
         temp_target = target.with_name(f".{target.name}.tmp-{uuid.uuid4().hex}")
         try:
             temp_target.write_text(output_text, encoding="utf-8")
+            # .env 明文含 API key:POSIX 侧收紧到仅属主可读写(Windows 的
+            # ACL 继承模型不适用 chmod 语义,跳过)。
+            if os.name != "nt":
+                temp_target.chmod(0o600)
             with temp_target.open("ab") as handle:
                 handle.flush()
                 os.fsync(handle.fileno())
