@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Optional, privacy-safe task events for future interactive clients."""
+"""Optional, privacy-safe task events for future interactive clients.
+
+多进程并发追加同一事件文件时行可能交错（append 非原子跨进程）；消费方
+需容忍坏行（跳过无法 json.loads 的行），不要因单行损坏丢弃整个事件流。
+"""
 
 from __future__ import annotations
 

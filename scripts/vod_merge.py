@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 from typing import TYPE_CHECKING
 
+from chat_parser import _MAX_HTML_BYTES
 from common_utils import require_executable
 from cut_timeline import CutTimeline, CutTimelineError
 from twitch_download_types import TwitchDownloadError
@@ -248,6 +249,13 @@ def concat_videos(
 
     # Fallback: concat demuxer with reencode (resets timestamps via -avoid_negative_ts)
     print("  [WARN] filter_complex concat 失败，尝试 concat demuxer + reencode…", flush=True)
+    # 回退链路是固定 libx264 软编码；指定了硬件 encoder 或帧率时必须显式告知，
+    # 否则用户以为回退产物保持了 nvenc/CFR 属性。
+    if encoder not in ("auto", "x264"):
+        print(
+            f"  [WARN] 回退编码固定 libx264，忽略指定 encoder: {encoder!r}",
+            flush=True,
+        )
     re_cmd = [
         require_executable("ffmpeg"),
         "-hide_banner",
@@ -266,14 +274,20 @@ def concat_videos(
         "18",
         "-pix_fmt",
         "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "160k",
-        "-avoid_negative_ts",
-        "make_zero",
-        str(out),
     ]
+    if output_fps:
+        re_cmd.extend(["-r", str(output_fps)])
+    re_cmd.extend(
+        [
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-avoid_negative_ts",
+            "make_zero",
+            str(out),
+        ]
+    )
     rc = _run_ffmpeg(re_cmd, "concat demuxer reencode")
     if rc != 0 or not out.is_file() or out.stat().st_size <= 0:
         raise TwitchDownloadError(f"视频拼接失败 (exit {rc})")
@@ -404,10 +418,20 @@ def merge_chat_html(
     dropped = 0
 
     for seg in segments:
+        html_path = seg.chat_html_path
         try:
-            html = seg.chat_html_path.read_text(encoding="utf-8", errors="replace")
+            size = html_path.stat().st_size
         except OSError as e:
-            raise TwitchDownloadError(f"无法读取聊天 HTML: {seg.chat_html_path}: {e}") from e
+            raise TwitchDownloadError(f"无法读取聊天 HTML: {html_path}: {e}") from e
+        if size > _MAX_HTML_BYTES:
+            raise TwitchDownloadError(
+                f"聊天 HTML 超过 {_MAX_HTML_BYTES / 2**30:.0f} GiB 上限"
+                f"({size / 2**30:.1f} GiB),拒绝读取: {html_path}"
+            )
+        try:
+            html = html_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            raise TwitchDownloadError(f"无法读取聊天 HTML: {html_path}: {e}") from e
         for cls, rule in extract_emote_css_rules(html).items():
             if cls not in emote_rules:
                 emote_rules[cls] = rule

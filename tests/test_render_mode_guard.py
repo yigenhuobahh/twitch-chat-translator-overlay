@@ -16,6 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+import glob  # noqa: E402 - Fix 10 glob.escape 验证用
+
 import render_cn_chat as pipe
 
 
@@ -454,3 +456,129 @@ def test_lint_translation_accepts_preparsed_data(tmp_path):
     data = json.loads(trans.read_text(encoding="utf-8"))
     issues = pipe.lint_translation(trans, data=data)
     assert any(i["severity"] == "FAIL" for i in issues)
+
+
+# ---------------------------------------------------------------------------
+# Fix 10: 管线面修复
+# ---------------------------------------------------------------------------
+
+def test_pause_prompt_eof_stops_instead_of_continue(monkeypatch, tmp_path, capsys):
+    """EOF（stdin 关闭）时返回 "stop"：无人监督自动续渲染数小时不安全。"""
+    trans = _write_trans_json(tmp_path / "t.json", fail=False)
+    monkeypatch.setattr(pipe, "export_review_tsv", lambda *a, **k: None)
+    monkeypatch.setattr(pipe, "export_review_xlsx", lambda *a, **k: None)
+    monkeypatch.setattr(pipe, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(pipe, "DRY_RUN", False)
+
+    def raise_eof(*_a, **_k):
+        raise EOFError("stdin closed")
+
+    monkeypatch.setattr("builtins.input", raise_eof)
+
+    action = pipe.pause_after_translation_for_review(
+        trans_json=trans,
+        review_xlsx=tmp_path / "r.xlsx",
+        review_tsv=tmp_path / "r.tsv",
+    )
+    assert action == "stop"
+    assert "已暂停" in capsys.readouterr().out
+
+
+def test_render_preview_clip_glob_escapes_special_stem(monkeypatch, tmp_path):
+    """stem 含 glob 元字符（[ ]）时按字面匹配，不匹配到错误候选。"""
+    preview_dir = tmp_path / "out"
+    preview_dir.mkdir()
+    real = preview_dir / "clip [x]_chat.mp4"
+    real.write_bytes(b"real")
+    # 未转义 glob 会把 "clip [x]" 当字符集，命中 "clip x_chat.mp4" 之类的候选；
+    # 放一个只被坏 glob 命中的文件验证转义生效。
+    bad_glob_match = preview_dir / "clip x_chat.mp4"
+    bad_glob_match.write_bytes(b"wrong")
+
+    monkeypatch.setattr(pipe, "run", lambda *a, **k: None)
+
+    from test_cli_flag_forward import _representative_namespace
+
+    args = _representative_namespace()
+    args.offset = None
+    args.x = 10
+    args.y = 20
+    args.width = 100
+    args.height = 200
+    args.font_size = 16
+    args.font_path = "auto"
+    args.font_bold_path = "auto"
+    args.bg_alpha = 200
+
+    video = tmp_path / "clip [x].mp4"
+    video.write_bytes(b"v")
+    html = tmp_path / "chat.html"
+    html.write_text("<html></html>", encoding="utf-8")
+    trans = tmp_path / "t.json"
+    trans.write_text("{}", encoding="utf-8")
+    burn = tmp_path / "burn.py"
+    burn.write_text("# stub", encoding="utf-8")
+
+    monkeypatch.setattr(pipe.os, "startfile", lambda *_a: None, raising=False)
+    out = pipe._render_preview_clip(
+        video=video,
+        chat_html=html,
+        trans_json=trans,
+        args=args,
+        workdir=preview_dir,  # 函数内实际写到 workdir/temp
+        seconds=5.0,
+        burn=burn,
+    )
+    assert out is None, "workdir/temp 下没有产物，应返回 None（只验证命令）"
+    # 直接验证转义后的 glob 行为：workdir/temp 现在存在
+    temp_dir = preview_dir / "temp"
+    moved_real = temp_dir / "clip [x]_chat.mp4"
+    moved_real.write_bytes(b"real")
+    candidates = list(temp_dir.glob(f"{glob.escape(video.stem)}_chat.mp4"))
+    assert candidates == [moved_real], "glob.escape 后应精确命中带 [] 的文件名"
+    # 未转义 glob 会漏掉真实文件（字符集语义）——证明转义是必要的
+    assert list(temp_dir.glob(f"{video.stem}_chat.mp4")) == []
+
+
+def test_render_preset_failure_message_and_exit_code(tmp_path, monkeypatch):
+    """--render-preset 加载失败：SystemExit("错误: ...")，exit code 1，与
+    layout 分支一致（原 bare SystemExit(2) 已改）。"""
+    video, html = _make_inputs(tmp_path)
+    bad_preset = tmp_path / "bad_preset.yaml"
+    bad_preset.write_text("{ not: valid: yaml ]", encoding="utf-8")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "render_cn_chat.py",
+            str(video),
+            str(html),
+            "--render-preset",
+            str(bad_preset),
+        ],
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        pipe.main()
+    # SystemExit(f"...") → code 是错误消息字符串；str 形式 exit code 为 1。
+    code = excinfo.value.code
+    assert not isinstance(code, int) or code == 1
+    assert isinstance(code, str)
+    assert code.startswith("错误:")
+
+
+def test_sentinel_lint_with_video_but_no_chat_is_parser_error(tmp_path, monkeypatch):
+    """--lint-translation 不带值 + video 但缺 chat_html：parser.error（exit 2），
+    不再走 _lint_only_exit 把 video 当翻译 JSON。"""
+    video, _html = _make_inputs(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "render_cn_chat.py",
+            str(video),
+            "--lint-translation",
+        ],
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        pipe.main()
+    assert excinfo.value.code == 2

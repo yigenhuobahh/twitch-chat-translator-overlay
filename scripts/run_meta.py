@@ -16,6 +16,11 @@ from typing import Any
 # Jobs stuck in running without a live pid or heartbeat longer than this are not "live".
 DEFAULT_STALE_RUNNING_SEC = 6 * 3600
 
+# Windows 复用 pid：OpenProcess 对"恰好被别的进程复用的 pid"照样成功，仅凭
+# pid 探活会让僵尸 run_meta 永远"看似存活"。任何 meta 超过这个绝对时限后
+# 一律视为非 live（长直播也只能连续跑一周，超时兜底不会误伤真实任务）。
+ABSOLUTE_MAX_LIVE_SEC = 7 * 24 * 3600
+
 
 def run_meta_path(job_dir: str | Path) -> Path:
     return Path(job_dir) / "run_meta.json"
@@ -101,6 +106,9 @@ def is_live_run_meta(
     Rules (first match wins for "not live"):
       - missing/empty status → not live
       - status not in running/in_progress/started → not live
+      - metadata older than ABSOLUTE_MAX_LIVE_SEC → not live
+        (Windows pid reuse makes OpenProcess succeed for recycled pids;
+        the absolute cap bounds that "seemingly alive" zombie state)
       - pid present and dead → not live (crashed / killed)
       - pid present and alive → live, regardless of metadata age
       - without a known-live pid, stale metadata → not live
@@ -112,14 +120,21 @@ def is_live_run_meta(
     if status not in ("running", "in_progress", "started"):
         return False
 
+    now_ts = time.time() if now is None else float(now)
+    stamp = _parse_meta_time(data.get("updated_at")) or _parse_meta_time(data.get("started_at"))
+    if (
+        stamp is not None
+        and ABSOLUTE_MAX_LIVE_SEC > 0
+        and (now_ts - stamp) > float(ABSOLUTE_MAX_LIVE_SEC)
+    ):
+        return False
+
     alive = pid_is_alive(data.get("pid"))
     if alive is False:
         return False
     if alive is True:
         return True
 
-    now_ts = time.time() if now is None else float(now)
-    stamp = _parse_meta_time(data.get("updated_at")) or _parse_meta_time(data.get("started_at"))
     if stamp is not None and stale_after_sec > 0 and (now_ts - stamp) > float(stale_after_sec):
         return False
 

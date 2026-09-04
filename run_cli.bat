@@ -33,6 +33,15 @@ if errorlevel 1 (
   exit /b 1
 )
 
+REM Reject cmd metacharacters early: they enable command injection when the
+REM whole %* vector is re-parsed by call/for logic downstream (C3).
+echo(%*| findstr /R /C:"[&|^<>()!]" >nul
+if not errorlevel 1 (
+  echo [FAIL] Arguments contain cmd metacharacters. Rejecting for safety.
+  if not defined CI pause
+  exit /b 1
+)
+
 if /I "%~1"=="" goto MENU
 if /I "%~1"=="menu" goto MENU
 if /I "%~1"=="new" goto NEW

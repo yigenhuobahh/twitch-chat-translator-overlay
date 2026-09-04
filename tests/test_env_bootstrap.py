@@ -532,3 +532,93 @@ def test_translate_main_rereads_shared_api_config(monkeypatch, tmp_path):
         == "https://agnes.invalid/v1"
     )
     assert record["create_kwargs"]["model"] == cfg["model"] == "agnes-model"
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: _dotenv_quote_value — .env 写值引号与 common_utils loader 精确对齐
+# ---------------------------------------------------------------------------
+
+def test_dotenv_quote_value_matches_loader_semantics():
+    from env_bootstrap import _dotenv_quote_value
+
+    # 空 → 显式空串
+    assert _dotenv_quote_value("") == '""'
+    # 无空白/#/引号 → 原样
+    assert _dotenv_quote_value("sk-abc123") == "sk-abc123"
+    assert _dotenv_quote_value("https://api.example.com/v1") == (
+        "https://api.example.com/v1"
+    )
+    # 含 # 或空白 → 双引号包裹
+    assert _dotenv_quote_value("my model #1") == '"my model #1"'
+    assert _dotenv_quote_value("a b") == '"a b"'
+    # 含双引号但不含单引号 → 单引号包裹
+    assert _dotenv_quote_value('say "hi"') == "'say \"hi\"'"
+    # 双引号+单引号同时出现 → 保守策略：内部双引号替成单引号
+    assert _dotenv_quote_value("he said \"ok\"; it's fine") == '"he said \'ok\'; it\'s fine"'
+
+
+def test_save_dotenv_api_config_roundtrip_with_spaces_hash(
+    tmp_path, monkeypatch, request
+):
+    """save(model='my model #1') 后 load_dotenv_if_present 读回保真。
+
+    注意测试隔离：conftest 会设 _TWITCH_TRANSPARENT_TEST_MODE=1 禁止 dotenv
+    加载；本测试恰要测加载路径，临时改为 "0" 并在测试内还原（monkeypatch
+    teardown 会把 "0" 回滚成 "1"，无需手工处理）。save/load 都在 monkeypatch
+    undo 之外直接写 os.environ，六个翻译键必须在 undo 之后再清一次。
+    """
+    import os
+
+    import common_utils as cu
+    from env_bootstrap import save_dotenv_api_config
+
+    translation_env_keys = (
+        "OPENAI_COMPAT_API_KEY",
+        "OPENAI_COMPAT_BASE_URL",
+        "OPENAI_COMPAT_MODEL",
+        "AGNES_API_KEY",
+        "AGNES_BASE_URL",
+        "AGNES_MODEL",
+    )
+    saved_values = {k: os.environ.get(k) for k in translation_env_keys}
+
+    def _cleanup_direct_env_writes():
+        for key, old in saved_values.items():
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
+
+    # addfinalizer 晚于 monkeypatch teardown(undo)执行,这里才真正清掉
+    # save/load 在 undo 之外直接写入 os.environ 的六个翻译键。
+    request.addfinalizer(_cleanup_direct_env_writes)
+
+    env_path = tmp_path / ".env"
+    ok, message = save_dotenv_api_config(
+        "https://api.example.com/v1",
+        "key-123",
+        "my model #1",
+        env_path=env_path,
+    )
+    assert ok, message
+    text = env_path.read_text(encoding="utf-8")
+    assert 'OPENAI_COMPAT_MODEL="my model #1"' in text
+
+    # 不能用 monkeypatch.delenv：save_dotenv_api_config 已经把六个键直接写进
+    # os.environ，delenv 会把"删除前的值"记入 undo，teardown 时原样写回——
+    # 等于把 key-123 泄漏给后续测试。直接 pop，finalizer 负责兜底还原。
+    for key in translation_env_keys:
+        os.environ.pop(key, None)
+    monkeypatch.setattr(cu, "_DOTENV_LOADED_KEYS", set())
+    # conftest 会设 _TWITCH_TRANSPARENT_TEST_MODE=1 禁止 dotenv 加载；
+    # 本测试恰要测加载路径，临时取消（teardown 自动还原为 "1"）。
+    monkeypatch.setenv("_TWITCH_TRANSPARENT_TEST_MODE", "0")
+    monkeypatch.chdir(tmp_path)
+    # R-3: cwd .env 同时提供端点+密钥时需交互确认;此处模拟用户确认(y),
+    # 使本回程测试继续覆盖"写入后完整读回"的语义。
+    monkeypatch.setattr(cu, "_confirm_untrusted_dotenv", lambda: True)
+    cu.load_dotenv_if_present()
+
+    assert os.environ["OPENAI_COMPAT_MODEL"] == "my model #1"
+    assert os.environ["OPENAI_COMPAT_BASE_URL"] == "https://api.example.com/v1"
+    assert os.environ["OPENAI_COMPAT_API_KEY"] == "key-123"

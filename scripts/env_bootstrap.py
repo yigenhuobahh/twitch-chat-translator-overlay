@@ -500,6 +500,28 @@ def probe_translate_api(
         return False, f"API 不可用: {err}"
 
 
+def _dotenv_quote_value(value: str) -> str:
+    """Quote a .env value so common_utils.load_dotenv_if_present reads it back verbatim.
+
+    与 loader 的解析规则精确对齐：值首字符是引号时按"首个同字符闭引号"截取，
+    否则按"首个空白前导 #"截断行内注释。因此：
+      - 空 → ""（裸空行会读成空串，但双引号形式自描述）；
+      - 不含空白/#/引号 → 原样（无歧义，loader 不截断）；
+      - 含双引号但不含单引号 → 单引号包裹；
+      - 其余 → 双引号包裹。双引号与单引号同时出现的值无法被该解析器无损
+        表示（任何包裹引号都会提前闭合）：保守地把内部双引号替成单引号，
+        避免 loader 截断产生的静默配置损坏。
+    """
+    if not value:
+        return '""'
+    if not any(c.isspace() for c in value) and "#" not in value and '"' not in value and "'" not in value:
+        return value
+    if '"' in value and "'" not in value:
+        return f"'{value}'"
+    inner = value.replace('"', "'")
+    return f'"{inner}"'
+
+
 def save_dotenv_api_config(
     base_url: str,
     api_key: str,
@@ -551,7 +573,7 @@ def save_dotenv_api_config(
 
             if matched_key:
                 if matched_key not in handled:
-                    new_lines.append(f"{matched_key}={updates[matched_key]}")
+                    new_lines.append(f"{matched_key}={_dotenv_quote_value(updates[matched_key])}")
                     handled.add(matched_key)
                 else:
                     # Duplicate occurrence, omit
@@ -561,7 +583,7 @@ def save_dotenv_api_config(
 
         for key, value in updates.items():
             if key not in handled:
-                new_lines.append(f"{key}={value}")
+                new_lines.append(f"{key}={_dotenv_quote_value(value)}")
 
         output_text = "\n".join(new_lines) + "\n"
 

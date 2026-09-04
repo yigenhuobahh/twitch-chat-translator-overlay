@@ -258,6 +258,8 @@ def test_legacy_menu_out_of_range_number_returns_to_menu(jobs_dir, monkeypatch, 
 
     assert wizard._run_legacy_menu() == 0
     assert "ran" not in calls
+    # _pick_job_from_list：越界编号打印"无效编号"；非编号走 resolve_job_arg
+    # 的"找不到 job 配置"文案。两种无效输入都不再静默。
     assert "无效编号" in capsys.readouterr().out
 
 

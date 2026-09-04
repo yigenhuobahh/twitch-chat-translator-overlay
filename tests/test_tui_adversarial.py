@@ -269,9 +269,16 @@ def test_adversarial_save_dotenv_special_characters(tmp_path: Path):
     assert ok is True
     assert env_file.is_file()
     content = env_file.read_text(encoding="utf-8")
-    assert f"OPENAI_COMPAT_BASE_URL={special_url}" in content
-    assert f"OPENAI_COMPAT_API_KEY={special_key}" in content
-    assert f"OPENAI_COMPAT_MODEL={special_model}" in content
+    # R-6: 含空白/# 的值由 _dotenv_quote_value 加引号落盘;断言"引号内原值"。
+    assert f'OPENAI_COMPAT_BASE_URL="{special_url}"' in content or (
+        f"OPENAI_COMPAT_BASE_URL={special_url}" in content
+    )
+    assert f'OPENAI_COMPAT_API_KEY="{special_key}"' in content or (
+        f"OPENAI_COMPAT_API_KEY={special_key}" in content
+    )
+    assert f'OPENAI_COMPAT_MODEL="{special_model}"' in content or (
+        f"OPENAI_COMPAT_MODEL={special_model}" in content
+    )
     assert os.environ.get("OPENAI_COMPAT_BASE_URL") == special_url
     assert os.environ.get("OPENAI_COMPAT_API_KEY") == special_key
     assert os.environ.get("OPENAI_COMPAT_MODEL") == special_model
@@ -289,9 +296,15 @@ def test_adversarial_save_dotenv_special_characters(tmp_path: Path):
     )
     assert ok2 is True
     content = env_file.read_text(encoding="utf-8")
-    assert f"OPENAI_COMPAT_BASE_URL={adversarial_url}" in content
-    assert f"OPENAI_COMPAT_API_KEY={adversarial_key}" in content
-    assert f"OPENAI_COMPAT_MODEL={adversarial_model}" in content
+    assert f'OPENAI_COMPAT_BASE_URL="{adversarial_url}"' in content or (
+        f"OPENAI_COMPAT_BASE_URL={adversarial_url}" in content
+    )
+    assert f'OPENAI_COMPAT_API_KEY="{adversarial_key}"' in content or (
+        f"OPENAI_COMPAT_API_KEY={adversarial_key}" in content
+    )
+    assert f'OPENAI_COMPAT_MODEL="{adversarial_model}"' in content or (
+        f"OPENAI_COMPAT_MODEL={adversarial_model}" in content
+    )
 
 
 def test_adversarial_save_dotenv_multiline_and_comment_chaos(tmp_path: Path):

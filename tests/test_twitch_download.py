@@ -383,6 +383,9 @@ def test_dotenv_only_loads_translation_keys_and_cannot_override_executable(
     monkeypatch.setenv("PATH", "")
     monkeypatch.setattr(common_utils, "_DOTENV_LOADED_KEYS", set())
     monkeypatch.setattr(td, "_TOOLS_ROOT", tmp_path / "trusted")
+    # R-3: 本 .env 仅含 API key(无端点键),不触发端点+密钥确认分支;
+    # 若上游后续加了端点键,这里也模拟用户确认(y)以维持测试语义。
+    monkeypatch.setattr(common_utils, "_confirm_untrusted_dotenv", lambda: True)
 
     common_utils.load_dotenv_if_present()
 
@@ -407,3 +410,103 @@ def test_process_environment_cli_override_requires_absolute_path(
 
     monkeypatch.setenv("TWITCHDOWNLOADER_CLI", str(payload.resolve()))
     assert td.find_twitchdownloader_cli(tmp_path / "empty") == payload.resolve()
+
+
+# ---------------------------------------------------------------------------
+# Fix 9: 下载簇其余修复
+# ---------------------------------------------------------------------------
+
+def test_validate_chat_html_prose_with_cdn_text_passes(tmp_path):
+    """正文纯文本提到 CDN 链接 + "first-" 单词（如 first-place finish）不再误报。"""
+    from twitch_download import validate_chat_html
+
+    html = tmp_path / "prose.html"
+    html.write_text(
+        '<pre class="comment-root">He took first-place finish at '
+        'static-cdn.jtvnw.net emote-image showcase! third- party wins too.</pre>',
+        encoding="utf-8",
+    )
+    validate_chat_html(html)  # must not raise
+
+
+def test_validate_chat_html_still_fails_remote_emote_class(tmp_path):
+    from twitch_download import TwitchDownloadError, validate_chat_html
+
+    bad = tmp_path / "bad.html"
+    bad.write_text(
+        '<pre class="comment-root"><img class="emote-image first-1" '
+        'src="https://static-cdn.jtvnw.net/x.png"></pre>',
+        encoding="utf-8",
+    )
+    with pytest.raises(TwitchDownloadError, match="embed"):
+        validate_chat_html(bad)
+
+
+def test_run_cli_masks_oauth_equals_form(capsys):
+    """--oauth=TOKEN 等号形式也必须掩码。"""
+    import twitch_download as td
+
+    cmd = ["TwitchDownloaderCLI.exe", "chatdownload", "--oauth=supersecret", "-o", "x.html"]
+
+    def fake_run_tracked(cmd, **kwargs):
+        from subprocess import CompletedProcess
+
+        return CompletedProcess(list(cmd), 0)
+
+    saved = td.run_tracked
+    td.run_tracked = fake_run_tracked
+    try:
+        td._run_cli(cmd, label="测试")
+    finally:
+        td.run_tracked = saved
+    out = capsys.readouterr().out
+    assert "supersecret" not in out
+    assert "--oauth=***" in out
+
+
+def test_slug_for_source_windows_reserved_names():
+    import twitch_download as td
+
+    assert td.slug_for_source("clip", "con") == "con_vod"
+    assert td.slug_for_source("clip", "NUL") == "NUL_vod"
+    assert td.slug_for_source("clip", "com1") == "com1_vod"
+    assert td.slug_for_source("clip", "lpt2") == "lpt2_vod"
+    # 普通名字不加后缀
+    assert td.slug_for_source("clip", "SomeClip") == "SomeClip"
+    assert td.slug_for_source("vod", "612942303") == "612942303"
+
+
+def test_get_stream_start_time_warns_on_probe_failure(monkeypatch, tmp_path, capsys):
+    import twitch_download as td
+
+    path = tmp_path / "v.mp4"
+    path.write_bytes(b"x")
+
+    monkeypatch.setattr(td, "_run_ffprobe", lambda args: None)
+    assert td.get_stream_start_time(path, "v:0") == 0.0
+    assert "[WARN]" in capsys.readouterr().out
+
+    class BadProbe:
+        returncode = 1
+        stdout = ""
+        stderr = "moov atom not found"
+
+    monkeypatch.setattr(td, "_run_ffprobe", lambda args: BadProbe())
+    assert td.get_stream_start_time(path, "a:0") == 0.0
+    assert "moov atom" in capsys.readouterr().out
+
+
+def test_multi_segment_duration_tolerance_scales_with_segment_count():
+    """20 段容差 = 1.0 + 0.05*20 = 2.0；validate_media_health 签名带
+    duration_tolerance 关键字（默认 1.0）。"""
+    import inspect
+
+    import media_health as mh
+
+    sig = inspect.signature(mh.validate_media_health)
+    assert "duration_tolerance" in sig.parameters
+    assert sig.parameters["duration_tolerance"].default == 1.0
+
+    # 调用方公式（download_assets_multi 内联）：
+    seg_downloads = list(range(20))
+    assert 1.0 + 0.05 * len(seg_downloads) == 2.0

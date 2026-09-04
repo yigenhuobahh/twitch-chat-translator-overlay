@@ -489,3 +489,19 @@ def test_download_assets_recovers_interrupted_pair_before_fresh_download(
     assert not tx._download_transaction_claim_path(root).exists()
     assert not list(root.glob(".*.backup-*"))
     assert not list(root.glob(".*.download-*"))
+
+
+# ---------------------------------------------------------------------------
+# Fix 9: _transaction_evidence_error 消息附手工恢复指引
+# ---------------------------------------------------------------------------
+
+def test_transaction_evidence_error_includes_manual_recovery_hint(tmp_path):
+    from twitch_download_transaction import _transaction_evidence_error
+
+    err = _transaction_evidence_error(tmp_path, "测试失败")
+    text = str(err)
+    assert "事务现场已保留" in text
+    assert "确认无下载进程后" in text
+    assert "手工删除" in text
+    assert ".twitch-download-publish.json" in text
+    assert ".twitch-download-publish.lock" in text

@@ -10,11 +10,13 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version
+import os
 from pathlib import Path
 import platform
 import re
 import subprocess
 import sys
+import tempfile
 
 from task_results import write_task_result
 from tui_task import redact_text
@@ -89,9 +91,21 @@ def write_summary(path: str | Path, content: str) -> Path:
     """Atomically write a user-chosen support summary."""
     target = Path(path).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_suffix(target.suffix + ".tmp")
-    temporary.write_text(content, encoding="utf-8")
-    temporary.replace(target)
+    # mkstemp 唯一命名 + finally 清理（样板 = run_meta.write_run_meta）：固定
+    # ".tmp" 后缀名在两个并发写方下会互相覆盖或残留半截文件。
+    temp_fd, temp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+    )
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(temp_fd, "w", encoding="utf-8") as file:
+            file.write(content)
+        os.replace(temp, target)
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
     return target
 
 
@@ -120,6 +134,8 @@ def main(argv: list[str] | None = None) -> int:
         path = write_summary(output, build_summary(doctor_returncode=doctor_returncode, doctor_output=doctor_output))
     except OSError as exc:
         print(f"Could not write support summary: {type(exc).__name__}")
+        # S-3: 失败也要落终态，交互端（TUI）才能从结果清单看到失败而不是永远"运行中"。
+        write_task_result(state="failed", mode="support-summary", returncode=2)
         return 2
     write_task_result(
         state="succeeded",

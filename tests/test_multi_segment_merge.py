@@ -569,3 +569,50 @@ def test_download_assets_multi_accepts_cut_and_fps(tmp_path: Path, monkeypatch):
     assert captured.get("encoder") == "x264"
     assert captured.get("merge_remove_ranges") == [(60.0, 120.0)]
     assert result.video_path.read_bytes() == b"concat_result"
+
+
+# ---------------------------------------------------------------------------
+# Fix 9: concat 回退命令带 -r output_fps + 非 x264 encoder WARN
+# ---------------------------------------------------------------------------
+
+def test_concat_fallback_command_includes_output_fps_and_encoder_warn(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """filter_complex 主流程失败后，回退命令含 -r <output_fps>；指定
+    nvenc 等 encoder 时打印"回退编码固定 libx264"WARN。"""
+    import encode_options
+    import twitch_download as td
+
+    paths = [tmp_path / "a.mp4", tmp_path / "b.mp4"]
+    for path in paths:
+        path.write_bytes(b"x")
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(td, "probe_media_duration", lambda _path: 10.0)
+    monkeypatch.setattr(td, "get_stream_start_time", lambda _path, _stream: 0.0)
+
+    def fake_run_tracked(cmd, **kwargs):
+        calls.append(list(cmd))
+        # 第一次（filter_complex 主流程）失败；第二次（回退）也失败——
+        # 我们只关心回退命令的形态，最后断言抛错。
+        return type("Result", (), {"returncode": 1})()
+
+    monkeypatch.setattr(td, "run_tracked", fake_run_tracked)
+    monkeypatch.setattr(td.require_executable, "__call__", td.require_executable)
+    monkeypatch.setattr(
+        encode_options,
+        "resolve_encode_options",
+        lambda **kwargs: type("Options", (), {"resolved_encoder": "x264"})(),
+    )
+    monkeypatch.setattr(encode_options, "build_video_encode_args", lambda _opts: ["-c:v", "libx264"])
+
+    with pytest.raises(td.TwitchDownloadError):
+        td.concat_videos(paths, tmp_path / "out.mp4", output_fps=60.0, encoder="nvenc")
+
+    assert len(calls) == 2
+    fallback = calls[1]
+    assert "-r" in fallback
+    assert "60.0" in fallback
+    out = capsys.readouterr().out
+    assert "回退编码固定 libx264" in out
+    assert "nvenc" in out

@@ -480,3 +480,69 @@ def test_load_job_integral_float_int_field_coerces_fractional_rejected(
     p_str.write_text('crf: "18.0"\n', encoding="utf-8")
     with pytest.raises(ValueError, match="crf"):
         job_mod.load_job_file(p_str)
+
+
+# ---------------------------------------------------------------------------
+# Fix 4: 数值范围校验（FLOAT_RANGE / INT_RANGE，与 burn 侧对齐）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("content", "field"),
+    [
+        ("msg_lifetime: 0\n", "msg_lifetime"),
+        ("output_fps: 0.1\n", "output_fps"),
+        ("width: 10\n", "width"),
+        ("bg_alpha: 300\n", "bg_alpha"),
+        ("font_size: 999\n", "font_size"),
+        ("workers: 0\n", "workers"),
+        ("preview_clip: 90000\n", "preview_clip"),
+        ("offset: -700000\n", "offset"),
+        ("height: 9999\n", "height"),
+        ("emote_height: 4\n", "emote_height"),
+    ],
+)
+def test_load_job_rejects_out_of_range_values(tmp_path: Path, job_mod, content, field):
+    p = tmp_path / "range.yaml"
+    p.write_text(content, encoding="utf-8")
+    with pytest.raises(ValueError, match="范围"):
+        job_mod.load_job_file(p)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "msg_lifetime: 0.1\n",
+        "output_fps: 240\n",
+        "output_fps: \"30000/1001\"\n",
+        "width: 7680\n",
+        "bg_alpha: 255\n",
+        "offset: -100\n",
+        "offset: -604800\n",
+        "preview_clip: 86400\n",
+        "workers: 64\n",
+        "blank_hold_seconds: 30\n",
+        "min_visible_seconds: 0\n",
+        "max_message_lines: 0\n",
+    ],
+)
+def test_load_job_accepts_boundary_values(tmp_path: Path, job_mod, content):
+    p = tmp_path / "ok.yaml"
+    p.write_text(content, encoding="utf-8")
+    data = job_mod.load_job_file(p)
+    assert data  # loaded fine
+
+
+def test_load_job_rejects_out_of_range_rational_fps(tmp_path: Path, job_mod):
+    """有理数 fps 走 quotient 分支后同样要过范围检查（999/1 > 240）。"""
+    p = tmp_path / "bad_rational_range.yaml"
+    p.write_text("output_fps: 999/1\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="output_fps"):
+        job_mod.load_job_file(p)
+
+
+def test_float_and_int_range_tables_align_with_burn(job_mod):
+    """范围表条目数与数值字段集合一致（防止新增字段漏登记）。"""
+    assert set(job_mod.FLOAT_RANGE) == set(job_mod.FLOAT_JOB_FIELDS)
+    missing_int = job_mod.INT_JOB_FIELDS - set(job_mod.INT_RANGE) - {"x", "y", "crf", "webm_crf"}
+    assert not missing_int

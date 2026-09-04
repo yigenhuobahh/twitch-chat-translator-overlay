@@ -135,6 +135,34 @@ def test_run_bat_preserves_original_argument_vector():
     assert r"scripts\job_wizard.py quick" in cli
     assert r"scripts\quick_demo.py" in cli
     assert 'set "EXTRA="' not in text
+    # C3: run_cli 拦截 cmd 元字符，但 %* 原样转发保持不变。
+    assert "findstr /R /C:" in cli
+    assert r"echo(%*| findstr" in cli
+
+
+def test_bat_launchers_reject_cmd_metacharacters():
+    """C3: run_cli.bat 与 doctor.bat 都在路由/执行前拦截 [&|^<>()!] 并 exit 1。"""
+    for name, anchor in (
+        ("run_cli.bat", 'if /I "%~1"=="" goto MENU'),
+        ("doctor.bat", r'"%PY%" scripts\render_cn_chat.py --doctor %*'),
+    ):
+        text = (ROOT / name).read_text(encoding="ascii")
+        assert "findstr /R /C:" in text, f"{name} must probe for cmd metacharacters"
+        assert 'echo(%*| findstr /R /C:"[&|^<>()!]"' in text
+        assert "Arguments contain cmd metacharacters" in text
+        assert "exit /b 1" in text
+        if name == "run_cli.bat":
+            assert text.index("findstr /R /C:") < text.index(anchor), (
+                "run_cli.bat must reject metacharacters before argument routing"
+            )
+        else:
+            assert text.index("findstr /R /C:") < text.index(anchor), (
+                "doctor.bat must reject metacharacters before invoking --doctor"
+            )
+        # ASCII+CRLF 仍由 test_run_bat_is_ascii_crlf 覆盖；这里再硬校验一次。
+        data = (ROOT / name).read_bytes()
+        assert all(b < 128 for b in data), f"{name} must stay ASCII-only"
+        assert b"\r\n" in data, f"{name} should use CRLF"
 
 
 def test_install_and_update_launchers_stop_after_failures():

@@ -243,11 +243,73 @@ FLOAT_JOB_FIELDS = frozenset(
 # --output-fps parser; the value stays a string for that CLI to normalize.
 _RATIONAL_FPS_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?\s*/\s*[+-]?\d+(?:\.\d+)?$")
 
+# 数值范围表（与 burn 侧 twitch_chat_burn._validate_runtime_args 对齐）：
+#   FLOAT_RANGE: 字段 -> (low, high, low_inclusive, high_inclusive)
+#   INT_RANGE:   字段 -> (low, high)
+# 类型校验通过后再查表，越界在 job 载入时即报错，而不是深入 burn 子进程
+# 的 argparse 才失败。burn 不校验 x/y/crf/webm_crf，这里同样不设。
+FLOAT_RANGE: dict[str, tuple[float, float, bool, bool]] = {
+    # msg_lifetime: burn 的 positive_float 允许 0.1 本身（< minimum 即报错），0.1 闭。
+    "msg_lifetime": (0.1, 600.0, True, True),
+    "output_fps": (1.0, 240.0, True, True),
+    "arrival_interval": (0.0, 600.0, True, True),
+    "min_visible_seconds": (0.0, 600.0, True, True),
+    # blank_hold_seconds: burn 要求 > 0（0 开）。
+    "blank_hold_seconds": (0.0, 30.0, False, True),
+    "preview_frame": (0.0, 86400.0, True, True),
+    # preview_clip: burn 要求 > 0（0 开）。
+    "preview_clip": (0.0, 86400.0, False, True),
+    "offset": (-604800.0, 604800.0, True, True),
+    "x_ratio": (0.0, 1.0, True, True),
+    "y_ratio": (0.0, 1.0, True, True),
+    "width_ratio": (0.0, 1.0, True, True),
+    "height_ratio": (0.0, 1.0, True, True),
+    "font_size_ratio": (0.0, 1.0, True, True),
+}
+
+_NO_UPPER_BOUND = 10**9
+
+INT_RANGE: dict[str, tuple[int, int]] = {
+    "fps": (1, 240),
+    "font_size": (8, 128),
+    "emote_height": (8, 256),
+    "max_visible": (0, 100),
+    "max_message_lines": (0, 100),
+    "message_image_cache_size": (8, 100000),
+    "bg_alpha": (0, 255),
+    "width": (16, 7680),
+    "height": (16, 4320),
+    "webm_cpu_used": (0, 8),
+    # burn 对 workers / batch_size 只要求 >= 1，无上界；用大数近似。
+    "workers": (1, _NO_UPPER_BOUND),
+    "batch_size": (1, _NO_UPPER_BOUND),
+}
+
 
 def _numeric_type_error(attr: str, expected: str, value: Any) -> ValueError:
     return ValueError(
         f"job 字段 {attr} 需要{expected}，收到 {value!r}（{type(value).__name__}）"
     )
+
+
+def _check_float_range(attr: str, numeric: float) -> None:
+    spec = FLOAT_RANGE.get(attr)
+    if spec is None:
+        return
+    low, high, low_inc, high_inc = spec
+    below = numeric < low if low_inc else numeric <= low
+    above = numeric > high if high_inc else numeric >= high
+    if below or above:
+        raise ValueError(f"job 字段 {attr} 需在 {low}..{high} 范围内,收到 {numeric!r}")
+
+
+def _check_int_range(attr: str, numeric: int) -> None:
+    spec = INT_RANGE.get(attr)
+    if spec is None:
+        return
+    low, high = spec
+    if numeric < low or numeric > high:
+        raise ValueError(f"job 字段 {attr} 需在 {low}..{high} 范围内,收到 {numeric!r}")
 
 
 def _validated_int_field(attr: str, value: Any) -> Any:
@@ -263,16 +325,21 @@ def _validated_int_field(attr: str, value: Any) -> Any:
     if isinstance(value, bool):
         raise _numeric_type_error(attr, "整数", value)
     if isinstance(value, int):
+        _check_int_range(attr, value)
         return value
     if isinstance(value, float):
         if value.is_integer():
-            return int(value)
+            coerced = int(value)
+            _check_int_range(attr, coerced)
+            return coerced
         raise _numeric_type_error(attr, "整数", value)
     if isinstance(value, str):
         try:
-            return int(value.strip())
+            coerced = int(value.strip())
         except ValueError:
             raise _numeric_type_error(attr, "整数", value) from None
+        _check_int_range(attr, coerced)
+        return coerced
     raise _numeric_type_error(attr, "整数", value)
 
 
@@ -288,6 +355,7 @@ def _validated_float_field(attr: str, value: Any) -> Any:
     if isinstance(value, (int, float)):
         if isinstance(value, float) and not math.isfinite(value):
             raise _numeric_type_error(attr, "有限数值", value)
+        _check_float_range(attr, float(value))
         return value
     if isinstance(value, str):
         text = value.strip()
@@ -297,6 +365,7 @@ def _validated_float_field(attr: str, value: Any) -> Any:
             parsed = None
         if parsed is not None:
             if math.isfinite(parsed):
+                _check_float_range(attr, parsed)
                 return parsed
             raise _numeric_type_error(attr, "有限数值", value)
         if attr == "output_fps" and _RATIONAL_FPS_RE.match(text):
@@ -306,6 +375,8 @@ def _validated_float_field(attr: str, value: Any) -> Any:
             except (ZeroDivisionError, ValueError):
                 quotient = None
             if quotient is not None and math.isfinite(quotient):
+                # 有理数形式也要过范围（如 0/1 与 999/1 都应被拒绝）。
+                _check_float_range(attr, quotient)
                 return value
             raise _numeric_type_error(attr, "数值（整数或小数）", value)
         raise _numeric_type_error(attr, "数值（整数或小数）", value)
@@ -864,6 +935,8 @@ def render_job_yaml(
         ("message_image_cache_size", "lazy 缓存上限"),
         ("batch_size", "翻译批大小"),
         ("workers", "翻译并发数"),
+        ("strict_import", "true=导入翻译时严格校验,身份不匹配即失败"),
+        ("force_export", "true=强制重新导出翻译 JSON(清空已有译文)"),
     ]
     lines: list[str] = [
         "# =============================================================================",

@@ -101,7 +101,11 @@ def _count_abnormal_audio_packets(path: Path, duration: float) -> tuple[int | No
 def probe_media_health(path: Path, *, require_audio: bool = True,
                        expected_duration: float | None = None,
                        tolerance: float = 1.0) -> MediaHealth:
-    """Run one ffprobe JSON query and return a user-readable health verdict."""
+    """Run one ffprobe JSON query and return a user-readable health verdict.
+
+    ``tolerance``: absolute seconds the measured duration may deviate from
+    ``expected_duration`` (caller may scale it, e.g. per concat segment).
+    """
     result = MediaHealth(path=Path(path), ok=False)
     if not result.path.is_file():
         result.issues.append(f"文件不存在: {result.path}")
@@ -304,11 +308,13 @@ def decode_check_media(path: Path, *, duration: float = 0.0) -> tuple[bool, str]
 
 
 def validate_media_health(path: Path, *, mode: str = "fast", require_audio: bool = True,
-                          expected_duration: float | None = None, allow_extra_streams: bool = False) -> MediaHealth:
+                          expected_duration: float | None = None, allow_extra_streams: bool = False,
+                          duration_tolerance: float = 1.0) -> MediaHealth:
     mode = str(mode or "fast").lower()
     if mode == "off":
         return MediaHealth(path=Path(path), ok=True)
-    health = probe_media_health(path, require_audio=require_audio, expected_duration=expected_duration)
+    health = probe_media_health(path, require_audio=require_audio, expected_duration=expected_duration,
+                                tolerance=duration_tolerance)
     if allow_extra_streams and health.extra_streams:
         health.issues = [x for x in health.issues if not x.startswith("含不支持的附加流:")]
         health.ok = not health.issues

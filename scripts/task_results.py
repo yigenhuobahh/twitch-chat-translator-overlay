@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import tempfile
 import time
 from typing import Any
 
@@ -53,9 +54,21 @@ def write_task_result(
             "finished_at": time.time(),
             "artifacts": _existing_artifacts(list(artifacts or [])),
         }
-        temp = path.with_suffix(path.suffix + ".tmp")
-        temp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-        os.replace(temp, path)
+        temp_fd, temp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+        )
+        temp = Path(temp_name)
+        try:
+            with os.fdopen(temp_fd, "w", encoding="utf-8") as file:
+                file.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+            os.replace(temp, path)
+        finally:
+            # mkstemp 唯一命名 + finally 清理：固定 ".tmp" 后缀名会让两个并发
+            # 写方互相覆盖/读到半截 JSON（样板 = run_meta.write_run_meta）。
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
         return True
     except (OSError, RuntimeError, TypeError, ValueError):
         return False

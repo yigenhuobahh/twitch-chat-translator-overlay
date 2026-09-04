@@ -89,3 +89,82 @@ def test_cli_rejects_bad_fps(tmp_path: Path):
     assert r.returncode != 0
     joined = (r.stdout or "") + (r.stderr or "")
     assert "fps" in joined.lower() or "FPS" in joined or "error" in joined.lower() or "错误" in joined
+
+
+# ---------------------------------------------------------------------------
+# Fix 6: run_meta 绝对时限兜底 Windows pid 复用
+# ---------------------------------------------------------------------------
+
+def test_is_live_run_meta_absolute_cap_beats_live_pid(monkeypatch):
+    """updated_at 远超 7 天：即使 pid_is_alive 恒 True（pid 复用），也非 live。"""
+    import time
+
+    import run_meta as rm
+
+    monkeypatch.setattr(rm, "pid_is_alive", lambda _pid: True)
+    now = time.time()
+    assert rm.is_live_run_meta(
+        {"status": "running", "pid": 123, "updated_at": "2020-01-01T00:00:00"},
+        now=now,
+    ) is False
+    # 新鲜 meta + 活 pid 保持 live（原语义未破坏）。
+    fresh = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now))
+    assert rm.is_live_run_meta(
+        {"status": "running", "pid": 123, "updated_at": fresh},
+        now=now,
+    ) is True
+
+
+def test_is_live_run_meta_absolute_cap_boundary():
+    """6 天前、无 pid：未超绝对时限（7 天），绝对时限不提前误伤——
+    stale_after_sec 设为覆盖整个 6 天窗口时仍算 live。"""
+    import time
+
+    import run_meta as rm
+
+    now = time.time()
+    six_days_ago = time.strftime(
+        "%Y-%m-%dT%H:%M:%S", time.localtime(now - 6 * 24 * 3600)
+    )
+    assert rm.is_live_run_meta(
+        {"status": "running", "updated_at": six_days_ago},
+        stale_after_sec=7 * 24 * 3600,
+        now=now,
+    ) is True
+
+
+# ---------------------------------------------------------------------------
+# Fix 7: 孤儿 .download- 分段暂存文件识别 + clean 实际删除
+# ---------------------------------------------------------------------------
+
+def test_is_partial_artifact_recognizes_orphan_download_staging():
+    from process_util import _is_partial_artifact
+
+    # twitch_download._new_download_staging_path 形态: ".<name>.download-<hex32>.<ext>"
+    assert _is_partial_artifact(".video.mp4.download-abc12345.mp4")
+    assert _is_partial_artifact(".video.mp4.download-" + "a" * 32 + ".mp4")
+    assert _is_partial_artifact(".chat.html.download-0123abcd.html")
+    assert _is_partial_artifact(".clip.mkv.download-deadbeef.mkv")
+    # 普通隐藏文件不误伤
+    assert not _is_partial_artifact(".gitignore")
+    assert not _is_partial_artifact(".env")
+    assert not _is_partial_artifact(".video.mp4.download-nothex.mp4")
+    assert not _is_partial_artifact(".video.mp4.download-abc12345.txt")
+
+
+def test_clean_temp_artifacts_removes_orphan_download_staging(tmp_path, capsys):
+    from process_util import clean_temp_artifacts
+
+    orphan = tmp_path / ".video.mp4.download-abc12345.mp4"
+    orphan.write_bytes(b"x" * 1024)
+    keep = tmp_path / "video.mp4"
+    keep.write_bytes(b"y")
+    hidden = tmp_path / ".gitignore"
+    hidden.write_text("*.tmp\n", encoding="utf-8")
+
+    count, freed = clean_temp_artifacts(tmp_path)
+    assert count == 1
+    assert freed == 1024
+    assert not orphan.exists()
+    assert keep.exists()
+    assert hidden.exists()

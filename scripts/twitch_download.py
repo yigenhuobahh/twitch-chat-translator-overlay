@@ -22,6 +22,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
+from chat_parser import _MAX_HTML_BYTES
 from common_utils import (
     current_cli_invocation,
     env_loaded_from_dotenv,
@@ -175,6 +176,13 @@ def parse_twitch_source(raw: str, *, kind_hint: str = "auto") -> tuple[str, str]
     )
 
 
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+
 def slug_for_source(kind: str, source_id: str) -> str:
     """Filesystem-safe folder name."""
     # Prefer trailing numeric VOD id
@@ -184,7 +192,12 @@ def slug_for_source(kind: str, source_id: str) -> str:
     else:
         base = source_id.rstrip("/").split("/")[-1] or "twitch"
     base = re.sub(r"[^\w.\-]+", "_", base, flags=re.UNICODE).strip("._") or "twitch"
-    return base[:80]
+    base = base[:80]
+    # Windows 保留设备名（大小写不敏感）不能直接做目录名（CON、NUL、COM1…），
+    # 追加后缀绕开保留名语义。
+    if base.upper() in _WINDOWS_RESERVED_NAMES:
+        base = f"{base}_vod"
+    return base
 
 
 def default_download_dir(root: Path | None = None) -> Path:
@@ -289,6 +302,15 @@ def validate_chat_html(path: Path) -> None:
     if not path.is_file():
         raise TwitchDownloadError(f"聊天 HTML 不存在: {path}")
     try:
+        size = path.stat().st_size
+    except OSError as e:
+        raise TwitchDownloadError(f"无法读取聊天 HTML: {e}") from e
+    if size > _MAX_HTML_BYTES:
+        raise TwitchDownloadError(
+            f"聊天 HTML 超过 {_MAX_HTML_BYTES / 2**30:.0f} GiB 上限"
+            f"({size / 2**30:.1f} GiB),拒绝读取: {path}"
+        )
+    try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
         raise TwitchDownloadError(f"无法读取聊天 HTML: {e}") from e
@@ -300,7 +322,9 @@ def validate_chat_html(path: Path) -> None:
     # file claims images without data embeds is hard to detect. Require either
     # embed CSS or zero emote-image tags.
     has_data = "content:url(" in text and "base64," in text.lower()
-    has_emote_img = "emote-image" in text or "first-" in text or "third-" in text
+    # 只认 class 属性里的 emote 类名：裸子串会把正文纯文本（如解说提到
+    # "first-place finish" 或静态 CDN 链接）误判成"有表情图"，触发硬失败。
+    has_emote_img = re.search(r'class="[^"]*\b(emote-image|first-|third-)', text) is not None
     if has_emote_img and not has_data:
         # Likely remote CDN only — this project will not fetch.
         if "static-cdn.jtvnw.net" in text or "cdn.betterttv.net" in text:
@@ -324,6 +348,9 @@ def _run_cli(cmd: list[str], *, label: str) -> None:
         if part in ("--oauth",):
             safe.append(part)
             skip_next = True
+            continue
+        if part.lower().startswith("--oauth="):
+            safe.append("--oauth=***")
             continue
         safe.append(part)
     print(f"\n$ {' '.join(safe)}", flush=True)
@@ -724,16 +751,25 @@ def get_stream_start_time(path: Path, stream_selector: str) -> float:
             str(path),
         ]
     )
-    if probe is None:
+    if probe is None or probe.returncode != 0:
+        # 静默回 0.0 会让 Exact 裁切的 lead-in 补偿丢失（音画偏移 1s 级），
+        # 至少让用户看见回退发生了。
+        err = (probe.stderr or probe.stdout or "").strip()[:200] if probe is not None else "ffprobe 启动失败或超时"
+        print(f"  [WARN] 无法探测 {stream_selector} start_time，按 0.0 处理: {err}", flush=True)
         return 0.0
     raw = (probe.stdout or "").strip().splitlines()
-    if probe.returncode != 0 or not raw:
+    if not raw:
+        print(f"  [WARN] {stream_selector} start_time 为空，按 0.0 处理", flush=True)
         return 0.0
     try:
         value = float(raw[0].strip() or 0.0)
     except ValueError:
+        print(f"  [WARN] {stream_selector} start_time 无法解析 ({raw[0]!r})，按 0.0 处理", flush=True)
         return 0.0
-    return value if math.isfinite(value) else 0.0
+    if not math.isfinite(value):
+        print(f"  [WARN] {stream_selector} start_time 非有限数值 ({raw[0]!r})，按 0.0 处理", flush=True)
+        return 0.0
+    return value
 
 
 def probe_av_fingerprint(path: Path) -> tuple[str, str, str, str, str, str]:
@@ -917,8 +953,15 @@ def download_assets_multi(
 
         expected = timeline.remaining_duration
         from media_health import repair_media, validate_media_health
+        # 每段拼接边界各有一个 probe/trim 残差；按段数线性放大时长容差，
+        # 避免多段（如 20 段）把 1s 默认容差耗尽而误判"时长不符"。
+        duration_tolerance = 1.0 + 0.05 * len(seg_downloads)
         health = validate_media_health(
-            staged_video, mode=media_check, require_audio=True, expected_duration=expected
+            staged_video,
+            mode=media_check,
+            require_audio=True,
+            expected_duration=expected,
+            duration_tolerance=duration_tolerance,
         )
         _print_media_health_warnings(health)
         video_to_publish = staged_video
@@ -926,7 +969,11 @@ def download_assets_multi(
             try:
                 repaired_video = repair_media(staged_video, encoder=encoder)
                 health = validate_media_health(
-                    repaired_video, mode=media_check, require_audio=True, expected_duration=expected
+                    repaired_video,
+                    mode=media_check,
+                    require_audio=True,
+                    expected_duration=expected,
+                    duration_tolerance=duration_tolerance,
                 )
                 _print_media_health_warnings(health)
                 if health.ok:

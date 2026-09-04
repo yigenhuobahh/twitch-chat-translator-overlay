@@ -23,12 +23,18 @@
   python render_cn_chat.py video.mp4 chat.html --preview-frame 60 --preview-image preview.png
 """
 
+import glob
 import json
 import os
 from pathlib import Path
 import shutil  # noqa: F401 - 测试按模块属性 patch pipeline.shutil.copy2；publish_output 实现居 review_tables，双方共享同一 shutil 模块对象，patch 仍然生效
 import sys
 import uuid
+
+try:
+    import yaml  # type: ignore
+except ImportError:  # pragma: no cover - PyYAML 是必需依赖，缺纸上 --job/--preset 已有兜底
+    yaml = None  # type: ignore
 
 # Allow sibling imports when loaded as a script or via importlib from tests.
 _SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -230,12 +236,14 @@ def _render_preview_clip(
 
     # burn compose names preview clips as <stem>_chat.mp4 (same as full burns);
     # also accept any *_preview_*s.mp4 if naming changes later.
-    candidates = list(preview_dir.glob(f"{video.stem}_chat.mp4"))
+    # glob.escape: stem 里的 [*?] 等元字符必须按字面匹配，否则带特殊字符的
+    # 视频名（如 "clip [x].mp4"）会匹配到错误的候选文件。
+    candidates = list(preview_dir.glob(f"{glob.escape(video.stem)}_chat.mp4"))
     if not candidates:
-        candidates = list(preview_dir.glob(f"{video.stem}_preview_*s.mp4"))
+        candidates = list(preview_dir.glob(f"{glob.escape(video.stem)}_preview_*s.mp4"))
     if not candidates:
         # Job-dir layout: out_dir may contain job_*/<stem>_chat.mp4
-        candidates = list(preview_dir.glob(f"**/job_*/{video.stem}_chat.mp4"))
+        candidates = list(preview_dir.glob(f"**/job_*/{glob.escape(video.stem)}_chat.mp4"))
     if candidates:
         # Prefer newest if multiple
         preview_out = max(candidates, key=lambda p: p.stat().st_mtime)
@@ -316,7 +324,9 @@ def pause_after_translation_for_review(
         try:
             raw = input("请选择 [回车继续" + (" / P 预览" if can_preview else "") + " / S 停止]: ").strip()
         except EOFError:
-            raw = ""
+            # stdin 关闭 = 无人监督（管道/断开的终端）：自动继续渲染数小时不安全，
+            # 与 "S" 同义停在翻译完成点（--review-done 可恢复）。
+            raw = "s"
 
         low = raw.lower()
 
@@ -1085,9 +1095,13 @@ def _main():
             )
             if rapplied:
                 print(f"[render-preset] 已加载: {args.render_preset} -> {', '.join(rapplied)}")
-        except Exception as e:
-            print(f"[render-preset] 加载失败: {e}")
-            raise SystemExit(2)
+        except (OSError, ValueError) as e:
+            # 只兜预设文件读取/校验错误（与 layout 分支同款），不吞编程错误。
+            raise SystemExit(f"错误: {e}")
+        except yaml.YAMLError as e:
+            # PyYAML 错误的 MRO 不经过 ValueError：坏 YAML 预设要像坏 job YAML
+            # 一样给出"错误:"退出（exit 1），而不是裸 traceback。
+            raise SystemExit(f"错误: render preset YAML 无法解析: {e}")
 
     # Clean early exit before mode guards; doctor 早退已前移至 --job 处理之前。
 
@@ -1153,7 +1167,13 @@ def _main():
     if args.lint_translation and args.lint_translation != "__PIPELINE__" and not args.video and not args.chat_html:
         _lint_only_exit(args, Path(args.lint_translation).resolve())
     if args.lint_translation == "__PIPELINE__" and args.video and not args.chat_html:
-        _lint_only_exit(args, Path(args.video).resolve())
+        # sentinel（--lint-translation 不带值）+ video：用户意图是"质检本片翻译"，
+        # 但管线还没有 translation_json 可检；直接 parser.error 比让它落到
+        # "需要 chat_html" 的通用报错更能说明问题。
+        parser.error(
+            "--lint-translation 不带值时不能同时提供 video 参数: "
+            "请给 --lint-translation 传翻译 JSON 路径，或去掉 video 只跑质检"
+        )
     if not args.video or not args.chat_html:
         parser.error(
             "需要提供 video 和 chat_html；"
@@ -1205,6 +1225,15 @@ def _main():
         return default_path
 
     # Explicit paths always win. --workdir only relocates implicit defaults.
+    # 三个显式路径与 --output 同款系统目录守卫：写进系统目录的翻译/复核表
+    # 同样不可接受（fail closed）。
+    for _label, _explicit in (
+        ("--translation-json", args.translation_json),
+        ("--review-tsv", args.review_tsv),
+        ("--review-xlsx", args.review_xlsx),
+    ):
+        if _explicit and is_dangerous_publish_path(Path(str(_explicit)).resolve()):
+            raise PipelineError(f"错误: {_label} 不能写到系统目录: {_explicit}")
     trans_json = Path(args.translation_json).resolve() if args.translation_json else wd(video.with_name(video.stem + "_translation.json"))
     review_tsv = Path(args.review_tsv).resolve() if args.review_tsv else wd(video.with_name(video.stem + "_translation_review.tsv"))
     review_xlsx = Path(args.review_xlsx).resolve() if args.review_xlsx else review_tsv.with_suffix(".xlsx")

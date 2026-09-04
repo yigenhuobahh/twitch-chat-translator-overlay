@@ -160,3 +160,59 @@ def test_tui_opens_the_structured_bug_template(monkeypatch):
     import asyncio
 
     asyncio.run(exercise())
+
+
+# ---------------------------------------------------------------------------
+# Fix 8 / S-3: mkstemp 唯一临时文件 + 失败也写 task result
+# ---------------------------------------------------------------------------
+
+def test_write_summary_leaves_no_tmp_residue(tmp_path: Path):
+    target = tmp_path / "sub" / "issue-summary.txt"
+    support_report.write_summary(target, "hello")
+    assert target.read_text(encoding="utf-8") == "hello"
+    assert list(tmp_path.rglob("*.tmp")) == []
+    assert list(tmp_path.rglob(".*.tmp")) == []
+
+
+def test_write_task_result_leaves_no_tmp_residue(tmp_path: Path):
+    from task_results import write_task_result
+
+    out = tmp_path / "result.json"
+    import os
+
+    old = os.environ.get("TWITCH_OVERLAY_RESULT_FILE")
+    os.environ["TWITCH_OVERLAY_RESULT_FILE"] = str(out)
+    try:
+        assert write_task_result(state="succeeded", mode="x", returncode=0)
+    finally:
+        if old is None:
+            os.environ.pop("TWITCH_OVERLAY_RESULT_FILE", None)
+        else:
+            os.environ["TWITCH_OVERLAY_RESULT_FILE"] = old
+    assert out.is_file()
+    assert list(tmp_path.rglob("*.tmp")) == []
+
+
+def test_main_records_failed_task_result_on_write_error(tmp_path, monkeypatch, capsys):
+    """S-3: write_summary 抛 OSError 时 main 返回 2 且写 failed 终态。"""
+    output = tmp_path / "summary.txt"
+
+    def boom(path, content):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(support_report, "write_summary", boom)
+    monkeypatch.setattr(
+        support_report,
+        "run_doctor",
+        lambda *, python, pipeline, timeout: (0, "doctor output"),
+    )
+    result_file = tmp_path / "result.json"
+    monkeypatch.setenv("TWITCH_OVERLAY_RESULT_FILE", str(result_file))
+
+    rc = support_report.main(["--output", str(output)])
+    assert rc == 2
+    data = read_task_result(result_file)
+    assert data is not None
+    assert data["state"] == "failed"
+    assert data["mode"] == "support-summary"
+    assert data["returncode"] == 2

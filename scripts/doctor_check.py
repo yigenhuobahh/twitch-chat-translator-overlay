@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import importlib.util
-import os
 from pathlib import Path
 import platform
 import subprocess
@@ -21,6 +20,7 @@ from common_utils import (
     detect_cjk_font,
     require_executable,
     safe_which,
+    translate_api_env_config,
 )
 from env_bootstrap import (
     maybe_prompt_offer_fixes,
@@ -140,9 +140,12 @@ def doctor(args):
         _, bold = _auto_cjk_font()
         check("粗体字体 (auto)", bool(bold), bold or "未检测到 CJK 字体", "用 --font-bold-path 手动指定字体路径")
 
-    base_url = os.getenv("OPENAI_COMPAT_BASE_URL")
-    api_key = os.getenv("OPENAI_COMPAT_API_KEY")
-    model = os.getenv("OPENAI_COMPAT_MODEL")
+    # R·doctor 单源：三键读取共用 common_utils 的同一实现（OPENAI_COMPAT_*
+    # 带 AGNES_* 回退），与 env_bootstrap / translate_chat_openai 不再漂移。
+    env_cfg = translate_api_env_config()
+    base_url = env_cfg["base_url"]
+    api_key = env_cfg["api_key"]
+    model = env_cfg["model"]
     check(
         "翻译 Base URL",
         bool(base_url),

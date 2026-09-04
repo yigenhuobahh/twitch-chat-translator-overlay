@@ -840,6 +840,26 @@ def ensure_utf8_stdio() -> None:
                 pass
 
 
+def _confirm_untrusted_dotenv() -> bool:
+    """Confirm with the user whether to use an untrusted cwd .env.
+
+    Used when a current-directory .env simultaneously provides a translation
+    endpoint and an API key: chat text would be sent to that endpoint, which
+    may come from an untrusted third-party "project bundle". Fails closed on
+    any non-interactive stdin (pipe, CI, redirected input).
+    """
+    try:
+        if sys.stdin is None or not sys.stdin.isatty():
+            return False
+    except Exception:
+        return False
+    try:
+        answer = input("仍要使用该 .env? [y/N]: ")
+    except (EOFError, OSError):
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
 def load_dotenv_if_present() -> None:
     """Load translation API keys from the first .env without overriding process vars.
 
@@ -927,14 +947,32 @@ def load_dotenv_if_present() -> None:
                     parsed[key] = val
         except OSError:
             return
+        if env_path is cwd_env and parsed and resolved not in trusted_envs:
+            endpoint_keys = {"OPENAI_COMPAT_BASE_URL", "AGNES_BASE_URL"}
+            secret_keys = {"OPENAI_COMPAT_API_KEY", "AGNES_API_KEY"}
+            has_endpoint = any(k in parsed for k in endpoint_keys)
+            has_secret = any(k in parsed for k in secret_keys)
+            if has_endpoint and has_secret:
+                # 同时提供端点+密钥的不受信 cwd .env:聊天原文会发往该端点,
+                # 必须经用户确认(常见于第三方"工程包"解压即运行的场景)。
+                # 注意:此处必须先确认再写入 os.environ,拒绝时视为未加载。
+                print(f"⚠ 当前目录 .env 同时提供翻译端点与 API 密钥: {env_path}", flush=True)
+                print("  聊天内容将被发送到该端点(可能来自第三方工程包)。", flush=True)
+                if _confirm_untrusted_dotenv():
+                    for key, val in parsed.items():
+                        os.environ[key] = val
+                        _DOTENV_LOADED_KEYS.add(key)
+                    print(f"已确认并从当前目录加载 .env: {env_path}", flush=True)
+                    # Only load the first existing .env.
+                    return
+                print("已拒绝加载当前目录 .env(端点+密钥);继续查找其他 .env。", flush=True)
+                # 视为未加载:继续尝试 repo/install 布局的 .env 候选。
+                continue
         for key, val in parsed.items():
             os.environ[key] = val
             _DOTENV_LOADED_KEYS.add(key)
-        if (
-            env_path is cwd_env
-            and parsed
-            and resolved not in trusted_envs
-        ):
+        if env_path is cwd_env and parsed and resolved not in trusted_envs:
+            # 其他情况(仅模型名等,无端点+密钥组合)维持现状:提示一行。
             print(f"已从当前目录加载 .env: {env_path}", flush=True)
         # Only load the first existing .env.
         return

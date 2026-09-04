@@ -117,7 +117,10 @@ def _download_transaction_is_active(transaction_id: str) -> bool:
 def _transaction_evidence_error(root: Path, message: str) -> TwitchDownloadError:
     journal = _download_transaction_journal_path(root)
     claim = _download_transaction_claim_path(root)
-    return TwitchDownloadError(f"{message}；事务现场已保留: {journal} / {claim}")
+    return TwitchDownloadError(
+        f"{message}；事务现场已保留: {journal} / {claim}"
+        "\n  (确认无下载进程后，可手工删除上述 journal/claim 文件恢复)"
+    )
 
 
 def _canonical_transaction_root(root: Path) -> Path:

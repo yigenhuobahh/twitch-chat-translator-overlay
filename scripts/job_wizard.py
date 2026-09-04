@@ -467,6 +467,10 @@ def _apply_extra_cli_path_overrides(
                 out[key] = args[i + 1]
                 i += 2
                 continue
+            # 值缺失或以 - 开头：没法解析成 flag 取值，保守跳过并提示，
+            # 否则该值会被静默丢弃（用户以为 --output 生效了）。
+            if i + 1 < len(args):
+                print(f"  [WARN] 忽略无法解析的参数: {args[i + 1]!r}(值以 - 开头)")
             i += 1
             continue
         for flag, skey in flags.items():
@@ -951,7 +955,7 @@ def run_job_wizard(
         job_name = _safe_stem(
             _prompt("1) 配置名称（英文/数字更好，如 mobile_preview）", default_name)
         )
-        if job_name in {"3", "1", "2", "0"} or (job_name.isdigit() and len(job_name) <= 2):
+        if job_name.isdigit() and len(job_name) <= 2:
             print("  提示: 纯数字名称容易和菜单编号搞混，建议改成有含义的名字。")
             alt = _prompt("  改用名称（回车保持原样）", job_name)
             job_name = _safe_stem(alt or job_name)
@@ -1147,8 +1151,9 @@ def run_job_wizard(
             else:
                 print(f'\n已保存。稍后运行: {current_cli_invocation()} --job "{path}"')
         return path
-    except KeyboardInterrupt:
-        print("\n已取消")
+    except (KeyboardInterrupt, EOFError):
+        # EOFError：stdin 关闭（管道/挂起的终端）同样无人可答，继续问只会循环报错。
+        print("\n已取消(输入已关闭)")
         return None
 
 
@@ -1187,6 +1192,40 @@ def _prompt_multi_segments() -> list[tuple[str, str]]:
     if confirm in ("n", "no", "q"):
         raise TwitchDownloadError("已取消多段下载")
     return pairs
+
+
+def _pick_job_from_list(
+    files: list[Path],
+    root: Path,
+    *,
+    prompt: str = "输入编号或配置名",
+    default: str = "1",
+    on_missing: str = "return",
+) -> Path | None:
+    """Shared "pick one job from a printed list" prompt (three callers).
+
+    解析编号（1..len）或配置名；无效时:
+      on_missing="return" → 返回 None，由调用方自行处理（打印错误/return 1）
+      on_missing="retry"  → 打印"无效编号"并返回 None（旧菜单循环里调用方
+                            只需拿回 None 继续外层 while）
+    返回 None 时调用方必须区分"用户没选"与"选择无效"两种语义吗？不需要：
+    三处旧控制流都把两种情况归并为"未选中"。
+    """
+    selected = _prompt(prompt, default)
+    try:
+        index = int(selected)
+        if 1 <= index <= len(files):
+            return files[index - 1]
+        # 越界编号：旧菜单打印"无效编号"后回菜单/报错；这里统一提示，
+        # 保证选择无效不是静默吞掉。
+        print("无效编号")
+        return None
+    except ValueError:
+        try:
+            return resolve_job_arg(selected, root)
+        except ValueError as exc:
+            print(exc)
+            return None
 
 
 def _menu_download_and_continue() -> int:
@@ -1334,18 +1373,7 @@ def _menu_download_and_continue() -> int:
         files = print_job_list(default_jobs_dir())
         if not files:
             return 0
-        sel = _prompt("输入编号或配置名", "1")
-        path: Path | None = None
-        try:
-            idx = int(sel)
-            if 1 <= idx <= len(files):
-                path = files[idx - 1]
-        except ValueError:
-            try:
-                path = resolve_job_arg(sel, default_jobs_dir())
-            except ValueError as e:
-                print(e)
-                return 1
+        path = _pick_job_from_list(files, default_jobs_dir())
         if path is None:
             print("无效选择")
             return 1
@@ -1441,19 +1469,7 @@ def _run_legacy_menu() -> int:
             if not files:
                 _prompt("回车返回菜单", "")
                 continue
-            sel = _prompt("输入编号或配置名", "1")
-            path: Path | None = None
-            try:
-                idx = int(sel)
-                if 1 <= idx <= len(files):
-                    path = files[idx - 1]
-                else:
-                    print("无效编号")
-            except ValueError:
-                try:
-                    path = resolve_job_arg(sel, root)
-                except ValueError as e:
-                    print(e)
+            path = _pick_job_from_list(files, root)
             if path is None:
                 _prompt("回车返回菜单", "")
                 continue
@@ -1472,17 +1488,7 @@ def _choose_existing_job(root: Path) -> int:
     files = print_job_list(root, show_presets=False)
     if not files:
         return 0
-    selected = _prompt("输入编号或配置名", "1")
-    path: Path | None = None
-    try:
-        index = int(selected)
-        if 1 <= index <= len(files):
-            path = files[index - 1]
-    except ValueError:
-        try:
-            path = resolve_job_arg(selected, root)
-        except ValueError as exc:
-            print(exc)
+    path = _pick_job_from_list(files, root)
     if path is None:
         print("无效选择。")
         return 1

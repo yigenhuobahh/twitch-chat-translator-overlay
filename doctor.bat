@@ -27,6 +27,15 @@ if errorlevel 1 (
   if not defined CI pause
   exit /b 1
 )
+REM Reject cmd metacharacters early: they enable command injection when the
+REM whole %* vector is re-parsed downstream (C3).
+echo(%*| findstr /R /C:"[&|^<>()!]" >nul
+if not errorlevel 1 (
+  echo [FAIL] Arguments contain cmd metacharacters. Rejecting for safety.
+  if not defined CI pause
+  exit /b 1
+)
+
 "%PY%" scripts\render_cn_chat.py --doctor %*
 set "RC=%ERRORLEVEL%"
 echo.
