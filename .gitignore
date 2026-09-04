@@ -35,6 +35,12 @@ outputs/*
 # Private local archive of personal samples/reviews/outputs (never publish)
 _local_archive/
 
+# Local checkout of historical versions for regression testing
+_test_samples/
+
+# Local prototype snapshots / one-off review workflow scripts
+_workflow/
+
 # Local profiles may contain channel/game-specific terminology.
 profiles/*.yaml
 !profiles/default.yaml
