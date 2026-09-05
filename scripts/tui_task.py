@@ -67,15 +67,34 @@ def _diagnostic_line(value: str) -> str:
     return redact_text(value)
 
 
+def _unique_sibling_temp(target: Path) -> Path:
+    """Create a unique temp file in ``target``'s directory via mkstemp.
+
+    固定 "<name><suffix>.tmp" 兄弟名在无锁时会让两个并发写者互踩
+    （run_meta.py 曾记载同款教训）：一个写者刚写完的 tmp 会被另一个写者的
+    write 覆盖，随后两次 replace 让“后完成者获胜”污染最终内容。mkstemp
+    保证每个写者拿到独立路径，同目录则保住 os.replace 的原子性语义。
+    """
+    fd, name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
+    os.close(fd)
+    return Path(name)
+
+
 def sanitize_diagnostic_file(path: str | Path) -> Path:
     """Migrate a prior diagnostic export to current privacy guarantees."""
     target = Path(path)
     raw = target.read_text(encoding="utf-8")
     cleaned = "\n".join(_diagnostic_line(line) for line in raw.splitlines()) + "\n"
     if cleaned != raw:
-        temporary = target.with_suffix(target.suffix + ".tmp")
-        temporary.write_text(cleaned, encoding="utf-8")
-        temporary.replace(target)
+        temporary = _unique_sibling_temp(target)
+        try:
+            temporary.write_text(cleaned, encoding="utf-8")
+            temporary.replace(target)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
     return target
 
 
@@ -257,7 +276,8 @@ class TaskSession:
             target.parent.mkdir(parents=True, exist_ok=True)
             # History can be redirected to another drive in tests or by a
             # portable install.  Copy-then-replace remains atomic at target.
-            temporary = target.with_suffix(target.suffix + ".tmp")
+            # 唯一临时名：固定 ".tmp" 兄弟名在两个会话并发 retain 同一目标时互踩。
+            temporary = _unique_sibling_temp(target)
             shutil.copyfile(self.result_path, temporary)
             os.replace(temporary, target)
             self.result_path.unlink(missing_ok=True)

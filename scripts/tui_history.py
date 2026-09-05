@@ -14,7 +14,7 @@ import time
 from typing import Any
 import uuid
 
-from run_meta import pid_is_alive
+from run_meta import ABSOLUTE_MAX_LIVE_SEC, pid_is_alive
 from task_results import read_task_result
 from tui_models import (
     TuiDownloadDraft,
@@ -248,10 +248,15 @@ class TuiHistoryStore:
             with self._history_lock():
                 records = self._load()
                 changed: list[dict[str, Any]] = []
+                now = time.time()
                 for record in records:
                     state = record.get("state")
                     if state == "running" and pid_is_alive(record.get("pid")) is True:
-                        continue
+                        # Windows 会复用 pid：仅凭 pid 探活会让僵尸 running 记录
+                        # 永远“看似存活”并永久阻塞 clear()。与 run_meta 的
+                        # is_live_run_meta 一致，加一个绝对时限兜底。
+                        if self._record_within_absolute_live_window(record, now=now):
+                            continue
                     if state in {"queued", "running"}:
                         record["state"] = "interrupted"
                         record["finished_at"] = time.time()
@@ -262,6 +267,26 @@ class TuiHistoryStore:
         except HistoryLockTimeoutError as exc:
             _degrade_locked_read(exc)
             return []
+
+    @staticmethod
+    def _record_within_absolute_live_window(record: dict[str, Any], *, now: float) -> bool:
+        """Absolute-age check for running records whose pid appears alive.
+
+        以 updated_at（缺省回退 started_at）为时间基准；缺时间字段的极老记录
+        保守处理：只要 pid 活着就按存活保持现状（不误杀），注释即此约定的
+        说明。updated_at 在 mark_running / set_diagnostic / finish 时都会刷新。
+        """
+        stamp = record.get("updated_at")
+        if not isinstance(stamp, (int, float)):
+            stamp = record.get("started_at")
+        try:
+            stamp_f = float(stamp)
+        except (TypeError, ValueError):
+            # 旧记录缺时间字段：保守起见沿用旧行为（pid 活 ⇒ 保持 running）。
+            return True
+        if not math.isfinite(stamp_f):
+            return True
+        return (now - stamp_f) <= float(ABSOLUTE_MAX_LIVE_SEC)
 
     def start(self, draft: TuiJobDraft | TuiDownloadDraft | None, *, label: str) -> dict[str, Any]:
         with self._history_lock():
