@@ -14,6 +14,12 @@ import threading
 import time
 import uuid
 
+# Import direction note: chat_text_layout does not import translation_support,
+# so this is a one-way dependency (no cycle). sanitize_render_text is the single
+# shared sanitizer for text that reaches Pillow draw.text; the LLM translation
+# path must apply it just like the chat HTML path does.
+from chat_text_layout import sanitize_render_text
+
 
 class TranslationErrorKind:
     RATE_LIMIT = "rate_limit"
@@ -287,9 +293,18 @@ def clean_translation_text(text, author=None) -> str:
     letters (C:\\) as username prefixes. Optional *author* strips an exact
     author-name prefix even without CJK (import path).
 
+    Output is sanitized via chat_text_layout.sanitize_render_text (the same
+    filter the chat HTML path applies) so LLM text never carries bidi
+    overrides, zero-width or C0/C1 control characters into draw.text. The
+    sanitizer runs on the final return value; it is idempotent and NFKC is
+    not applied on this path, so prefix stripping sees the raw model output.
     Burn import historically called this ``clean_imported_translation``; use
     this function (or the burn re-export alias) for both paths.
     """
+    return sanitize_render_text(_clean_translation_text_inner(text, author))
+
+
+def _clean_translation_text_inner(text, author=None) -> str:
     text = str(text or "").strip()
     text = _INDEX_PREFIX_RE.sub("", text).strip()
     text = _ANGLE_PREFIX_RE.sub("", text).strip()

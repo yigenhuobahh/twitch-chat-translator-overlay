@@ -9,9 +9,45 @@ prepass and the bitmap renderer share exactly one layout implementation."""
 
 from __future__ import annotations
 
+import re
 import unicodedata
 
 from common_utils import hex_to_rgb_soft
+
+# Invisible/hostile characters that must never reach Pillow draw.text:
+# - bidi embedding/override controls (U+202A-U+202E, U+2066-U+2069) can visually
+#   reorder/reverse rendered text (display spoofing, e.g. U+202E RLO).
+# - zero-width characters (U+200B, U+200C, U+FEFF) are invisible but occupy
+#   layout space and can hide content from human review. U+200D (ZWJ) is
+#   deliberately kept: it carries no display-spoofing capability and removing
+#   it breaks emoji ZWJ ligature sequences (e.g. 😀‍🚀).
+# - C0/C1 control characters render as tofu boxes (or are otherwise undefined
+#   glyphs) in bitmap fonts.
+# \t \n \r are excluded from the control class because they are normalized to
+# plain spaces (matching common_utils.normalize_text and the space-based
+# wrapping in split_text_for_wrap, which draws a bare newline as tofu).
+_BIDI_CONTROL_RE = re.compile(r"[\u202a-\u202e\u2066-\u2069]")
+_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\ufeff]")
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def sanitize_render_text(t) -> str:
+    """Make arbitrary text safe for direct Pillow draw.text rendering.
+
+    Removes bidi override/embedding controls, zero-width characters and
+    C0/C1 control characters; collapses \\r \\n \\t to plain spaces (render
+    only wraps on spaces, so a literal newline would draw as tofu). Shared by
+    the chat HTML text path (via normalize_text) and the LLM translation path
+    (via translation_support.clean_translation_text). NFKC neither produces
+    nor removes any of these characters, so callers may sanitize before or
+    after NFKC; this module always sanitizes after NFKC (fixed order).
+    """
+    s = str(t or "")
+    s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    s = _BIDI_CONTROL_RE.sub("", s)
+    s = _ZERO_WIDTH_RE.sub("", s)
+    s = _CONTROL_RE.sub("", s)
+    return s
 
 
 def is_cjk_char(ch):
@@ -157,10 +193,16 @@ def wrap_fragments(frag_list, header_w, max_w, padding, indent, gap, text_width_
 
 
 def normalize_text(t):
-    """Normalize compatibility glyphs without destroying supplementary Unicode."""
-    # Keep emoji, ZWJ sequences and supplementary CJK whenever the font supports
-    # them; NFKC still simplifies mathematical compatibility letters.
-    return unicodedata.normalize("NFKC", str(t or ""))
+    """Normalize compatibility glyphs without destroying supplementary Unicode.
+
+    Also sanitizes invisible/hostile characters (bidi overrides, zero-width,
+    C0/C1 controls; see sanitize_render_text) so nothing reachable from remote
+    chat HTML reaches draw.text. Sanitization happens after NFKC (fixed order;
+    NFKC never creates or removes these characters). Emoji, ZWJ sequences and
+    supplementary CJK are kept whenever the font supports them.
+    """
+    # NFKC still simplifies mathematical compatibility letters.
+    return sanitize_render_text(unicodedata.normalize("NFKC", str(t or "")))
 
 
 def hex_to_rgb(hex_color):
