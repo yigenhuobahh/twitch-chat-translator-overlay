@@ -349,3 +349,115 @@ def test_compose_publish_restores_bak_on_replace_failure(tmp_path: Path, make_te
     # Old output restored from .bak
     assert existing.is_file()
     assert existing.read_bytes() == b"OLD_OUTPUT_BYTES"
+
+
+# ---------------------------------------------------------------------------
+# validate_rendered_output short-check floor semantics (overlay_compose.py).
+#
+# Contract under test (docstring "Floor semantics"): expected_duration and
+# min_duration are *independent* short-check floors — reject iff
+#   actual + tol < expected   (when expected > 0)  OR
+#   actual + tol < min_duration  (when min_duration set and > 0).
+#
+# These tests patch the probe seam at the owner module (overlay_compose.media_probe)
+# so they need no FFmpeg, matching the file's patch-ownership convention.
+# ---------------------------------------------------------------------------
+
+
+def _patch_probe_with_duration(monkeypatch, duration: float) -> None:
+    fake = SimpleNamespace(
+        probe_media_summary=lambda path: {
+            "ok": True,
+            "duration": float(duration),
+            "has_video": True,
+            "has_audio": True,
+            "width": 640,
+            "height": 360,
+            "error": "",
+        }
+    )
+    monkeypatch.setattr(overlay_compose, "media_probe", fake)
+
+
+def test_validate_min_floor_below_expected_passes_when_within_tolerance(monkeypatch):
+    """Output between min_duration and expected clears both floors -> PASS.
+
+    expected=2.0 with tol=0.35 accepts actual=1.72 (2.07 >= expected), and the
+    independent min_duration=1.0 floor is far below. Guards against tightening
+    mutants of the floor block: dropping the tolerance from the expected
+    short-check, raising the min branch above min_duration in a way that
+    rejects outputs the contract accepts, or inverting either floor check.
+    """
+    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
+    _patch_probe_with_duration(monkeypatch, 1.72)
+    ok, _summary, reason = burn.validate_rendered_output(
+        "synthetic.mp4",
+        expected_duration=2.0,
+        require_audio=True,
+        duration_tolerance=0.35,
+        min_duration=1.0,
+    )
+    assert ok, reason
+
+
+def test_validate_min_floor_above_expected_binds_and_reports_min_duration(monkeypatch):
+    """A min_duration floor ABOVE expected must bind on its own.
+
+    actual=2.10 clears expected=2.0 (+tol) but sits below min_duration=2.5
+    even with tolerance: must be rejected with the min_duration reason. Catches
+    deletion/deadening of the min branch (floor zeroed, guard raised, branch
+    removed) which would silently accept a below-floor output.
+    """
+    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
+    _patch_probe_with_duration(monkeypatch, 2.10)
+    ok, _summary, reason = burn.validate_rendered_output(
+        "synthetic.mp4",
+        expected_duration=2.0,
+        require_audio=True,
+        duration_tolerance=0.35,
+        min_duration=2.5,
+    )
+    assert not ok
+    assert "min_duration" in reason, reason
+
+
+def test_validate_min_below_expected_does_not_relax_expected_short_check(monkeypatch):
+    """min_duration below expected must not disable the expected short-check.
+
+    actual=1.50 vs expected=2.0: 1.85 < 2.0 even with tol, so the output is
+    rejected via the *expected* floor even though it sits above
+    min_duration=1.0. Guards the opposite misreading of "independent floor"
+    (min_duration replacing/relaxing the expected check would accept this).
+    """
+    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
+    _patch_probe_with_duration(monkeypatch, 1.50)
+    ok, _summary, reason = burn.validate_rendered_output(
+        "synthetic.mp4",
+        expected_duration=2.0,
+        require_audio=True,
+        duration_tolerance=0.35,
+        min_duration=1.0,
+    )
+    assert not ok
+    assert "expected" in reason, reason
+    assert "min_duration" not in reason, reason
+
+
+def test_validate_min_floor_applies_independently_without_expected(monkeypatch):
+    """With expected=0, min_duration alone is the short floor.
+
+    actual=1.20 vs min_duration=1.6 (tol 0.35 -> 1.55 < 1.6) must be rejected
+    with the min_duration reason; proves the floor exists independently of the
+    expected check rather than only as a shadow of it.
+    """
+    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
+    _patch_probe_with_duration(monkeypatch, 1.20)
+    ok, _summary, reason = burn.validate_rendered_output(
+        "synthetic.mp4",
+        expected_duration=0.0,
+        require_audio=False,
+        duration_tolerance=0.35,
+        min_duration=1.6,
+    )
+    assert not ok
+    assert "min_duration" in reason, reason

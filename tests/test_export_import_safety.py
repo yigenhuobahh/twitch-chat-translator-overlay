@@ -811,3 +811,129 @@ def test_review_issue_map_severity_monotonic_upgrade(tmp_path: Path):
     assert merge("FAIL", "WARN", "OK")["severity"] == "FAIL"
     # 未知 severity 归一为 WARN，不抛异常
     assert merge("OK", "WEIRD")["severity"] == "WARN"
+
+
+# ---------------------------------------------------------------------------
+# 导入身份门·细节回归（tests-6）
+#   1) 重复 index 行：后写覆盖先写 + 警告文案
+#   2) 手编 JSON 缺 author/original 字段：不得因此被拒
+#   3) 时间戳容差 0.51s 边界（0.5 应用 / 0.6 跳过）+ 时间戳无法解析分支
+# ---------------------------------------------------------------------------
+
+
+def _single_msg_chat(author: str = "alice", ts: float = 100.0) -> dict:
+    return {
+        "messages": [
+            {
+                "author": author,
+                "timestamp": ts,
+                "stream_timestamp": ts,
+                "fragments": [{"type": "text", "text": ": hello"}],
+            }
+        ]
+    }
+
+
+def test_import_duplicate_index_last_write_wins_and_warns():
+    """同一 JSON 出现重复 index：后写覆盖先写，且必须发"后写覆盖先写"警告。
+
+    变异验证锚点：若删掉 dup 检测块（仅抑制警告、保留 trans_map 赋值），
+    本测试的警告断言必须失败；若删块连带丢赋值，覆盖断言也会失败。
+    """
+    import translation_io
+
+    chat = _single_msg_chat()
+    trans = {
+        "schema_version": 2,
+        "time_base": "stream",
+        "messages": [
+            {"index": 0, "author": "alice", "timestamp": 100.0, "original": "hello", "translation": "先写"},
+            {"index": 0, "author": "alice", "timestamp": 100.0, "original": "hello", "translation": "后写"},
+        ],
+    }
+    replaced, _stripped, warnings = translation_io.apply_imported_translations(chat, trans)
+    assert replaced == 1
+    assert chat["messages"][0]["fragments"][0]["text"] == "后写"
+    dup = [w for w in warnings if "重复 index" in w]
+    assert dup, f"missing dup-index warning, warnings={warnings!r}"
+    assert "后写覆盖先写" in dup[0]
+    assert "0" in dup[0]
+    # 只有 index=0 一行（重复不计），消息与 map 条数一致，不应有条数不一致警告
+    assert not any("条数" in w for w in warnings)
+
+
+def test_import_row_without_author_and_original_still_applies():
+    """手编 JSON 缺 author、缺 original 字段：时间戳匹配时正常导入。
+
+    变异验证锚点：若 author 守卫（exp_author is not None）被改成无条件比较，
+    None != 'alice' 会判为身份不一致而跳过导入，本测试失败。
+    """
+    import translation_io
+
+    chat = _single_msg_chat(author="alice", ts=100.0)
+    trans = {
+        "schema_version": 2,
+        "time_base": "stream",
+        "messages": [
+            {"index": 0, "timestamp": 100.0, "translation": "你好"},
+        ],
+    }
+    replaced, _stripped, warnings = translation_io.apply_imported_translations(chat, trans)
+    assert replaced == 1
+    assert chat["messages"][0]["fragments"][0]["text"] == "你好"
+    assert not any("不一致" in w for w in warnings)
+
+
+@pytest.mark.parametrize(
+    ("exp_ts", "should_apply"),
+    [
+        (100.5, True),   # |Δ| = 0.5，未超 0.51 容差 → 应用
+        (100.6, False),  # |Δ| = 0.6，超 0.51 容差 → 跳过
+    ],
+)
+def test_import_timestamp_tolerance_boundary(exp_ts: float, should_apply: bool):
+    """时间戳容差边界 |Δ|∈{0.5, 0.6}：0.5 应用、0.6 跳过。
+
+    变异验证锚点：0.51 → 1e9 时 0.6 也被放行（should_apply=False 分支失败）；
+    0.51 → 0 时 0.5 也被拒（should_apply=True 分支失败）。
+    """
+    import translation_io
+
+    chat = _single_msg_chat(author="alice", ts=100.0)
+    trans = {
+        "schema_version": 2,
+        "time_base": "stream",
+        "messages": [
+            {"index": 0, "author": "alice", "timestamp": exp_ts, "translation": "你好"},
+        ],
+    }
+    replaced, _stripped, warnings = translation_io.apply_imported_translations(chat, trans)
+    if should_apply:
+        assert replaced == 1
+        assert chat["messages"][0]["fragments"][0]["text"] == "你好"
+        assert not any("时间戳不一致" in w for w in warnings)
+    else:
+        assert replaced == 0
+        assert chat["messages"][0]["fragments"][0]["text"] == ": hello"
+        assert any("时间戳不一致(stream)" in w for w in warnings)
+
+
+def test_import_unparseable_timestamp_is_flagged_and_skipped():
+    """timestamp 为非数值字符串：走"时间戳无法解析"分支，行被跳过不误贴。"""
+    import translation_io
+
+    chat = _single_msg_chat(author="alice", ts=100.0)
+    trans = {
+        "schema_version": 2,
+        "time_base": "stream",
+        "messages": [
+            {"index": 0, "author": "alice", "timestamp": "not-a-number", "translation": "你好"},
+        ],
+    }
+    replaced, _stripped, warnings = translation_io.apply_imported_translations(chat, trans)
+    assert replaced == 0
+    assert chat["messages"][0]["fragments"][0]["text"] == ": hello"
+    unparseable = [w for w in warnings if "时间戳无法解析" in w]
+    assert unparseable, f"missing unparseable-ts warning, warnings={warnings!r}"
+    # 实际文案带 repr 的 JSON 值：'时间戳无法解析: 翻译 JSON='not-a-number''
+    assert "'not-a-number'" in unparseable[0]

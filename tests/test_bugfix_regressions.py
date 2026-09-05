@@ -495,3 +495,54 @@ def test_float_no_lifetime_only_capacity_evicts(burn):
     assert {v[1] for v in visible} == {2, 3, 4}
     # end times are far future
     assert all(e[1] > 1000 for e in events)
+
+
+def test_lanes_carry_in_keeps_source_start_under_arrival_interval(burn):
+    """Lanes path must exempt rebased carry-in (src<0) rows from throttling.
+
+    The float path receives throttle_from explicitly from the caller; the
+    lanes path hardcodes throttle_from=0.0 whenever arrival_interval>0, so
+    negative rebased timestamps keep their original starts instead of being
+    paced to last_admitted_at + interval (which would empty the stack at
+    preview t=0), while in-window rows are still rate limited.
+    """
+    messages = [{"timestamp": t} for t in (-0.5, -0.3, -0.1, 0.2)]
+    schedule = burn.schedule_messages(
+        messages,
+        msg_line_count={i: 1 for i in range(4)},
+        duration=10.0,
+        max_visible=10,
+        msg_lifetime=5.0,
+        arrival_interval=0.5,
+    )
+    assert [row[3] for row in schedule] == [0, 1, 2, 3]
+    # Carry-in rows keep their original negative starts (throttle exemption);
+    # the first in-window row is still paced against the last admitted time.
+    assert [row[0] for row in schedule] == [-0.5, -0.3, -0.1, 0.4]
+    # Lifetime still runs from the (unmodified) admit time.
+    assert all(end - start == 5.0 for start, end, *_rest in schedule)
+
+
+def test_lanes_negative_src_drop_does_not_advance_throttle_cursor(burn):
+    """A dropped src<0 row must not advance the throttle cursor.
+
+    Reachability: with arrival_interval>0 the carry-in exemption pins
+    t=src<0 and a positive window always admits such rows, and with
+    interval==0 a src<0 row can only reach the t>=duration drop via
+    t=last (making the advance a no-op) unless the window itself is
+    non-positive. So the guard is only observable with duration<0, and
+    interval is left at 0 so the cursor alone decides the second row.
+    """
+    messages = [{"timestamp": -0.5}, {"timestamp": -2.0}]
+    schedule = burn.schedule_messages(
+        messages,
+        msg_line_count={0: 1, 1: 1},
+        duration=-1.0,
+        max_visible=4,
+        msg_lifetime=10.0,
+    )
+    # -0.5 lands past the (negative) window and is dropped, but because its
+    # source timestamp is negative it must NOT advance last_admitted_at;
+    # -2.0 is therefore admitted at its own time instead of being throttled
+    # up to -0.5 (which would also drop it past the window).
+    assert [(row[0], row[3]) for row in schedule] == [(-2.0, 1)]
