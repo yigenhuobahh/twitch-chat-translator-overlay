@@ -11,6 +11,7 @@ are driven via ``twitch_download.concat_videos`` / ``twitch_download.merge_chat_
 
 from __future__ import annotations
 
+from fractions import Fraction
 import math
 from pathlib import Path
 import re
@@ -90,6 +91,22 @@ def _ffmpeg_concat_list_line(path: Path) -> str:
     return f"file '{p}'"
 
 
+def _fps_filter_expr(output_fps: float | str) -> str:
+    """Render output_fps for the ffmpeg fps filter (fps=fps=<expr> form).
+
+    Fractional strings ("30000/1001") are normalized via Fraction to an exact
+    num/den expression (AV_OPT_TYPE_VIDEO_RATE accepts num/den); floats keep
+    the legacy ``%.6f`` rendering byte-for-byte (30000/1001 as a float ≈
+    29.97002997 must not change behavior).
+    """
+    if isinstance(output_fps, str):
+        value = Fraction(output_fps.strip())
+        if value.denominator == 1:
+            return f"fps=fps={value.numerator}"
+        return f"fps=fps={value.numerator}/{value.denominator}"
+    return f"fps=fps={float(output_fps):.6f}"
+
+
 def concat_videos(
     paths: list[Path],
     out: Path,
@@ -97,7 +114,7 @@ def concat_videos(
     list_path: Path | None = None,
     remove_ranges: list[tuple[float, float]] | None = None,
     cut_timeline: CutTimeline | None = None,
-    output_fps: float | None = None,
+    output_fps: float | str | None = None,
     encoder: str = "auto",
 ) -> str:
     """Concat N videos → out. Returns 'copy' or 'reencode'.
@@ -110,7 +127,8 @@ def concat_videos(
     0 before joining, which is the correct behavior. ``remove_ranges`` are
     continuous merged-timeline ranges in seconds; cuts are applied while
     decoding the source segments, so this never re-encodes an assembled output.
-    ``output_fps`` optionally forces CFR without disabling B-frames.
+    ``output_fps`` optionally forces CFR without disabling B-frames: a float
+    (e.g. 60) or an exact fractional expression string ("30000/1001").
     ``encoder`` selects the video encoder: auto (default) detects hardware
     encoders (QSV/NVENC/AMF) with libx264 fallback; or explicitly specify
     x264/nvenc/qsv/amf.
@@ -199,7 +217,7 @@ def concat_videos(
     concat_count = len(concat_inputs)
     fc = ";".join(chains) + ";" + "".join(concat_inputs) + f"concat=n={concat_count}:v=1:a=1[v][a]"
     if output_fps:
-        fc += f";[v]fps=fps={float(output_fps):.6f}[v_cfr]"
+        fc += f";[v]{_fps_filter_expr(output_fps)}[v_cfr]"
     # Resolve encoder via encode_options (auto-detect hardware vs software)
     from encode_options import build_video_encode_args, resolve_encode_options
 

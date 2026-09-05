@@ -293,6 +293,40 @@ def test_release_metadata_rejects_untrusted_asset_url(monkeypatch):
     with pytest.raises(td.TwitchDownloadError, match="GitHub 下载路径"):
         td.fetch_latest_td_cli_release_asset()
 
+
+@pytest.mark.parametrize(
+    "extra",
+    ["?token=abc", "#fragment"],
+)
+def test_release_metadata_rejects_url_with_query_or_fragment(extra: str, monkeypatch):
+    """T-3: 正确的 GitHub 下载路径但带 query/fragment 也必须拒绝。"""
+    import json
+
+    import td_cli_install
+    import twitch_download as td
+
+    metadata = {
+        "tag_name": "test",
+        "assets": [
+            {
+                "name": "TwitchDownloaderCLI-test-Windows-x64.zip",
+                "browser_download_url": (
+                    "https://github.com/lay295/TwitchDownloader/releases/"
+                    "download/test/asset.zip" + extra
+                ),
+            }
+        ],
+    }
+    monkeypatch.setattr(td_cli_install, "platform_td_asset_token", lambda: "Windows-x64")
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: FakeResponse(json.dumps(metadata).encode("utf-8")),
+    )
+
+    with pytest.raises(td.TwitchDownloadError, match="query/fragment"):
+        td.fetch_latest_td_cli_release_asset()
+
 def test_non_finite_time_and_media_values_are_rejected(
     tmp_path: Path,
     monkeypatch,
@@ -464,3 +498,183 @@ def test_download_pair_publish_restores_old_files_on_second_replace_failure(
     assert video.read_bytes() == b"old-video"
     assert chat.read_bytes() == b"old-chat"
     assert not any(".backup-" in path.name for path in tmp_path.iterdir())
+
+
+# ---------------------------------------------------------------------------
+# S-1: TD CLI 下载 checksum 尽力校验
+# ---------------------------------------------------------------------------
+
+import hashlib
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _setup_s1_install(monkeypatch, tmp_path: Path, payload: bytes, assets: list):
+    """Fake release metadata + zip download for try_portable_td_cli.
+
+    find_twitchdownloader_cli is patched to return None only before the
+    install lands (the real resolver takes over afterwards, so the
+    post-install discovery still runs against the real tree).
+    Returns (fake_urlopen, good_zip_url, checksum_url).
+    """
+    import json as jsonmod
+
+    import td_cli_install
+    import twitch_download as td
+
+    good_zip_url = "https://github.com/lay295/TwitchDownloader/releases/download/test/TwitchDownloaderCLI-test-Windows-x64.zip"
+    checksum_url = "https://github.com/lay295/TwitchDownloader/releases/download/test/checksums.txt"
+    # 校验文件 URL 的"尾部匹配"集合：兼容 checksums.txt / sha256sums.txt / *.sha256
+    checksum_suffixes = tuple(
+        {checksum_url, checksum_url + ".sha256", checksum_url.replace("checksums.txt", "sha256sums.txt")}
+    )
+
+    def fake_urlopen(req, timeout=None):
+        url = getattr(req, "full_url", req)
+        if url.endswith("releases/latest"):
+            return FakeResponse(
+                jsonmod.dumps({"tag_name": "test", "assets": assets}).encode("utf-8")
+            )
+        if url.endswith(checksum_suffixes):
+            return FakeResponse(getattr(fake_urlopen, "checksum_text", "").encode("utf-8"))
+        return FakeResponse(payload)
+
+    monkeypatch.setattr(td_cli_install, "platform_td_asset_token", lambda: "Windows-x64")
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    real_find = td.find_twitchdownloader_cli
+
+    def find_none_until_installed(root=None):
+        if root is not None and (Path(root) / "tools" / "TwitchDownloaderCLI").is_dir():
+            return real_find(root)
+        return None
+
+    monkeypatch.setattr(td, "find_twitchdownloader_cli", find_none_until_installed)
+    # try_portable_td_cli 成功路径的收尾 prepend_tools_td_to_path 会直接改写
+    # os.environ["PATH"]（进程级全局,monkeypatch 不知道这个写入）,污染同一进程里
+    # 后续测试的 safe_which。这里记下快照,测试结束后恢复。
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
+    return fake_urlopen, good_zip_url, checksum_url
+
+
+def test_td_install_checksum_match_passes(tmp_path: Path, monkeypatch):
+    """S-1 (a): release 提供 checksum 文件且哈希一致 → 安装成功。"""
+    import twitch_download as td
+
+    payload = make_zip({"TwitchDownloaderCLI.exe": b"MZ-fake"})
+    zip_url = "https://github.com/lay295/TwitchDownloader/releases/download/test/TwitchDownloaderCLI-test-Windows-x64.zip"
+    checksum_line = f"{_sha256_hex(payload)}  TwitchDownloaderCLI-test-Windows-x64.zip\n"
+    assets = [
+        {"name": "TwitchDownloaderCLI-test-Windows-x64.zip", "browser_download_url": zip_url},
+        {
+            "name": "checksums.txt",
+            "browser_download_url": zip_url.rsplit("/", 1)[0] + "/checksums.txt",
+        },
+    ]
+    fake_urlopen, _, _ = _setup_s1_install(monkeypatch, tmp_path, payload, assets)
+    fake_urlopen.checksum_text = checksum_line
+
+    root = tmp_path / "root"
+    assert td.try_portable_td_cli(root=root) is True
+    assert (root / "tools" / "TwitchDownloaderCLI" / "TwitchDownloaderCLI.exe").is_file()
+
+
+def test_td_install_checksum_mismatch_aborts_and_cleans(tmp_path: Path, monkeypatch, capsys):
+    """S-1 (b): 哈希不匹配 → TwitchDownloadError 路径、无残留文件、安装失败。"""
+    import twitch_download as td
+
+    payload = make_zip({"TwitchDownloaderCLI.exe": b"MZ-fake"})
+    zip_url = "https://github.com/lay295/TwitchDownloader/releases/download/test/TwitchDownloaderCLI-test-Windows-x64.zip"
+    # 故意给一个"正确格式但错误"的哈希（payload 实际哈希 ≠ 此值）
+    wrong = "0" * 64
+    assert wrong != _sha256_hex(payload)
+    checksum_line = f"{wrong}  TwitchDownloaderCLI-test-Windows-x64.zip\n"
+    assets = [
+        {"name": "TwitchDownloaderCLI-test-Windows-x64.zip", "browser_download_url": zip_url},
+        {
+            "name": "sha256sums.txt",
+            "browser_download_url": zip_url.rsplit("/", 1)[0] + "/sha256sums.txt",
+        },
+    ]
+    fake_urlopen, _, _ = _setup_s1_install(monkeypatch, tmp_path, payload, assets)
+    fake_urlopen.checksum_text = checksum_line
+
+    root = tmp_path / "root"
+    assert td.try_portable_td_cli(root=root) is False
+    out = capsys.readouterr().out
+    assert "checksum mismatch" in out
+    # 无残留: staging 目录被清理, 工具目录未创建
+    tools_parent = root / "tools"
+    assert not (tools_parent / "TwitchDownloaderCLI").exists()
+    leftovers = [p for p in tools_parent.iterdir() if p.name.startswith(".TwitchDownloaderCLI.install-")]
+    assert leftovers == []
+
+
+def test_td_install_no_checksum_asset_keeps_current_behavior(tmp_path: Path, monkeypatch, capsys):
+    """S-1 (c): release 没有 checksum 资产 → 保持现状（正常安装, 无校验报错）。"""
+    import twitch_download as td
+
+    payload = make_zip({"TwitchDownloaderCLI.exe": b"MZ-fake"})
+    zip_url = "https://github.com/lay295/TwitchDownloader/releases/download/test/TwitchDownloaderCLI-test-Windows-x64.zip"
+    assets = [
+        {"name": "TwitchDownloaderCLI-test-Windows-x64.zip", "browser_download_url": zip_url},
+    ]
+    _setup_s1_install(monkeypatch, tmp_path, payload, assets)
+
+    root = tmp_path / "root"
+    assert td.try_portable_td_cli(root=root) is True
+    out = capsys.readouterr().out
+    assert "checksum mismatch" not in out
+    assert (root / "tools" / "TwitchDownloaderCLI" / "TwitchDownloaderCLI.exe").is_file()
+
+
+def test_td_install_checksum_text_star_prefix_and_case_insensitive(tmp_path: Path, monkeypatch):
+    """`<hash> *<filename>` 二进制模式 + 大小写不敏感文件名匹配也能通过。"""
+    import twitch_download as td
+
+    payload = make_zip({"TwitchDownloaderCLI.exe": b"MZ-fake"})
+    zip_url = "https://github.com/lay295/TwitchDownloader/releases/download/test/TwitchDownloaderCLI-test-Windows-x64.zip"
+    checksum_line = (
+        f"{_sha256_hex(payload)} *TWITCHDOWNLOADERCLI-TEST-WINDOWS-X64.ZIP\n"
+        f"{'f' * 64}  some-other-file.zip\n"
+    )
+    assets = [
+        {"name": "TwitchDownloaderCLI-test-Windows-x64.zip", "browser_download_url": zip_url},
+        {
+            "name": "TwitchDownloaderCLI-1.0.sha256",
+            "browser_download_url": zip_url.rsplit("/", 1)[0] + "/TwitchDownloaderCLI-1.0.sha256",
+        },
+    ]
+    fake_urlopen, _, _ = _setup_s1_install(monkeypatch, tmp_path, payload, assets)
+    fake_urlopen.checksum_text = checksum_line
+
+    root = tmp_path / "root"
+    assert td.try_portable_td_cli(root=root) is True
+
+
+def test_td_install_checksum_parses_helper_units(tmp_path: Path):
+    """_parse_checksum_for / _find_checksum_asset 单元行为。"""
+    from td_cli_install import _find_checksum_asset, _parse_checksum_for
+
+    text = (
+        "abcd  other.zip\n"
+        f"{'A' * 64}  *Target.ZIP\n"
+        "not-a-hash  target2.zip\n"
+    )
+    assert _parse_checksum_for(text, "target.zip") == "a" * 64
+    assert _parse_checksum_for(text, "target2.zip") is None
+    assert _parse_checksum_for("", "target.zip") is None
+
+    assets = [
+        {"name": "cli.zip", "browser_download_url": "https://github.com/x"},
+        {"name": "checksums.txt", "browser_download_url": "https://github.com/y"},
+        {"name": "notes.md", "browser_download_url": "https://github.com/z"},
+    ]
+    found = _find_checksum_asset(assets, "cli.zip")
+    assert found is not None and found["name"] == "checksums.txt"
+    assert _find_checksum_asset([{"name": "notes.md"}], "cli.zip") is None
+    # <stem>.sha256 命名（名字本身不含 sha256 关键字以外的提示）也可命中
+    assets2 = [{"name": "cli.sha256", "browser_download_url": "https://github.com/y"}]
+    assert _find_checksum_asset(assets2, "cli.zip") is not None

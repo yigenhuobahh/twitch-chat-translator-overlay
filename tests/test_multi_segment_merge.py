@@ -616,3 +616,227 @@ def test_concat_fallback_command_includes_output_fps_and_encoder_warn(
     out = capsys.readouterr().out
     assert "回退编码固定 libx264" in out
     assert "nvenc" in out
+
+
+# ---------------------------------------------------------------------------
+# K-3: --download-output-fps 支持精确分数（如 30000/1001）
+# ---------------------------------------------------------------------------
+
+def test_download_output_fps_argparse_accepts_float_and_fraction():
+    """argparse type: float 直接解析；分数原样透传；非法分数报错。"""
+    from cli_spec import _download_output_fps
+
+    assert _download_output_fps("60") == 60.0
+    assert _download_output_fps("29.97") == 29.97
+    assert _download_output_fps("30000/1001") == "30000/1001"
+    import argparse
+
+    with pytest.raises(argparse.ArgumentTypeError):
+        _download_output_fps("abc")
+    with pytest.raises(argparse.ArgumentTypeError):
+        _download_output_fps("30000/")  # 缺分母
+    with pytest.raises(argparse.ArgumentTypeError):
+        _download_output_fps("/1001")  # 缺分子
+    with pytest.raises(argparse.ArgumentTypeError):
+        _download_output_fps("30000/0")  # 分母为 0
+    with pytest.raises(argparse.ArgumentTypeError):
+        _download_output_fps("0")  # 非正数
+    with pytest.raises(argparse.ArgumentTypeError):
+        _download_output_fps("-5")
+
+
+def test_build_arg_parser_parses_fraction_output_fps():
+    """端到端：--download-output-fps 30000/1001 解析为原样字符串。"""
+    from cli_spec import build_arg_parser
+
+    parser = build_arg_parser()
+    args = parser.parse_args(["--download-output-fps", "30000/1001"])
+    assert args.download_output_fps == "30000/1001"
+    args2 = parser.parse_args(["--download-output-fps", "60"])
+    assert args2.download_output_fps == 60.0
+    # 默认仍是 None（PIPELINE_CLI_DEFAULTS 单源）
+    args3 = parser.parse_args([])
+    assert args3.download_output_fps is None
+
+
+def test_concat_fraction_fps_filter_expression(tmp_path: Path, monkeypatch):
+    """分数 output_fps 走 fps=num/den 精确表达式；float 保持 .6f。"""
+    import encode_options
+    import twitch_download as td
+
+    paths = [tmp_path / "a.mp4", tmp_path / "b.mp4"]
+    for path in paths:
+        path.write_bytes(b"x")
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(td, "probe_media_duration", lambda _path: 10.0)
+    monkeypatch.setattr(td, "get_stream_start_time", lambda _path, _stream: 0.0)
+
+    def fake_run_tracked(cmd, **kwargs):
+        calls.append(list(cmd))
+        return type("Result", (), {"returncode": 1})()  # 失败以触发回退，捕全部命令
+
+    monkeypatch.setattr(td, "run_tracked", fake_run_tracked)
+    monkeypatch.setattr(
+        encode_options,
+        "resolve_encode_options",
+        lambda **kwargs: type("Options", (), {"resolved_encoder": "x264"})(),
+    )
+    monkeypatch.setattr(encode_options, "build_video_encode_args", lambda _opts: ["-c:v", "libx264"])
+
+    with pytest.raises(td.TwitchDownloadError):
+        td.concat_videos(paths, tmp_path / "out.mp4", output_fps="30000/1001")
+
+    fc_cmd = calls[0]
+    fc_index = fc_cmd.index("-filter_complex")
+    fc = fc_cmd[fc_index + 1]
+    # 归一后的精确分数表达式（30000/1001 已是最简）
+    assert "fps=fps=30000/1001" in fc
+    assert "[v_cfr]" in fc
+    # 回退命令 -r 保持 str() 透传
+    fallback = calls[1]
+    assert "-r" in fallback and "30000/1001" in fallback
+
+    # float 路径回归：维持现状 .6f 渲染
+    calls.clear()
+    with pytest.raises(td.TwitchDownloadError):
+        td.concat_videos(paths, tmp_path / "out2.mp4", output_fps=60.0)
+    fc2 = calls[0][calls[0].index("-filter_complex") + 1]
+    assert "fps=fps=60.000000" in fc2
+
+    # float 形式的 30000/1001 也维持现状（29.970030 近似值不改变行为）
+    calls.clear()
+    with pytest.raises(td.TwitchDownloadError):
+        td.concat_videos(paths, tmp_path / "out3.mp4", output_fps=30000 / 1001)
+    fc3 = calls[0][calls[0].index("-filter_complex") + 1]
+    assert "fps=fps=29.970030" in fc3
+
+
+def test_download_assets_multi_forwards_fraction_fps(tmp_path: Path, monkeypatch):
+    """download_assets_multi 把分数字符串 output_fps 原样转发给 concat_videos。"""
+    import twitch_download as td
+
+    captured: dict = {}
+
+    class FakeResult:
+        video_path = tmp_path / "seg_00.mp4"
+        chat_html_path = tmp_path / "seg_00.html"
+
+    def fake_download_assets(source, **kw):
+        FakeResult.video_path.write_bytes(b"dummy")
+        FakeResult.chat_html_path.write_text("<html></html>")
+        return FakeResult()
+
+    def fake_concat_videos(paths, out, **kw):
+        captured.update(kw)
+        out.write_bytes(b"concat_result")
+        return "reencode"
+
+    def fake_merge_chat_html(segments, **kw):
+        kw["out_path"].write_text("<html>merged</html>")
+        return kw["out_path"]
+
+    monkeypatch.setattr(td, "download_assets", fake_download_assets)
+    monkeypatch.setattr(td, "concat_videos", fake_concat_videos)
+    monkeypatch.setattr(td, "merge_chat_html", fake_merge_chat_html)
+    monkeypatch.setattr(td, "probe_media_duration", lambda _path: 100.0)
+
+    td.download_assets_multi(
+        "1234567890",
+        [("0:00:00", "0:10:00"), ("0:20:00", "0:30:00")],
+        out_dir=tmp_path / "dl",
+        output_fps="30000/1001",
+        media_check="off",
+    )
+    assert captured.get("output_fps") == "30000/1001"
+
+    # 单段 + 分数 fps 也要被拒绝（不能静默忽略）
+    with pytest.raises(td.TwitchDownloadError, match="download-output-fps"):
+        td.download_assets_multi(
+            "1234567890",
+            [("0:00:00", "0:10:00")],
+            out_dir=tmp_path / "dl2",
+            output_fps="30000/1001",
+            media_check="off",
+        )
+
+
+# ---------------------------------------------------------------------------
+# T-2: concat demuxer 路径转义 golden 测试（零产品代码改动）
+# ---------------------------------------------------------------------------
+
+def test_ffmpeg_concat_list_line_golden(tmp_path: Path):
+    """_ffmpeg_concat_list_line 的精确输出 golden：空格/单引号/反斜杠路径。
+
+    期望语义: resolve → '\\'→'/'，' → '\\''，包在单引号里。
+    golden 按现有实际输出写死；若未来转义规则变更需有意识地更新这里。
+    """
+    from twitch_download import _ffmpeg_concat_list_line
+
+    # 空格路径
+    space = tmp_path / "a b.mp4"
+    space.write_bytes(b"x")
+    expected_space = f"file '{str(space.resolve()).replace(chr(92), '/')}'"
+    assert _ffmpeg_concat_list_line(space) == expected_space
+    assert " " in _ffmpeg_concat_list_line(space)  # 空格原样保留在引号内
+
+    # 单引号路径 (it's)
+    quote = tmp_path / "it's.mp4"
+    quote.write_bytes(b"x")
+    # 实现: ' → '\''（结束引号 + 转义引号 + 重开引号，ffmpeg concat demuxer
+    # 规范转义），与 shell quoting 习惯一致。golden 按现有实际输出写死。
+    resolved_quote = str(quote.resolve()).replace("\\", "/")
+    golden_quote = "file '" + resolved_quote.replace("'", "'\\''") + "'"
+    assert _ffmpeg_concat_list_line(quote) == golden_quote
+    # golden 精确断言（含转义序列 '\''）
+    assert _ffmpeg_concat_list_line(quote).endswith("it'\\''s.mp4'")
+
+    # Windows 反斜杠路径形态: C:\a b\file.mp4 → 全部正斜杠
+    line = _ffmpeg_concat_list_line(Path("C:\\a b\\file.mp4"))
+    assert line.startswith("file 'C:/a b/file.mp4'") or line.startswith("file 'c:/a b/file.mp4'")
+    assert "\\" not in line
+
+    # 混合: 引号 + 空格 + 反斜杠（golden 按现有实现实际输出）
+    # 注意: 转义序列 '\' 自带一个反斜杠，因此这里不能断言"无反斜杠"，
+    # 而是精确断言整行：路径分隔符已全部转为 '/'，仅剩转义反斜杠。
+    mixed = Path("C:\\a b\\it's file.mp4")
+    mixed_line = _ffmpeg_concat_list_line(mixed)
+    assert mixed_line == "file 'C:/a b/it'\\''s file.mp4'" or mixed_line == "file 'c:/a b/it'\\''s file.mp4'"
+
+
+def test_concat_list_file_roundtrip_written_lines(tmp_path: Path, monkeypatch):
+    """写盘的 concat_list.txt 每行 = _ffmpeg_concat_list_line 输出，可直接回读。"""
+    import encode_options
+    import twitch_download as td
+
+    names = ["a b.mp4", "it's.mp4", "plain.mp4"]
+    paths = []
+    for name in names:
+        p = tmp_path / name
+        p.write_bytes(b"x")
+        paths.append(p)
+
+    # 单段无 cut 会走 copy 短路；给两段并让 ffmpeg 失败前已写盘。
+    monkeypatch.setattr(td, "probe_media_duration", lambda _path: 10.0)
+    monkeypatch.setattr(td, "get_stream_start_time", lambda _path, _stream: 0.0)
+    monkeypatch.setattr(
+        td, "run_tracked",
+        lambda cmd, **kwargs: type("Result", (), {"returncode": 1})(),
+    )
+    monkeypatch.setattr(
+        encode_options,
+        "resolve_encode_options",
+        lambda **kwargs: type("Options", (), {"resolved_encoder": "x264"})(),
+    )
+    monkeypatch.setattr(encode_options, "build_video_encode_args", lambda _opts: ["-c:v", "libx264"])
+
+    list_path = tmp_path / "concat_list.txt"
+    with pytest.raises(td.TwitchDownloadError):
+        td.concat_videos(paths[:2], tmp_path / "out.mp4", list_path=list_path)
+
+    written = list_path.read_text(encoding="utf-8").splitlines()
+    assert len(written) == 2
+    for path, line in zip(paths[:2], written):
+        assert line == td._ffmpeg_concat_list_line(path)
+    # 引号路径的转义写盘后保持 golden（' → '\''）
+    assert written[1].endswith("it'\\''s.mp4'")

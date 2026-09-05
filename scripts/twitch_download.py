@@ -32,6 +32,7 @@ from common_utils import (
     trusted_tools_root,
 )
 from cut_timeline import CutTimeline, CutTimelineError
+import process_util
 from process_util import run_tracked
 from twitch_download_transaction import (
     preserved_staged_paths,
@@ -324,7 +325,10 @@ def validate_chat_html(path: Path) -> None:
     has_data = "content:url(" in text and "base64," in text.lower()
     # 只认 class 属性里的 emote 类名：裸子串会把正文纯文本（如解说提到
     # "first-place finish" 或静态 CDN 链接）误判成"有表情图"，触发硬失败。
-    has_emote_img = re.search(r'class="[^"]*\b(emote-image|first-|third-)', text) is not None
+    # 前缀集合与 chat_parser._EMOTE_PREFIXES 对齐（first-/second-/third-）。
+    has_emote_img = (
+        re.search(r'class="[^"]*\b(emote-image|first-|second-|third-)', text) is not None
+    )
     if has_emote_img and not has_data:
         # Likely remote CDN only — this project will not fetch.
         if "static-cdn.jtvnw.net" in text or "cdn.betterttv.net" in text:
@@ -337,23 +341,8 @@ def validate_chat_html(path: Path) -> None:
 
 
 def _run_cli(cmd: list[str], *, label: str) -> None:
-    # Never print oauth token values
-    safe = []
-    skip_next = False
-    for part in cmd:
-        if skip_next:
-            safe.append("***")
-            skip_next = False
-            continue
-        if part in ("--oauth",):
-            safe.append(part)
-            skip_next = True
-            continue
-        if part.lower().startswith("--oauth="):
-            safe.append("--oauth=***")
-            continue
-        safe.append(part)
-    print(f"\n$ {' '.join(safe)}", flush=True)
+    # Never print oauth token values — single source: process_util.redact_command.
+    print(f"\n$ {' '.join(process_util.redact_command(cmd))}", flush=True)
     try:
         completed = run_tracked(
             cmd,
@@ -821,7 +810,7 @@ def download_assets_multi(
     video_name: str = "video.mp4",
     chat_name: str = "chat.html",
     remove_ranges: list[tuple[float, float]] | None = None,
-    output_fps: float | None = None,
+    output_fps: float | str | None = None,
     encoder: str = "auto",
     trim_mode: str = "Safe",
     media_check: str = "fast",
@@ -853,6 +842,7 @@ def download_assets_multi(
 
     if len(crops) == 1:
         if remove_ranges or output_fps is not None:
+            # 分数字符串（如 "30000/1001"）也算显式指定了 output_fps，同样拒绝。
             raise TwitchDownloadError(
                 "--cut / --download-output-fps 需要至少两个 --segment；"
                 "单段请先下载，再以多段流程处理，不能静默忽略参数"

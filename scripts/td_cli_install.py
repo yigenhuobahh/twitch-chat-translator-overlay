@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import shutil
 import tempfile
 import uuid
@@ -25,6 +26,11 @@ from twitch_download_types import TwitchDownloadError
 # trusted_tools_root() derives the root from the module file location, so the
 # default root= of try_portable_td_cli resolves to the identical trusted root.
 _TOOLS_ROOT = trusted_tools_root(__file__)
+
+# Assets of the most recent successful release lookup. Lets the checksum
+# verifier reuse the already-fetched asset list (no extra API round-trip).
+# Module-level state: releases are fetched once per install run.
+_LAST_RELEASE_ASSETS: list[object] = []
 
 
 def find_twitchdownloader_cli(root: Path | None = None) -> Path | None:
@@ -164,6 +170,10 @@ def fetch_latest_td_cli_release_asset(
         or not parsed.path.startswith("/lay295/TwitchDownloader/releases/download/")
     ):
         raise TwitchDownloadError("release asset URL 不属于预期的 GitHub 下载路径")
+    if parsed.query or parsed.fragment:
+        raise TwitchDownloadError("release asset URL 不应携带 query/fragment")
+    global _LAST_RELEASE_ASSETS
+    _LAST_RELEASE_ASSETS = list(assets)
     return tag, name, url
 
 
@@ -200,6 +210,119 @@ def _flatten_td_cli_into(dest: Path) -> Path | None:
     return None
 
 
+def _find_checksum_asset(assets: list[object], asset_name: str) -> dict | None:
+    """Find a sibling checksum asset for ``asset_name`` in the release assets.
+
+    Common shapes: checksums.txt, sha256sums.txt, <stem>.sha256. Returns the
+    asset dict or None (best-effort: absence simply skips verification).
+    """
+    lower_name = asset_name.lower()
+    stem = lower_name
+    if stem.endswith(".zip"):
+        stem = stem[:-4]
+    for a in assets or []:
+        if not isinstance(a, dict):
+            continue
+        name = str(a.get("name") or "")
+        low = name.lower()
+        if not (low.endswith(".txt") or low.endswith(".sha256") or low.endswith(".sha256sum")):
+            continue
+        if "sha256" in low or "checksum" in low or low.startswith(stem):
+            return a
+    return None
+
+
+def _parse_checksum_for(text: str, asset_name: str) -> str | None:
+    """Parse `<hash>  <filename>` / `<hash> *<filename>` lines for asset_name.
+
+    Returns the hex digest (lowercase) or None when no (case-insensitive) match.
+    """
+    target = asset_name.lower()
+    for line in (text or "").splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        digest, filename = parts[0].strip(), parts[1].strip()
+        if filename.startswith("*"):
+            filename = filename[1:]
+        if filename.lower() == target and re.fullmatch(r"[0-9a-fA-F]{32,128}", digest):
+            return digest.lower()
+    return None
+
+
+def _sha256_file(path: Path) -> str:
+    """Streaming SHA-256 of a file (hex, lowercase)."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verify_download_checksum(
+    *,
+    asset_name: str,
+    zip_path: Path,
+    urlopen,
+    request_factory,
+    timeout: float,
+    max_bytes: int,
+    stream_to_path,
+) -> None:
+    """Best-effort SHA-256 verification against a sibling release checksum asset.
+
+    Only assets already listed in the same release response are considered —
+    no extra API round-trips, no hard-coded digests. When the release ships a
+    checksum file (name containing sha256/checksum, .txt/.sha256) that maps
+    ``asset_name`` to a digest, the downloaded archive must match or it is
+    deleted and TwitchDownloadError raised. No checksum asset → silently skip.
+    """
+    from urllib.error import HTTPError, URLError
+    from urllib.parse import urlparse
+
+    checksum_asset = _find_checksum_asset(_LAST_RELEASE_ASSETS, asset_name)
+    if checksum_asset is None:
+        return
+    checksum_url = str(checksum_asset.get("browser_download_url") or "").strip()
+    if not checksum_url:
+        return
+    parsed = urlparse(checksum_url)
+    if (
+        parsed.scheme.lower() != "https"
+        or (parsed.hostname or "").lower() != "github.com"
+        or not parsed.path.startswith("/lay295/TwitchDownloader/releases/download/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        return
+    checksum_path = zip_path.parent / "checksums.download"
+    try:
+        with urlopen(request_factory(checksum_url), timeout=timeout) as resp:  # nosec B310
+            stream_to_path(resp, checksum_path, max_bytes=max_bytes)
+        expected = _parse_checksum_for(
+            checksum_path.read_text(encoding="utf-8", errors="replace"), asset_name
+        )
+    except (OSError, ValueError, HTTPError, URLError):
+        checksum_path.unlink(missing_ok=True)
+        return
+    checksum_path.unlink(missing_ok=True)
+    if not expected:
+        return
+    actual = _sha256_file(zip_path)
+    if actual != expected.lower():
+        try:
+            zip_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise TwitchDownloadError(
+            f"下载的 {asset_name} checksum mismatch（sha256 不匹配）: "
+            f"expected {expected.lower()}, got {actual}。已删除损坏的下载文件。"
+        )
+    print("  [OK] SHA-256 校验通过", flush=True)
+
+
 def try_portable_td_cli(
     *,
     root: Path | None = None,
@@ -232,7 +355,7 @@ def try_portable_td_cli(
         return False
 
     print(f"  版本: {tag}")
-    print("  注意: 发布包不做哈希校验，仅校验 GitHub 官方 release 路径与压缩包结构。")
+    print("  注意: 尽力校验 release 提供的 SHA-256 校验文件；未提供时仅校验 GitHub 官方 release 路径与压缩包结构。")
     print(f"  资源: {asset_name}")
     print(f"  URL: {url}")
 
@@ -253,6 +376,17 @@ def try_portable_td_cli(
                 zip_path,
                 max_bytes=MAX_PORTABLE_DOWNLOAD_BYTES,
             )
+        _verify_download_checksum(
+            asset_name=asset_name,
+            zip_path=zip_path,
+            urlopen=urlopen,
+            request_factory=lambda target: Request(
+                target, headers={"User-Agent": "twitch-chat-cn-overlay"}
+            ),
+            timeout=timeout,
+            max_bytes=MAX_PORTABLE_DOWNLOAD_BYTES,
+            stream_to_path=stream_response_to_path,
+        )
         print("  解压中…")
         with zipfile.ZipFile(zip_path, "r") as archive:
             safe_extract_zip(archive, payload)

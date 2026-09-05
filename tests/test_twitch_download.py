@@ -442,8 +442,40 @@ def test_validate_chat_html_still_fails_remote_emote_class(tmp_path):
         validate_chat_html(bad)
 
 
+def test_validate_chat_html_second_prefix_remote_cdn_fails(tmp_path):
+    """K-4: 仅含 second- emote 类 + 远程 CDN URL 也必须硬失败（原先漏检）。
+
+    HTML 里不能出现 emote-image/first-/third- 字样，否则旧正则也会命中，
+    无法证明 second- 分支是必要条件。
+    """
+    from twitch_download import TwitchDownloadError, validate_chat_html
+
+    bad = tmp_path / "second-bad.html"
+    bad.write_text(
+        '<pre class="comment-root"><span class="second-42">: emote!</span>'
+        '<span class="comment-message" style="background:'
+        'url(https://cdn.betterttv.net/emote/x/3x.png)"></span></pre>',
+        encoding="utf-8",
+    )
+    with pytest.raises(TwitchDownloadError, match="embed"):
+        validate_chat_html(bad)
+
+
+def test_validate_chat_html_second_prefix_local_data_passes(tmp_path):
+    """K-4: second- emote 类 + base64 内嵌 → 通过（与 first-/third- 对称）。"""
+    from twitch_download import validate_chat_html
+
+    good = tmp_path / "second-good.html"
+    good.write_text(
+        '<style>.second-42 { content:url("data:image/png;base64,aaa"); }</style>'
+        '<pre class="comment-root"><img class="emote-image second-42"></pre>',
+        encoding="utf-8",
+    )
+    validate_chat_html(good)  # must not raise
+
+
 def test_run_cli_masks_oauth_equals_form(capsys):
-    """--oauth=TOKEN 等号形式也必须掩码。"""
+    """--oauth=TOKEN 等号形式也必须掩码（单源 process_util.redact_command）。"""
     import twitch_download as td
 
     cmd = ["TwitchDownloaderCLI.exe", "chatdownload", "--oauth=supersecret", "-o", "x.html"]
@@ -461,7 +493,33 @@ def test_run_cli_masks_oauth_equals_form(capsys):
         td.run_tracked = saved
     out = capsys.readouterr().out
     assert "supersecret" not in out
-    assert "--oauth=***" in out
+    assert "--oauth=[redacted]" in out
+
+
+def test_run_cli_masks_oauth_separated_form(capsys):
+    """--oauth TOKEN 分离形式也必须掩码（D-9: 单源 process_util.redact_command）。"""
+    import twitch_download as td
+
+    cmd = ["TwitchDownloaderCLI.exe", "videodownload", "--oauth", "topsecrettoken", "-o", "v.mp4"]
+
+    def fake_run_tracked(cmd, **kwargs):
+        from subprocess import CompletedProcess
+
+        return CompletedProcess(list(cmd), 0)
+
+    saved = td.run_tracked
+    td.run_tracked = fake_run_tracked
+    try:
+        td._run_cli(cmd, label="测试")
+    finally:
+        td.run_tracked = saved
+    out = capsys.readouterr().out
+    assert "topsecrettoken" not in out
+    assert "[redacted]" in out
+    assert "--oauth [redacted]" in out
+    # 其余参数保持原样
+    assert "videodownload" in out
+    assert "-o" in out and "v.mp4" in out
 
 
 def test_slug_for_source_windows_reserved_names():
