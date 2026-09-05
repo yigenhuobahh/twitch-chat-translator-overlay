@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -857,6 +858,97 @@ def test_keyboard_interrupt_forces_progress_persist_of_completed_batches(
 # ---------------------------------------------------------------------------
 # O·AUTH/CLIENT 全局熔断: 配置类错误不得让每个 worker 把全部批次打一遍 API
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# P-8: TranslationCache 并发读写(写写互斥 + 无锁读路径)
+# ---------------------------------------------------------------------------
+
+
+def test_translation_cache_concurrent_writes_keep_every_key(tmp_path: Path):
+    """8 线程 × 各写不同 key × 200 轮:写写互斥下文件不丢、JSON 完整可解析。"""
+    from translation_support import TranslationCache
+
+    cache = TranslationCache(tmp_path / "cache")
+    workers = 8
+    rounds = 200
+    barrier = threading.Barrier(workers)
+
+    def worker(w: int):
+        barrier.wait()
+        for r in range(rounds):
+            cache.put(f"msg{w}", "zh", "m1", "ctx", f"译文{w}-{r}")
+            cache.get(f"msg{w}", "zh", "m1", "ctx")
+
+    threads = [threading.Thread(target=worker, args=(w,)) for w in range(workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    files = list((tmp_path / "cache").glob("*.json"))
+    assert len(files) == workers  # 每个 key 一个文件,无临时文件残留
+    for path in files:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["translation"].startswith("译文")
+    # 每个 key 都能 get 回一个非空译文(不得丢 key / 丢更新到空)。
+    for w in range(workers):
+        assert (cache.get(f"msg{w}", "zh", "m1", "ctx") or "").startswith("译文")
+
+
+def test_translation_cache_get_survives_concurrent_atomic_replace(tmp_path: Path):
+    """读路径不持全局锁:并发 get 与 put(原子替换)交错时 get 返回值合法或不命中。"""
+    from translation_support import TranslationCache
+
+    cache = TranslationCache(tmp_path / "cache")
+    cache.put("seed", "zh", "m1", "ctx", "种子")
+    barrier = threading.Barrier(4)
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def reader():
+        barrier.wait()
+        try:
+            for _ in range(400):
+                value = cache.get("seed", "zh", "m1", "ctx")
+                # 原子替换语义:要么见旧/新完整内容,要么(极端时序)未命中。
+                assert value is None or value == "种子" or value.startswith("更新")
+        except BaseException as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+
+    def writer():
+        barrier.wait()
+        for i in range(400):
+            cache.put("seed", "zh", "m1", "ctx", f"更新{i}")
+        stop.set()
+
+    threads = [threading.Thread(target=reader) for _ in range(3)] + [
+        threading.Thread(target=writer)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, errors
+    # 最终文件仍可解析且非空。
+    final = cache.get("seed", "zh", "m1", "ctx")
+    assert final is not None and final.startswith("更新")
+
+
+def test_translation_cache_get_returns_none_on_corrupt_json(tmp_path: Path):
+    """损坏 JSON 文件的 get 返回 None,与未命中语义一致(不抛异常)。"""
+    from translation_support import TranslationCache
+
+    cache = TranslationCache(tmp_path / "cache")
+    cache.put("good", "zh", "m1", "ctx", "好")
+    good_path = tmp_path / "cache"
+    key_file = next(good_path.glob("*.json"))
+    key_file.write_text("{not valid json", encoding="utf-8")
+
+    assert cache.get("good", "zh", "m1", "ctx") is None
+    # 未命中路径同样返回 None。
+    assert cache.get("missing", "zh", "m1", "ctx") is None
 
 
 def test_main_aborts_remaining_batches_on_auth_error(tmp_path: Path, monkeypatch):

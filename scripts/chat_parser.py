@@ -20,6 +20,8 @@ _EMOTE_PREFIXES = ("first-", "second-", "third-")
 _CSS_LOOKBACK = 8192  # class selector may sit far before content:url
 _MAX_EMOTE_BYTES = 8 * 1024 * 1024
 _MAX_TOTAL_EMOTE_BYTES = 128 * 1024 * 1024
+# 单个 HTML 导出最多提取的 emote 数量上限(DoS / 磁盘膨胀防护)。
+_MAX_EMOTES = 5000
 # A padded base64 payload needs four characters for every three decoded bytes.
 _MAX_EMOTE_BASE64_CHARS = 4 * ((_MAX_EMOTE_BYTES + 2) // 3)
 _MAX_HTML_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB;TwitchDownloader 导出远小于此,超出即视为损坏/恶意输入
@@ -468,8 +470,8 @@ def parse_chat_html(html_path, out_dir):
                 flush=True,
             )
             break
-        if emote_count >= 5000:
-            print("  emote 数量达到上限 5000，停止继续提取", flush=True)
+        if emote_count >= _MAX_EMOTES:
+            print(f"  emote 数量达到上限 {_MAX_EMOTES}，停止继续提取", flush=True)
             break
 
     print(

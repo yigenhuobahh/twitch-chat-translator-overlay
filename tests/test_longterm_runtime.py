@@ -300,6 +300,50 @@ def test_emote_cumulative_byte_budget_stops_further_writes(tmp_path: Path, monke
     assert sum(written) <= parser._MAX_TOTAL_EMOTE_BYTES
 
 
+def test_emote_oversize_single_image_is_skipped_but_later_kept(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+):
+    """单图超过 _MAX_EMOTE_BYTES 时跳过该图,不影响后续正常 emote 提取。"""
+    parser = load_module("chat_parser_longterm_skip", "chat_parser.py")
+    monkeypatch.setattr(parser, "_MAX_EMOTE_BYTES", 4)
+    monkeypatch.setattr(parser, "_MAX_EMOTE_BASE64_CHARS", 200)
+    # 一条 >4 bytes 的有效图片载荷(PNG 魔数 + 填充),一条 1x1 PNG(iVBORw==)。
+    huge_payload = "iVBORw0KGgoAAAAAAw=="
+    html_path = tmp_path / "skip.html"
+    html_path.write_text(
+        '<style>.first-huge{content:url("data:image/png;base64,' + huge_payload + '")}'
+        '.first-ok{content:url("data:image/png;base64,iVBORw==")}</style>',
+        encoding="utf-8",
+    )
+
+    data = parser.parse_chat_html(str(html_path), str(tmp_path / "skip-out"))
+
+    assert set(data["emote_map"]) == {"first-ok"}
+    assert "first-huge" not in data["emote_map"]
+    assert "跳过" in capsys.readouterr().out
+
+
+def test_emote_count_limit_breaks_after_max_writes(tmp_path: Path, monkeypatch, capsys):
+    """emote 数量达到 _MAX_EMOTES 上限后停止继续提取(写入恰为上限)。"""
+    parser = load_module("chat_parser_longterm_count", "chat_parser.py")
+    monkeypatch.setattr(parser, "_MAX_EMOTES", 2)
+    # 4 个独立规则 = 4 个正常 emote,上限 2 应在写满 2 条后 break。
+    rules = "".join(
+        f'.first-n{i}{{content:url("data:image/png;base64,iVBORw==")}}' for i in range(4)
+    )
+    html_path = tmp_path / "count.html"
+    html_path.write_text(f"<style>{rules}</style>", encoding="utf-8")
+
+    data = parser.parse_chat_html(str(html_path), str(tmp_path / "count-out"))
+
+    assert len(data["emote_map"]) == 2
+    out = capsys.readouterr().out
+    assert "数量达到上限" in out
+    assert "2" in out
+
+
 def _configure_fake_main(
     burn,
     monkeypatch,

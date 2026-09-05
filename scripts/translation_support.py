@@ -159,15 +159,18 @@ class TranslationCache:
             prompt_version=prompt_version,
         )
         path = self.cache_dir / f"{key}.json"
-        with self._lock:
-            if not path.is_file():
-                return None
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                text = str(data.get("translation", "") or "").strip()
-                return text or None
-            except Exception:
-                return None
+        # 读路径无锁:写入方用 os.replace 原子替换文件,读者要么见到旧的
+        # 完整内容、要么见到新的完整内容,不会读到半个文件;全局锁只用于
+        # 写写互斥(见 put),避免 4 个翻译 worker 在缓存命中路径上串行。
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            text = str(data.get("translation", "") or "").strip()
+            return text or None
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError, ValueError):
+            # 文件损坏 / 读取竞态(如被外部删除):与未命中语义一致。
+            return None
 
     def put(
         self,

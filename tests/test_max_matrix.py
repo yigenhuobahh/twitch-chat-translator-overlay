@@ -76,6 +76,9 @@ def test_pyproject_py_modules_match_scripts():
     assert mods
     for name in mods:
         assert (SCRIPTS / f"{name}.py").is_file(), f"py-module {name} missing on disk"
+    assert {p.stem for p in SCRIPTS.glob("*.py")} == set(mods), (
+        "scripts/ 下存在未注册 py-modules 的新模块"
+    )
 
     runner_tree = ast.parse((SCRIPTS / "run_tests.py").read_text(encoding="utf-8"))
     compile_node = next(
