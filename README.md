@@ -288,6 +288,21 @@ OPENAI_COMPAT_API_KEY=your_key
 
 支持任何 OpenAI 兼容接口（OpenAI / DeepSeek / Moonshot / 本地 Ollama 等）。不翻译时这个文件可以不配。
 
+**不可信目录 `.env` 确认门**：`.env` 按「当前工作目录 → 仓库根 → 模块旁」顺序加载，其中**当前工作目录**下的 `.env` 可能来自解压即用的第三方「工程包」，位置不受信任。当该文件**同时**提供翻译端点（`OPENAI_COMPAT_BASE_URL` / `AGNES_BASE_URL`）与 API 密钥（`OPENAI_COMPAT_API_KEY` / `AGNES_API_KEY`）时，聊天原文会被发送到该端点，因此工具会要求确认：
+
+- 在交互终端（stdin 为 TTY）下，工具会先打印警告并询问 `仍要使用该 .env? [y/N]: `；输入 `y` / `yes` 才加载该文件，其他回答视为拒绝，继续尝试仓库根等受信位置的 `.env`。
+- 非交互环境（管道 / CI / 重定向输入，stdin 不是 TTY）一律**直接拒绝加载**该不可信 `.env`，随后继续查找受信候选。
+- 若翻译相关变量已存在于进程环境变量中，则完全不读取任何 `.env`，该确认门不会触发。
+
+### job YAML 数值范围校验
+
+通过 `--job` 加载 `jobs/*.yaml` 时，工具会在**加载期**对浮点 / 整数字段做范围校验（与命令行参数的 argparse 校验对齐）：类型合法但越界的值会立即报 `job 字段 <名> 需在 <下限>..<上限> 范围内` 并停止，而不是等到深入渲染子进程的参数解析才失败。覆盖的类别包括：
+
+- 浮点字段：时长类（`msg_lifetime`、`output_fps`、`arrival_interval`、`min_visible_seconds`、`blank_hold_seconds`、`preview_frame`、`preview_clip`、`offset`）与几何比例类（`x_ratio`、`y_ratio`、`width_ratio`、`height_ratio`、`font_size_ratio`，均在 0..1）。
+- 整数字段：`fps`、`font_size`、`emote_height`、`max_visible`、`max_message_lines`、`message_image_cache_size`、`bg_alpha`、`width`、`height`、`webm_cpu_used`，以及只有下限的 `workers` / `batch_size`。
+
+个别字段的开闭区间与 burn 侧一致（例如 `blank_hold_seconds`、`preview_clip` 要求大于 0，不接受 0）。越界即报错、宁可早停，避免带病参数跑完翻译才发现无效。
+
 ## 快速开始
 
 ### 最简单的用法：不翻译，直接烧录原始英文弹幕
@@ -382,7 +397,7 @@ python scripts\render_cn_chat.py --job jobs\my_vod.yaml
 
 ### 任务配置（job.yaml）
 
-`jobs/*.yaml` 是「一条片子」的参数快照：输入路径、`mode`、是否 `render_original` / `reuse_translation`、布局/编码短名等。一般相对路径相对 **YAML 所在目录** 解析；若 YAML 旁没有指定的 profile 或 rules，则继续从项目和已安装资源目录查找。命令行同名参数覆盖文件。`python scripts\render_cn_chat.py --init` / `run.bat new` 会生成带中文注释的模板。
+`jobs/*.yaml` 是「一条片子」的参数快照：输入路径、`mode`、是否 `render_original` / `reuse_translation`、布局/编码短名等。一般相对路径相对 **YAML 所在目录** 解析；若 YAML 旁没有指定的 profile 或 rules，则继续从项目和已安装资源目录查找。命令行同名参数覆盖文件。`python scripts\render_cn_chat.py --init` / `run.bat new` 会生成带中文注释的模板。YAML 中的浮点/整数字段在加载期会做范围校验（见「环境要求」一节末尾的「job YAML 数值范围校验」），越界立即报错。
 
 ### 弹幕帧率 vs 成片帧率
 

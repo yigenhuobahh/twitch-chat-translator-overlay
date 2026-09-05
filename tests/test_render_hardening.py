@@ -229,8 +229,9 @@ def test_burn_surface_after_cleanup(burn):
     # REND-O1: duplicate contiguity assert removed from render_overlay
     # (expand_frame_sequence_for_ffmpeg keeps its own hard guarantee).
     assert not hasattr(burn, "assert_contiguous_frame_sequence")
-    # REND-N9: collection imports live at module top now.
-    assert hasattr(burn, "Counter") and hasattr(burn, "OrderedDict")
+    # REND-N9 (repealed): the collections re-export was removed; the facade
+    # must no longer surface Counter/OrderedDict.
+    assert not hasattr(burn, "Counter") and not hasattr(burn, "OrderedDict")
     # REND-N5: fade envelope is module-level, single source of truth.
     assert burn.FADE_IN_SECONDS == 0.3
     assert burn.FADE_OUT_SECONDS == 0.5

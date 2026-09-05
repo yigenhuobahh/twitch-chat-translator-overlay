@@ -18,7 +18,7 @@ Twitch Chat Overlay Tool
   python twitch_chat_burn.py "video.mp4" "chat.html" --font-size 15 --fps 30
 
 输出:
-  <video>_chat_overlay.mp4
+  <video>_chat.mp4
 
 依赖:
   pip install pillow
@@ -26,7 +26,6 @@ Twitch Chat Overlay Tool
 """
 
 import argparse
-from collections import Counter, OrderedDict  # noqa: F401  (re-exported; REND-N9)
 import json
 import math
 import os
@@ -113,6 +112,20 @@ from render_perf import (  # noqa: F401  (frame-store helpers re-exported)
 from render_preset import apply_render_preset_to_namespace, load_render_preset
 from run_meta import mark_run_status, write_run_meta
 import translation_io
+
+# C-12: publish-guard unlink policy. On POSIX, unlinking the guard right after
+# publishing is racy (ABA): a waiter may still hold the old inode open while a
+# newcomer creates a fresh guard file, so two "holders" coexist. POSIX keeps the
+# guard file in place; leftovers are claimed by --clean (pattern
+# `.{base_name}.publish.guard`). Windows keeps unlinking — its lock semantics
+# block such ABA, and the existing best-effort remove is safe there.
+_GUARD_UNLINK_ON = ("nt",)
+
+
+def _should_unlink_guard() -> bool:
+    """Whether the publish guard file should be unlinked after success."""
+    return os.name in _GUARD_UNLINK_ON
+
 
 # media_probe: ffprobe wrappers (lru-cached per absolute path + stat signature).
 _PROBE_TIMEOUT_SECONDS = media_probe._PROBE_TIMEOUT_SECONDS
@@ -1318,14 +1331,22 @@ def _main(status_sink=None):
             print(f"  警告: 等待输出发布锁失败 {lock_path}: {exc}", flush=True)
             return None
         if published:
-            # Success: drop the guard file so out_base is not littered. Failure /
-            # exception paths keep it for post-mortem. Best-effort — a concurrent
-            # waiter still holding the lock open (notably on Windows) can block
-            # the unlink; that only leaves the file behind, never breaks publishing.
-            try:
-                os.remove(lock_path)
-            except OSError:
-                pass
+            # Success path. On Windows the guard file is unlinked so out_base
+            # is not littered; failure / exception paths keep it for
+            # post-mortem. Best-effort — a concurrent waiter still holding the
+            # lock open (notably on Windows) can block the unlink; that only
+            # leaves the file behind, never breaks publishing.
+            # On POSIX the guard is intentionally kept (module-level
+            # _should_unlink_guard / _GUARD_UNLINK_ON): unlinking here invites
+            # an ABA race where waiter B still holds the old inode while a
+            # newcomer C creates a fresh guard, giving B/C distinct locks.
+            # POSIX leftovers are claimed later by --clean's
+            # `.*.publish.guard` rule — see C-12.
+            if _should_unlink_guard():
+                try:
+                    os.remove(lock_path)
+                except OSError:
+                    pass
         return published
 
 

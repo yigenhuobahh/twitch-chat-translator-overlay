@@ -291,3 +291,124 @@ def test_concurrent_burns_shared_out_dir_isolated(tmp_path: Path, make_test_vide
     # Each job should have its own chat mp4; root may have unique-suffixed copies
     job_mp4s = list(out_dir.glob("job_*/" + video.stem + "_chat.mp4"))
     assert len(job_mp4s) >= 2
+
+
+# ---------------------------------------------------------------------------
+# C-12: publish-guard unlink policy per platform
+# ---------------------------------------------------------------------------
+# POSIX unlinking the guard right after publish is racy (ABA): waiter B holds
+# the old inode while newcomer C creates a fresh guard file, so B/C end up with
+# distinct "locks". POSIX therefore keeps the guard file (leftovers are claimed
+# by --clean's `.*.publish.guard` rule); Windows keeps unlinking.
+
+
+def test_should_unlink_guard_defaults_to_current_platform():
+    from twitch_chat_burn import _GUARD_UNLINK_ON, _should_unlink_guard
+
+    assert _should_unlink_guard() == (os.name in _GUARD_UNLINK_ON)
+    # Windows unlinks; POSIX keeps the guard (ABA, see C-12).
+    if os.name == "nt":
+        assert _should_unlink_guard() is True
+    else:
+        assert _should_unlink_guard() is False
+
+
+def test_promote_guard_kept_on_posix_deleted_on_windows(tmp_path: Path, make_test_video):
+    """End-to-end promote: guard file survives on POSIX, is removed on Windows.
+
+    promote_to_out_base is a main() closure and cannot be patched directly, so
+    the platform decision is forced in a real child burn process: a tiny driver
+    imports the burn module, flips the module-level _GUARD_UNLINK_ON constant,
+    then calls main(). Runs two preview jobs into the same out_base so the
+    second one goes through the real promote/collision path.
+    """
+    video = make_test_video(duration=2.0, fps=10)
+    html = ROOT / "tests" / "fixtures" / "twitchdownloader_chat.html"
+    if not html.is_file():
+        pytest.skip("fixture html missing")
+
+    driver = tmp_path / "guard_policy_driver.py"
+    driver.write_text(
+        "import sys\n"
+        "sys.argv = ['twitch_chat_burn.py'] + sys.argv[1:]\n"
+        "import twitch_chat_burn as burn\n"
+        "burn._GUARD_UNLINK_ON = (sys.argv[1],)\n"
+        "sys.argv = [sys.argv[0]] + sys.argv[2:]\n"
+        "rc = burn.main()\n"
+        "sys.exit(rc if isinstance(rc, int) else 0)\n",
+        encoding="utf-8",
+    )
+
+    for platform, expect_guard in (("posix", True), ("nt", False)):
+        out_base = tmp_path / f"out_{platform}"
+        out_base.mkdir()
+
+        # First run seeds the colliding basename in out_base.
+        r1 = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS / "twitch_chat_burn.py"),
+                str(video),
+                str(html),
+                "--preview-frame",
+                "1.5",
+                "--out-dir",
+                str(out_base),
+                "--offset",
+                "0",
+                "--keep-temp",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=_env(),
+            cwd=str(ROOT),
+        )
+        assert r1.returncode == 0, (r1.stdout or "") + (r1.stderr or "")
+        published = out_base / f"{video.stem}_preview_1.5s.png"
+        assert published.is_file(), (r1.stdout or "") + (r1.stderr or "")
+
+        # Second run with an isolated job dir under out_base: promote must run
+        # (out_dir != out_base) with the platform decision forced by the driver.
+        job_dir = out_base / f"job_c12_{platform}"
+        job_dir.mkdir()
+        r2 = subprocess.run(
+            [
+                sys.executable,
+                str(driver),
+                platform,
+                str(video),
+                str(html),
+                "--preview-frame",
+                "1.5",
+                "--out-dir",
+                str(out_base),
+                "--job-dir",
+                str(job_dir),
+                "--offset",
+                "0",
+                "--keep-temp",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=_env(),
+            cwd=str(ROOT),
+        )
+        assert r2.returncode == 0, (r2.stdout or "") + (r2.stderr or "")
+
+        if expect_guard:
+            # POSIX: guard intentionally left behind for --clean to claim.
+            guards = list(out_base.glob(".*.publish.guard"))
+            assert guards, (
+                f"[{platform}] expected a leftover publish.guard, got none; "
+                + (r2.stdout or "") + (r2.stderr or "")
+            )
+        else:
+            # Windows: guard removed after successful publish.
+            assert not list(out_base.glob(".*.publish.guard")), (
+                f"[{platform}] expected no publish.guard leftovers; "
+                + (r2.stdout or "") + (r2.stderr or "")
+            )
