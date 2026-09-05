@@ -77,6 +77,7 @@ HANDOVER.md
 CLAUDE.md
 PROJECT.md
 CODE_REVIEW_REPORT_*.md
+.deep-review/
 .claude/
 .agents/
 *.lock
