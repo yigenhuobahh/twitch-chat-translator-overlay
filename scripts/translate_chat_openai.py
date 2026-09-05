@@ -318,36 +318,53 @@ def build_translation_batches(
     context: str,
     target_language: str,
 ) -> list[list[dict]]:
-    """Split work so both message count and complete prompt size stay bounded."""
+    """Split work so both message count and complete prompt size stay bounded.
+
+    尺寸用增量核算:每条消息对完整提示的贡献只有它自己的
+    "[index] original" 行加上与上一行的换行分隔符,提示模板(context、
+    rules、target_language)在同一轮内是常量,预计算一次空壳长度即可,
+    无需对每条消息重新 format 整个 prompt(O(N×(C+B)) → O(N))。
+    """
     batches: list[list[dict]] = []
     current: list[dict] = []
+    # 模板空壳长度:messages 插入点为空串时的完整提示长度。任何批次的
+    # 完整提示长度 = 空壳 + 该批 prepare 后文本长度(逐字节等价于
+    # TRANSLATE_PROMPT.format(...) 的结果)。
+    prompt_shell_size = len(
+        TRANSLATE_PROMPT.format(context=context, messages="", target_language=target_language)
+    )
 
-    def prompt_size(items: list[dict]) -> int:
-        messages_text = prepare_messages_for_llm(items)
-        prompt = TRANSLATE_PROMPT.format(
-            context=context,
-            messages=messages_text,
-            target_language=target_language,
-        )
-        return len(prompt)
+    # 单条消息行:prepare_messages_for_llm 对空 original 的替换与行格式。
+    def message_line(msg: dict) -> str:
+        original = msg.get("original", "").strip()
+        if not original:
+            original = "[空消息]"
+        return f'[{msg["index"]}] {original}'
 
+    running_size = 0
     for msg in messages:
         if current and len(current) >= max_messages:
             batches.append(current)
             current = []
+            running_size = 0
 
-        candidate = [*current, msg]
-        if prompt_size(candidate) <= max_prompt_chars:
-            current = candidate
+        line = message_line(msg)
+        # 新增行长度 = 行本身 + 非空批次前置的换行分隔符。
+        candidate_size = prompt_shell_size + running_size + (1 if current else 0) + len(line)
+        if candidate_size <= max_prompt_chars:
+            current.append(msg)
+            running_size += (1 if len(current) > 1 else 0) + len(line)
             continue
 
         if current:
             batches.append(current)
             current = [msg]
+            running_size = len(line)
         else:
-            current = candidate
+            current.append(msg)
+            running_size += (1 if len(current) > 1 else 0) + len(line)
 
-        if prompt_size(current) > max_prompt_chars:
+        if prompt_shell_size + running_size > max_prompt_chars:
             raise ValueError(
                 f"消息 {msg.get('index')} 单条提示超过 --max-batch-chars="
                 f"{max_prompt_chars}；请缩短 context 或提高上限"
@@ -1010,62 +1027,83 @@ def main():
     # 正常成功路径不走此分支(既有收尾语义不变);异常路径先强制落盘一次,
     # 再把中断原样抛出。落盘自身失败只打印一行告警,不掩盖原始异常。
     try:
+        futures = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
-            futures = {}
-            for batch_num, batch in batches:
-                if abort_event.is_set():
-                    break
-                future = executor.submit(
-                    translate_batch,
-                    client,
-                    batch,
-                    batch_num,
-                    args.context,
-                    args.target_language,
-                    cache,
-                    error_counts,
-                    bump_error,
-                )
-                futures[future] = (batch_num, batch)
+            try:
+                for batch_num, batch in batches:
+                    if abort_event.is_set():
+                        break
+                    future = executor.submit(
+                        translate_batch,
+                        client,
+                        batch,
+                        batch_num,
+                        args.context,
+                        args.target_language,
+                        cache,
+                        error_counts,
+                        bump_error,
+                    )
+                    futures[future] = (batch_num, batch)
 
-            for future in concurrent.futures.as_completed(futures):
-                if abort_event.is_set():
-                    # 已熔断:不再 result() 剩余 future(等只会放大配置错误的
-                    # API 调用),直接跳出;未消费的 future 由 executor 退出时
-                    # 统一等待收尾。对应批次仍会被下方 missing 标记为失败。
-                    break
-                batch_num, batch = futures[future]
-                try:
-                    translations = future.result()
-                    if translations:
-                        with progress_lock:
-                            for item in translations:
-                                if "index" in item and "translation" in item:
-                                    idx = item["index"]
-                                    translation_map[idx] = item["translation"]
-                                    failed_indexes.discard(idx)
-                            persist_progress()
-                    else:
-                        print(f"批次 {batch_num} 翻译失败")
+                for future in concurrent.futures.as_completed(futures):
+                    if abort_event.is_set():
+                        # 已熔断:不再 result() 剩余 future(等只会放大配置错误的
+                        # API 调用),直接跳出;同时取消全部尚未开始的批次并停止
+                        # 等待在跑批次,否则 with 块退出的 shutdown(wait=True)
+                        # 会把整条预提交队列翻完。对应批次仍会被下方 missing
+                        # 标记为失败。
+                        for pending in futures:
+                            pending.cancel()
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
+                    batch_num, batch = futures[future]
+                    try:
+                        translations = future.result()
+                        if translations:
+                            with progress_lock:
+                                for item in translations:
+                                    if "index" in item and "translation" in item:
+                                        idx = item["index"]
+                                        translation_map[idx] = item["translation"]
+                                        failed_indexes.discard(idx)
+                                persist_progress()
+                        else:
+                            print(f"批次 {batch_num} 翻译失败")
+                            with progress_lock:
+                                for msg in batch:
+                                    mark_failed(msg["index"])
+                                persist_progress(force=True)
+                    except Exception as e:
+                        print(f"批次 {batch_num} 异常: {type(e).__name__}: {e}")
                         with progress_lock:
                             for msg in batch:
                                 mark_failed(msg["index"])
                             persist_progress(force=True)
-                except Exception as e:
-                    print(f"批次 {batch_num} 异常: {type(e).__name__}: {e}")
-                    with progress_lock:
-                        for msg in batch:
-                            mark_failed(msg["index"])
-                        persist_progress(force=True)
-                completed_batches += 1
-                emit_task_event(
-                    "stage_progress",
-                    stage="translate",
-                    completed=completed_batches,
-                    total=total_batches,
-                    unit="batches",
-                )
+                    completed_batches += 1
+                    emit_task_event(
+                        "stage_progress",
+                        stage="translate",
+                        completed=completed_batches,
+                        total=total_batches,
+                        unit="batches",
+                    )
+            except BaseException:
+                # Ctrl+C/异常:必须在 with 块退出之前取消——with 的 __exit__
+                # 是 shutdown(wait=True),若不先取消,会把提交循环预提交的
+                # 全部批次等跑完(每批最多 3 次重试+退避),Ctrl+C 形同虚设。
+                # 取消未开始批次并停止等待在跑批次,再交由外层统一落盘、
+                # 原样抛出。未运行批次对应的消息由下方 missing 清理标记为失败。
+                for pending in futures:
+                    pending.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
     except BaseException:
+        # 兜底(含在 __exit__ 等待期间再次 Ctrl+C):幂等取消剩余批次后落盘、
+        # 原样抛出。与内层 handler 的 shutdown 均可重复调用,无副作用。
+        for pending in futures:
+            pending.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
         try:
             persist_progress(force=True)
         except Exception as persist_exc:
