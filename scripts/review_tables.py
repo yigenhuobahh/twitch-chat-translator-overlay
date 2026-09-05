@@ -22,7 +22,7 @@ import re
 import shutil
 import tempfile
 
-from common_utils import atomic_write_json
+from common_utils import atomic_replace_with_retry, atomic_write_json
 
 
 class PipelineError(SystemExit):
@@ -48,7 +48,7 @@ def _review_issue_map(json_path: Path, max_chars: int = 90, data: dict | None = 
     """
     if data is None:
         try:
-            data = json.loads(json_path.read_text(encoding="utf-8"))
+            data = json.loads(json_path.read_text(encoding="utf-8-sig"))
         except FileNotFoundError:
             print(f"[WARN] 复核表 lint 跳过：找不到 {json_path}", flush=True)
             return {}
@@ -112,7 +112,7 @@ def _review_rows(
     issue_map: dict | None = None,
 ):
     if data is None:
-        data = json.loads(json_path.read_text(encoding="utf-8"))
+        data = json.loads(json_path.read_text(encoding="utf-8-sig"))
     if include_lint:
         if issue_map is None:
             issue_map = _review_issue_map(json_path, max_chars=max_chars, data=data)
@@ -140,7 +140,7 @@ def _review_rows(
 
 def _prepare_review_export(json_path: Path, max_chars: int = 90, lint_fn=None) -> tuple[dict, dict]:
     """翻译 JSON 只解析一次、lint 只跑一次；结果供 TSV/XLSX 两个导出函数共用。"""
-    data = json.loads(json_path.read_text(encoding="utf-8"))
+    data = json.loads(json_path.read_text(encoding="utf-8-sig"))
     issue_map = _review_issue_map(json_path, max_chars=max_chars, data=data, lint_fn=lint_fn)
     return data, issue_map
 
@@ -173,7 +173,19 @@ def export_review_tsv(
             )
         )
     review_path.parent.mkdir(parents=True, exist_ok=True)
-    review_path.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
+    # 原子写：同目录唯一 tmp（utf-8-sig 逐字节同 write_text）+ retry replace，
+    # 中断/共享冲突不会半写复核表（C-5，与 atomic_write_json 同款模式）。
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{review_path.name}.", suffix=".tmp", dir=str(review_path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8-sig") as file:
+            file.write("\n".join(lines) + "\n")
+        atomic_replace_with_retry(tmp_path, review_path)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
     print(f"\n[人工复核] 已导出中英对照 TSV: {review_path}")
 
 
@@ -243,7 +255,17 @@ def export_review_xlsx(
         ws.row_dimensions[idx].height = 36
 
     review_path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(review_path)
+    # 原子写：先存到带 .xlsx 后缀的同目录 tmp 名（openpyxl 按扩展名定格式），
+    # 再 retry replace——共享冲突/中断不会留半写 XLSX（C-5）。
+    tmp_path = review_path.parent / (review_path.name + f".{os.getpid()}.tmp.xlsx")
+    try:
+        wb.save(tmp_path)
+        atomic_replace_with_retry(tmp_path, review_path)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
     print(f"[人工复核] 已导出更适合 Excel/WPS 的 XLSX: {review_path}")
 
 
@@ -258,7 +280,7 @@ def import_review_xlsx(json_path: Path, review_path: Path, *, dry_run: bool = Fa
         raise SystemExit("错误: 读取 XLSX 需要 openpyxl，请先运行 python -m pip install openpyxl") from e
     if not review_path.is_file():
         raise SystemExit(f"错误: 找不到人工复核文件: {review_path}")
-    data = json.loads(json_path.read_text(encoding="utf-8"))
+    data = json.loads(json_path.read_text(encoding="utf-8-sig"))
     by_index = {int(m.get("index")): m for m in data.get("messages", []) if str(m.get("index", "")).isdigit()}
     wb = load_workbook(review_path)
     ws = wb.active
@@ -311,7 +333,7 @@ def import_review_tsv(json_path: Path, review_path: Path, *, dry_run: bool = Fal
         return
     if not review_path.is_file():
         raise SystemExit(f"错误: 找不到人工复核文件: {review_path}")
-    data = json.loads(json_path.read_text(encoding="utf-8"))
+    data = json.loads(json_path.read_text(encoding="utf-8-sig"))
     by_index = {int(m.get("index")): m for m in data.get("messages", []) if str(m.get("index", "")).isdigit()}
     lines = review_path.read_text(encoding="utf-8-sig").splitlines()
     if not lines:
@@ -390,7 +412,7 @@ def lint_translation(
         raise SystemExit(f"错误: 翻译 JSON 不存在: {json_path}")
     if data is None:
         try:
-            data = json.loads(json_path.read_text(encoding="utf-8"))
+            data = json.loads(json_path.read_text(encoding="utf-8-sig"))
         except json.JSONDecodeError as e:
             raise SystemExit(f"错误: JSON 解析失败: {json_path}: {e}")
 
@@ -478,7 +500,20 @@ def lint_translation(
                     str(issue.get("translation", "")).replace("\t", " ").replace("\r", " ").replace("\n", " "),
                 ]
                 lines.append("\t".join(row))
-            report_path.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
+            # 原子写：同目录唯一 tmp + retry replace，报告不因共享冲突/中断半写（C-5）。
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f".{report_path.name}.", suffix=".tmp", dir=str(report_path.parent)
+            )
+            tmp_path = Path(tmp_name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8-sig") as file:
+                    file.write("\n".join(lines) + "\n")
+                atomic_replace_with_retry(tmp_path, report_path)
+            finally:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             print(f"  质检报告: {report_path}")
 
     return issues
@@ -613,7 +648,7 @@ def publish_output(src_path: Path, dst_path: Path, *, backup_prev: bool = True):
     try:
         try:
             shutil.copy2(src_path, tmp_path)
-            os.replace(tmp_path, dst_path)
+            atomic_replace_with_retry(tmp_path, dst_path)
         except OSError:
             if backup_created and backup is not None and backup.is_file() and not dst_path.is_file():
                 try:
@@ -653,7 +688,7 @@ def normalize_translation(json_path: Path, rules_path: Path | None = None, *, dr
     if not rules:
         print(f"\n[规则清洗] 规则文件无 normalizations: {rules_path}")
         return
-    data = json.loads(json_path.read_text(encoding="utf-8"))
+    data = json.loads(json_path.read_text(encoding="utf-8-sig"))
     changed = []
     for msg in data.get("messages", []):
         original = str(msg.get("original", ""))

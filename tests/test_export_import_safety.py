@@ -937,3 +937,193 @@ def test_import_unparseable_timestamp_is_flagged_and_skipped():
     assert unparseable, f"missing unparseable-ts warning, warnings={warnings!r}"
     # 实际文案带 repr 的 JSON 值：'时间戳无法解析: 翻译 JSON='not-a-number''
     assert "'not-a-number'" in unparseable[0]
+
+
+# ---------------------------------------------------------------------------
+# P2-8·BOM: review_tables 读翻译 JSON 必须容 BOM（与姊妹路径 utf-8-sig 对齐）
+# ---------------------------------------------------------------------------
+
+
+def test_review_rows_reads_bom_translation_json(tmp_path: Path):
+    """带 BOM 的翻译 JSON：_review_rows 解析结果与无 BOM 版逐行一致。"""
+    import review_tables as rt
+
+    payload = {
+        "messages": [
+            {"index": 0, "timestamp": 1.0, "author": "a", "original": "hi", "translation": "你好"}
+        ]
+    }
+    bom_path = tmp_path / "bom.json"
+    plain_path = tmp_path / "plain.json"
+    _write_bom_json(bom_path, payload)
+    plain_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    rows_bom = rt._review_rows(bom_path, include_lint=False)
+    rows_plain = rt._review_rows(plain_path, include_lint=False)
+    assert rows_bom == rows_plain
+    assert rows_bom[0][4] == "你好"
+
+
+def test_lint_translation_reads_bom_translation_json(tmp_path: Path):
+    """带 BOM 的翻译 JSON：lint_translation 不抛解析错误，issues 与无 BOM 版一致。"""
+    import review_tables as rt
+
+    payload = {
+        "messages": [
+            {"index": 0, "author": "a", "original": "hello @user https://x.co", "translation": "你好"}
+        ]
+    }
+    bom_path = tmp_path / "bom.json"
+    plain_path = tmp_path / "plain.json"
+    _write_bom_json(bom_path, payload)
+    plain_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    issues_bom = rt.lint_translation(bom_path)
+    issues_plain = rt.lint_translation(plain_path)
+    assert issues_bom == issues_plain
+
+
+def test_import_review_tsv_reads_bom_translation_json(tmp_path: Path):
+    """带 BOM 的翻译 JSON：import_review_tsv 回写不被 BOM 卡死。"""
+    import review_tables as rt
+
+    json_path = tmp_path / "t.json"
+    _write_bom_json(
+        json_path,
+        {"messages": [{"index": 0, "author": "a", "original": "hi", "translation": ""}]},
+    )
+    tsv_path = tmp_path / "r.tsv"
+    tsv_path.write_text(
+        "index\ttimestamp\tauthor\toriginal\ttranslation\n0\t\t\thi\t你好\n",
+        encoding="utf-8",
+    )
+
+    rt.import_review_tsv(json_path, tsv_path)
+    data = json.loads(json_path.read_text(encoding="utf-8-sig"))
+    assert data["messages"][0]["translation"] == "你好"
+
+
+def test_normalize_translation_reads_bom_translation_json(tmp_path: Path):
+    """带 BOM 的翻译 JSON：normalize_translation 规则清洗不被 BOM 卡死。"""
+    import review_tables as rt
+
+    json_path = tmp_path / "t.json"
+    _write_bom_json(
+        json_path,
+        {"messages": [{"index": 0, "original": "GG", "translation": "旧"}]},
+    )
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text(
+        "normalizations:\n  - match: GG\n    translation: 干得漂亮\n",
+        encoding="utf-8",
+    )
+
+    rt.normalize_translation(json_path, rules_path=rules_path)
+    data = json.loads(json_path.read_text(encoding="utf-8-sig"))
+    assert data["messages"][0]["translation"] == "干得漂亮"
+
+
+# ---------------------------------------------------------------------------
+# C-5·发布/导出原子替换 retry：Windows 共享冲突（PermissionError）退避重试
+# ---------------------------------------------------------------------------
+
+
+def _flaky_os_replace(fail_times: int, state: dict):
+    """前 fail_times 次 replace 抛 PermissionError，之后走真 replace。"""
+    real_replace = os.replace
+
+    def flaky(src, dst, *args, **kwargs):
+        state["calls"] += 1
+        if state["calls"] <= fail_times:
+            raise PermissionError(5, "拒绝访问。")
+        return real_replace(src, dst, *args, **kwargs)
+
+    return flaky
+
+
+def _permanent_replace_error():
+    def boom(src, dst, *args, **kwargs):
+        raise PermissionError(5, "拒绝访问。")
+
+    return boom
+
+
+def test_publish_output_retries_transient_replace_permission_error(tmp_path, monkeypatch):
+    import review_tables as rt
+
+    src = tmp_path / "src.mp4"
+    dst = tmp_path / "out.mp4"
+    src.write_bytes(b"new")
+    dst.write_bytes(b"old")
+    state = {"calls": 0}
+    monkeypatch.setattr(rt.os, "replace", _flaky_os_replace(2, state))
+
+    rt.publish_output(src, dst, backup_prev=True)
+
+    assert state["calls"] == 3, "replace 必须重试到第 3 次成功"
+    assert dst.read_bytes() == b"new"
+    assert (tmp_path / "out.mp4.bak").is_file()
+    assert not list(tmp_path.glob("*.partial.mp4")), "tmp 残留必须清理"
+
+
+def test_publish_output_permanent_replace_error_restores_backup(tmp_path, monkeypatch):
+    import review_tables as rt
+
+    src = tmp_path / "src.mp4"
+    dst = tmp_path / "out.mp4"
+    src.write_bytes(b"new")
+    dst.write_bytes(b"old")
+    monkeypatch.setattr(rt.os, "replace", _permanent_replace_error())
+
+    with pytest.raises(PermissionError):
+        rt.publish_output(src, dst, backup_prev=True)
+    # 失败后回滚：dst 保持旧内容、.bak 不残留、tmp 清理
+    assert dst.read_bytes() == b"old"
+    assert not (tmp_path / "out.mp4.bak").exists()
+    assert not list(tmp_path.glob("*.partial.mp4"))
+
+
+def test_export_review_tsv_retries_transient_replace_permission_error(tmp_path, monkeypatch):
+    import review_tables as rt
+
+    json_path = tmp_path / "t.json"
+    json_path.write_text(
+        json.dumps(
+            {"messages": [{"index": 0, "author": "a", "original": "hi", "translation": "你好"}]},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    review_path = tmp_path / "r.tsv"
+    state = {"calls": 0}
+    monkeypatch.setattr(rt.os, "replace", _flaky_os_replace(2, state))
+
+    rt.export_review_tsv(json_path, review_path)
+
+    assert state["calls"] == 3, "replace 必须重试到第 3 次成功"
+    raw = review_path.read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf"), "输出编码必须保持 utf-8-sig"
+    assert "你好" in raw.decode("utf-8-sig")
+    assert not list(tmp_path.glob(".r.tsv.*")), "tmp 残留必须清理"
+
+
+def test_export_review_tsv_permanent_replace_error_keeps_old_file(tmp_path, monkeypatch):
+    import review_tables as rt
+
+    json_path = tmp_path / "t.json"
+    json_path.write_text(
+        json.dumps(
+            {"messages": [{"index": 0, "original": "hi", "translation": "你好"}]},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    review_path = tmp_path / "r.tsv"
+    review_path.write_text("OLD", encoding="utf-8-sig")
+    monkeypatch.setattr(rt.os, "replace", _permanent_replace_error())
+
+    with pytest.raises(PermissionError):
+        rt.export_review_tsv(json_path, review_path)
+    # 旧文件原样保留（不被半写内容污染），tmp 清理
+    assert review_path.read_text(encoding="utf-8-sig") == "OLD"
+    assert not list(tmp_path.glob(".r.tsv.*"))
