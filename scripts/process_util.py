@@ -17,6 +17,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import IO
@@ -199,6 +200,83 @@ def _unregister(proc: subprocess.Popen) -> None:
             pass
 
 
+def _posix_descendant_pids(pid: int) -> set[int]:
+    """Collect live descendant PIDs of ``pid`` (Linux /proc scan, best-effort).
+
+    Used as a safety net for the POSIX kill path: ``os.killpg`` only covers the
+    process group, and descendants that escaped via ``setsid`` (or whose pgid
+    lookup failed) would otherwise survive the tree kill. Implementation walks
+    ``/proc/<pid>/task/<tid>/children`` breadth-first, falling back to ppid
+    chains parsed from ``/proc/<pid>/stat``. Tolerates missing/unreadable
+    ``/proc`` (macOS/BSD, containers): returns an empty set in that case.
+    """
+    if pid <= 0:
+        return set()
+    root = Path(f"/proc/{pid}")
+    if not root.is_dir():
+        return set()
+
+    # Strategy 1: kernel-maintained children lists (cheap, no /proc/*/stat scan).
+    try:
+        found: set[int] = set()
+        frontier = [pid]
+        while frontier:
+            current = frontier.pop()
+            for task_dir in Path(f"/proc/{current}/task").iterdir():
+                children_file = task_dir / "children"
+                try:
+                    text = children_file.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                for token in text.split():
+                    try:
+                        child = int(token)
+                    except ValueError:
+                        continue
+                    if child > 0 and child not in found:
+                        found.add(child)
+                        frontier.append(child)
+        if found:
+            return found
+    except OSError:
+        found = set()
+
+    # Strategy 2: ppid chain from /proc/<pid>/stat (e.g. children files unreadable).
+    try:
+        ppid_of: dict[int, int] = {}
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat_text = (entry / "stat").read_text(encoding="utf-8")
+            except OSError:
+                continue
+            close = stat_text.rfind(")")
+            if close < 0:
+                continue
+            fields = stat_text[close + 2 :].split()
+            if len(fields) < 2:
+                continue
+            try:
+                ppid_of[int(entry.name)] = int(fields[1])
+            except ValueError:
+                continue
+        descendants: set[int] = set()
+        changed = True
+        while changed:
+            changed = False
+            for proc_pid, ppid in ppid_of.items():
+                if proc_pid in descendants:
+                    continue
+                if ppid == pid or ppid in descendants:
+                    descendants.add(proc_pid)
+                    changed = True
+        return descendants
+    except OSError:
+        pass
+    return set()
+
+
 def kill_process_tree(pid: int, force: bool = True) -> None:
     """Kill a process and its descendants when possible."""
     if pid <= 0:
@@ -220,16 +298,40 @@ def kill_process_tree(pid: int, force: bool = True) -> None:
             except OSError:
                 pgid = None
             sig = signal.SIGKILL if force else signal.SIGTERM
-            if pgid is not None:
+            # Safety net: killpg only covers one process group. Descendants that
+            # escaped via setsid (new session/pgid) or whose group membership
+            # changed must be swept individually, or they survive the kill.
+            try:
+                descendant_pids = sorted(_posix_descendant_pids(pid))
+            except Exception:
+                descendant_pids = []
+            if pgid is None:
+                # No group known: kill the root itself, then each descendant.
                 try:
-                    os.killpg(pgid, sig)
-                    return
+                    os.kill(pid, sig)
                 except OSError:
                     pass
-            try:
-                os.kill(pid, sig)
-            except OSError:
-                pass
+                for descendant in descendant_pids:
+                    try:
+                        os.kill(descendant, sig)
+                    except OSError:
+                        pass
+            else:
+                # killpg covers the root and same-group children.
+                try:
+                    os.killpg(pgid, sig)
+                except OSError:
+                    # Group kill denied/raced: still kill the root directly.
+                    try:
+                        os.kill(pid, sig)
+                    except OSError:
+                        pass
+                # Escaped descendants would otherwise survive — sweep per-pid.
+                for descendant in descendant_pids:
+                    try:
+                        os.kill(descendant, sig)
+                    except OSError:
+                        pass
     except Exception:
         # Best-effort cleanup only.
         pass
@@ -387,7 +489,15 @@ def _is_link_or_reparse_point(path: str | Path) -> bool:
 
 
 def make_job_dir(parent: str | Path, prefix: str = "job_") -> Path:
-    """Create a unique per-run working directory under parent with a tool marker."""
+    """Create a unique per-run working directory under parent with a tool marker.
+
+    The directory is fully seeded (marker + run_meta.json status=running) inside
+    a hidden staging directory first and only then renamed to its final
+    ``job_*`` name. A concurrent ``--clean`` therefore never observes a visible
+    job dir that lacks run_meta.json (it would treat it as a stale half-built
+    job and rmtree it). The final rename is same-filesystem atomic and raises
+    ``FileExistsError`` on name collision; the staging dir is removed then.
+    """
     import time
     import uuid
 
@@ -395,21 +505,37 @@ def make_job_dir(parent: str | Path, prefix: str = "job_") -> Path:
     parent_path.mkdir(parents=True, exist_ok=True)
     name = f"{prefix}{int(time.time())}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
     job_dir = parent_path / name
-    job_dir.mkdir(parents=True, exist_ok=False)
+    staging = Path(tempfile.mkdtemp(prefix=f".{name}.", dir=str(parent_path)))
     try:
-        (job_dir / JOB_DIR_MARKER).write_text("twitch-chat-cn-overlay\n", encoding="utf-8")
-    except OSError:
-        pass
-    # Seed run_meta immediately (status=running + live pid) so a concurrent
-    # --clean / --clean-all in the window before the tool writes its own meta
-    # treats this fresh dir as live and skips it. Goes through run_meta's writer
-    # (function-local import: run_meta must stay independent of process_util).
-    try:
-        from run_meta import write_run_meta
+        try:
+            (staging / JOB_DIR_MARKER).write_text("twitch-chat-cn-overlay\n", encoding="utf-8")
+        except OSError:
+            pass
+        # Seed run_meta immediately (status=running + live pid) so a concurrent
+        # --clean / --clean-all after the rename treats this fresh dir as live
+        # and skips it. Goes through run_meta's writer (function-local import:
+        # run_meta must stay independent of process_util).
+        try:
+            from run_meta import write_run_meta
 
-        write_run_meta(job_dir, {"status": "running"})
-    except OSError:
-        pass
+            write_run_meta(staging, {"status": "running"})
+        except OSError:
+            pass
+        try:
+            os.rename(staging, job_dir)
+        except OSError as exc:
+            if job_dir.exists():
+                # Windows os.rename already raises FileExistsError for an
+                # existing target; POSIX os.rename would silently replace a
+                # dir target, so normalize to the same explicit error here.
+                raise FileExistsError(
+                    f"job dir 已存在（如需覆盖请手动删除）: {job_dir}"
+                ) from exc
+            raise
+    except BaseException:
+        # Never leak a half-built staging dir (collision / crash / KeyboardInterrupt).
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     return job_dir
 
 
@@ -561,6 +687,13 @@ def _is_partial_artifact(name: str) -> bool:
     return False
 
 
+def _is_publish_guard_artifact(name: str) -> bool:
+    """Leftover publish lock file: ``.<base>.publish.guard`` (twitch_chat_burn
+    promote_to_out_base). Guard files are normally unlinked after a successful
+    publish; crash/kill leaves them behind and --clean should claim them."""
+    return bool(re.fullmatch(r"\..+\.publish\.guard", name.lower()))
+
+
 def _is_live_tool_job(path: str | Path) -> bool:
     """True if run_meta.json reports this tool job as still running.
 
@@ -595,11 +728,15 @@ def clean_temp_artifacts(
     scan_one_level: bool = True,
     clean_all: bool = False,
     only_job_dir: str | Path | None = None,
+    clean_bak_artifacts: bool = True,
 ) -> tuple[int, int]:
     """Remove tool temp dirs/files under out_base.
 
     Scope:
       - Always eligible: *.partial.mp4 / *.mp4.partial (and optional *.progress.json)
+      - ``.<base>.publish.guard`` lock leftovers; ``<file>.bak`` crash-leftover
+        backups when ``clean_bak_artifacts`` is True (deletion only — restore
+        semantics are deliberately manual)
       - job_*/batch_* tool dirs:
           * only_job_dir set → only that one directory (must be under out_base)
           * clean_all=True → all finished marked tool job/batch dirs (legacy bulk clean)
@@ -662,6 +799,12 @@ def clean_temp_artifacts(
 
     def _should_remove_file(name: str) -> bool:
         if _is_partial_artifact(name):
+            return True
+        # Crash-leftover publish lock files (.publish.guard) and backup copies
+        # (<file>.bak) from promote paths; deletion only — restore stays manual.
+        if _is_publish_guard_artifact(name):
+            return True
+        if clean_bak_artifacts and name.lower().endswith(".bak"):
             return True
         if clean_progress and name.lower().endswith(".progress.json"):
             return True

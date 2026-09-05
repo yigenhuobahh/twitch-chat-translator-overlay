@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -873,3 +874,224 @@ def test_noninteractive_job_hint_quotes_job_path(tmp_path: Path):
     output = (result.stdout or "") + (result.stderr or "")
     assert result.returncode != 0
     assert f"--job {quote_cli_arg(job.resolve())}" in output
+
+
+# ---------------------------------------------------------------------------
+# C-1: POSIX kill tree must sweep descendants, not just one layer.
+# The POSIX branch is verified with monkeypatched os.getpgid/os.killpg/os.kill
+# and a fake _posix_descendant_pids — no real POSIX process trees are spawned
+# (this box is Windows; real verification happens on POSIX deployments).
+# ---------------------------------------------------------------------------
+
+def test_posix_descendant_pids_tolerant_off_posix():
+    """_posix_descendant_pids must never raise when /proc is unavailable."""
+    import process_util as pu
+
+    result = pu._posix_descendant_pids(10**9)
+    assert isinstance(result, (set, frozenset))
+    assert result == set()
+    # Non-positive pids short-circuit.
+    assert pu._posix_descendant_pids(0) == set()
+    assert pu._posix_descendant_pids(-5) == set()
+
+
+def test_posix_killpg_then_sweep_escaped_descendants(monkeypatch):
+    """killpg covers the root group; escaped descendants are killed per-pid."""
+    import process_util as pu
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(pu, "_is_windows", lambda: False)
+    monkeypatch.setattr(pu.os, "getpgid", lambda pid: 4242, raising=False)
+    monkeypatch.setattr(
+        pu.os, "killpg", lambda pgid, sig: calls.append(("killpg", pgid, sig)), raising=False
+    )
+    monkeypatch.setattr(pu.os, "kill", lambda pid, sig: calls.append(("kill", pid, sig)))
+    monkeypatch.setattr(pu.signal, "SIGKILL", 9, raising=False)
+    monkeypatch.setattr(pu, "_posix_descendant_pids", lambda pid: {111, 222})
+
+    pu.kill_process_tree(7, force=True)
+
+    assert ("killpg", 4242, 9) in calls
+    assert calls.count(("killpg", 4242, 9)) == 1
+    # Root is covered by killpg; only the escaped descendants get per-pid kills.
+    per_pid = [c[1] for c in calls if c[0] == "kill"]
+    assert sorted(per_pid) == [111, 222]
+
+
+def test_posix_killpg_none_kills_root_and_descendants(monkeypatch):
+    """pgid is None → root and every descendant killed per-pid (old code: root only)."""
+    import process_util as pu
+
+    calls: list[tuple] = []
+
+    def no_process(pid):
+        raise OSError("no such process")
+
+    monkeypatch.setattr(pu, "_is_windows", lambda: False)
+    monkeypatch.setattr(pu.os, "getpgid", no_process, raising=False)
+    monkeypatch.setattr(pu.os, "kill", lambda pid, sig: calls.append(("kill", pid, sig)))
+    monkeypatch.setattr(pu.signal, "SIGKILL", 9, raising=False)
+    monkeypatch.setattr(pu, "_posix_descendant_pids", lambda pid: [111, 222])
+
+    pu.kill_process_tree(7, force=True)
+
+    assert [c[1] for c in calls] == [7, 111, 222], calls
+
+
+def test_posix_killpg_failure_falls_back_to_per_pid_kill(monkeypatch):
+    """killpg raising OSError must still kill root + descendants per-pid."""
+    import process_util as pu
+
+    killed: list[int] = []
+    monkeypatch.setattr(pu, "_is_windows", lambda: False)
+    monkeypatch.setattr(pu.os, "getpgid", lambda pid: 4242, raising=False)
+
+    def denied(pgid, sig):
+        raise OSError("killpg denied")
+
+    monkeypatch.setattr(pu.os, "killpg", denied, raising=False)
+    monkeypatch.setattr(pu.os, "kill", lambda pid, sig: killed.append(pid))
+    monkeypatch.setattr(pu.signal, "SIGKILL", 9, raising=False)
+    monkeypatch.setattr(pu, "_posix_descendant_pids", lambda pid: [55])
+
+    pu.kill_process_tree(7, force=True)
+
+    assert sorted(killed) == [7, 55]
+
+
+def test_posix_descendant_kill_errors_swallowed(monkeypatch):
+    """A descendant dying between enumeration and kill must not propagate."""
+    import process_util as pu
+
+    killed: list[int] = []
+    monkeypatch.setattr(pu, "_is_windows", lambda: False)
+    monkeypatch.setattr(pu.os, "getpgid", lambda pid: 4242, raising=False)
+    monkeypatch.setattr(pu.os, "killpg", lambda pgid, sig: None, raising=False)
+
+    def fake_kill(pid, sig):
+        killed.append(pid)
+        if pid == 111:
+            raise ProcessLookupError(pid)
+
+    monkeypatch.setattr(pu.os, "kill", fake_kill)
+    monkeypatch.setattr(pu.signal, "SIGKILL", 9, raising=False)
+    monkeypatch.setattr(pu, "_posix_descendant_pids", lambda pid: [111, 222])
+
+    pu.kill_process_tree(7, force=True)  # must not raise
+
+    assert killed == [111, 222]
+
+
+# ---------------------------------------------------------------------------
+# C-11: make_job_dir must not expose a half-built job dir (marker written,
+# run_meta.json missing) — concurrent --clean-all would rmtree it on POSIX.
+# ---------------------------------------------------------------------------
+
+def test_make_job_dir_job_dir_hidden_until_fully_seeded(tmp_path: Path, monkeypatch):
+    """The final job_<...> name must not be visible while seeding is in progress."""
+    from process_util import make_job_dir
+    import run_meta as rm
+
+    observed: list[str] = []
+    real_write = rm.write_run_meta
+
+    def spy_write(job_dir, payload):
+        parent = Path(job_dir).parent
+        observed.extend(p.name for p in parent.iterdir() if p.name.startswith("job_"))
+        return real_write(job_dir, payload)
+
+    monkeypatch.setattr(rm, "write_run_meta", spy_write)
+
+    job = make_job_dir(tmp_path, prefix="job_")
+    assert observed == [], f"job dir visible before fully seeded: {observed}"
+    assert (job / "run_meta.json").is_file()
+    assert (job / ".twitch_overlay_job").is_file()
+
+
+def test_make_job_dir_seeding_crash_leaves_no_half_built_job_dir(tmp_path: Path, monkeypatch):
+    """A crash between marker and meta must not leave a visible job_ dir behind."""
+    from process_util import make_job_dir
+    import run_meta as rm
+
+    def boom(job_dir, payload):
+        raise ValueError("simulated crash between marker and meta")
+
+    monkeypatch.setattr(rm, "write_run_meta", boom)
+
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError):
+        make_job_dir(tmp_path, prefix="job_")
+
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith("job_")]
+    assert leftovers == [], f"half-built job dir survived the crash: {leftovers}"
+
+
+def test_make_job_dir_conflict_cleans_up_and_raises(tmp_path: Path, monkeypatch):
+    """Final-name collision: raise FileExistsError, remove staging, keep existing."""
+    import time as time_mod
+    import uuid as uuid_mod
+
+    from process_util import make_job_dir
+
+    parent = tmp_path / "jobs"
+    parent.mkdir()
+    monkeypatch.setattr(time_mod, "time", lambda: 1_000_000)
+    monkeypatch.setattr(uuid_mod, "uuid4", lambda: SimpleNamespace(hex="0123456789abcdef"))
+    collision = parent / f"job_1000000_{os.getpid()}_01234567"
+    collision.mkdir()
+    (collision / "keep.txt").write_text("existing", encoding="utf-8")
+
+    import pytest as _pytest
+
+    with _pytest.raises(FileExistsError):
+        make_job_dir(parent, prefix="job_")
+
+    assert (collision / "keep.txt").is_file(), "existing dir must not be touched"
+    others = [p.name for p in parent.iterdir() if p.name != collision.name]
+    assert others == [], f"staging directory leaked on conflict: {others}"
+
+
+def test_make_job_dir_success_leaves_no_staging_leftovers(tmp_path: Path):
+    """Success path: parent contains exactly the final job dir, nothing else."""
+    from process_util import JOB_DIR_MARKER, is_tool_job_dir, make_job_dir
+
+    job = make_job_dir(tmp_path, prefix="job_")
+    assert (job / JOB_DIR_MARKER).is_file()
+    assert (job / "run_meta.json").is_file()
+    assert is_tool_job_dir(job)
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name != job.name]
+    assert leftovers == [], f"staging directories leaked: {leftovers}"
+
+
+# ---------------------------------------------------------------------------
+# C-8: --clean must claim leftover .bak backups and .<name>.publish.guard
+# lock files (deletion only — restore semantics stay manual).
+# ---------------------------------------------------------------------------
+
+def test_clean_removes_bak_and_publish_guard_files(tmp_path: Path):
+    from process_util import clean_temp_artifacts
+
+    (tmp_path / "video.mp4.bak").write_bytes(b"b" * 10)
+    (tmp_path / "chat.html.bak").write_bytes(b"c" * 10)
+    (tmp_path / ".video_chat.mp4.publish.guard").write_bytes(b"g")
+    (tmp_path / "video.mp4").write_bytes(b"keep")
+    # ".bak" only counts as a suffix; "notes.bak.txt" is not claimed.
+    (tmp_path / "notes.bak.txt").write_text("keep", encoding="utf-8")
+
+    nested = tmp_path / "sub"
+    nested.mkdir()
+    (nested / "out.mp4.bak").write_bytes(b"n" * 10)
+    (nested / ".out_chat.mp4.publish.guard").write_bytes(b"g")
+
+    count, freed = clean_temp_artifacts(tmp_path, clean_progress=False, clean_all=False)
+
+    assert not (tmp_path / "video.mp4.bak").exists()
+    assert not (tmp_path / "chat.html.bak").exists()
+    assert not (tmp_path / ".video_chat.mp4.publish.guard").exists()
+    assert not (nested / "out.mp4.bak").exists()
+    assert not (nested / ".out_chat.mp4.publish.guard").exists()
+    assert (tmp_path / "video.mp4").is_file(), "real output must survive"
+    assert (tmp_path / "notes.bak.txt").is_file(), ".bak must be a trailing suffix"
+    assert count >= 5
+    assert freed > 0
