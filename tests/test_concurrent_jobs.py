@@ -340,11 +340,15 @@ def test_promote_guard_kept_on_posix_deleted_on_windows(tmp_path: Path, make_tes
         "import sys\n"
         "sys.argv = ['twitch_chat_burn.py'] + sys.argv[1:]\n"
         "import twitch_chat_burn as burn\n"
-        # sys.argv[1] is the unlink-policy token: 'unlink' -> ('nt',)-like
-        # (guard removed after publish), 'keep' -> () (guard always kept,
-        # the C-12 POSIX contract). Flipping to a platform name would be
-        # ambiguous — e.g. ('posix',) means "unlink ON posix".
-        "burn._GUARD_UNLINK_ON = ('nt',) if sys.argv[1] == 'unlink' else ()\n"
+        # sys.argv[1] is the unlink-policy token. 'unlink' forces
+        # _should_unlink_guard() True on ANY host; 'keep' forces it False.
+        # (Setting _GUARD_UNLINK_ON to a platform tuple would be a no-op when
+        # that platform isn't the runner's own os.name — the original CI
+        # failure.) Bind the token BEFORE stripping argv: the real promote
+        # closure resolves _should_unlink_guard via its module-global lookup,
+        # so this replacement is what main() actually consults.
+        "force_unlink = sys.argv[1] == 'unlink'\n"
+        "burn._should_unlink_guard = (lambda: force_unlink)\n"
         "sys.argv = [sys.argv[0]] + sys.argv[2:]\n"
         "rc = burn.main()\n"
         "sys.exit(rc if isinstance(rc, int) else 0)\n",
