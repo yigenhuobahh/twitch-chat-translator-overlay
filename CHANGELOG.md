@@ -2,11 +2,10 @@
 
 Notable changes to this project are documented in this file.
 
-## [Unreleased]
+## [0.2.6] - 2026-09-05
 
 ### Changed
 
-- Started the next development cycle as `0.2.6.dev0` after the v0.2.5 release.
 - Added automatic GitHub issue creation when the scheduled max-suite or security-audit workflows fail, so nightly regressions are noticed instead of silently staying red.
 - Pinned all GitHub Actions to exact commit SHAs (with version comments) so a compromised action repository cannot move a tag under the release workflow's `contents: write` permission.
 - Split the review-table export/import pipeline and translation lint into `scripts/review_tables.py`, the `--download` flow into `scripts/download_flow.py`, and the `--doctor` environment check into `scripts/doctor_check.py`, shrinking the pipeline orchestrator from ~2900 to ~2100 lines; all moved code is verbatim and public signatures are unchanged.
@@ -40,6 +39,14 @@ Notable changes to this project are documented in this file.
 - Batch-era test files renamed to module-based names via `git mv` (e.g. `test_p2_fixes.py` → `test_burn_compose_and_encode.py`, `test_audit_cli_clean.py` → `test_cli_clean_and_contracts.py`); collection count unchanged.
 - CI: top-level least-privilege `contents: read`, a PR-path bandit gate, and `pip-audit` now also auditing dev dependencies; `run_tests --coverage` enforces a per-module 60% floor for scripts with ≥500 statements.
 - In-process test coverage for the job_wizard interactive menu (75 cases, 27% → 63% module coverage) and the doctor() diagnosis body (56% → 97%).
+- Full-codebase deep review fix waves (2026-09-05): 54 findings audited with adversarial runtime verification; 10 items from wave one (P1 encoder preset + 8 P2 + text sanitization) and 27 items from wave two are fixed with per-finding regression tests. Highlights:
+  - **Encoding**: QSV default preset is now a legal value (`medium`) and `vod_merge` no longer hardcodes a preset that leaks an invalid `-quality medium` to AMF — `--encoder auto/qsv` no longer guarantees a compose-step failure on Intel-only machines (exit 127 was reproduced end-to-end before the fix).
+  - **Crash/waste on interrupt**: the translator's Ctrl+C now cancels pending futures instead of draining the whole queue (previously kept calling the API for hours); batch building no longer re-formats the entire prompt per message (457s → sub-second at 50k messages + 150k context); chat HTML parsing peak memory dropped from ~3.5-6.2x to ~2.9-4.0x file size.
+  - **Rendering safety**: bidi overrides, zero-width and C0/C1 control characters from remote chat HTML or LLM output are stripped before `draw.text` (emoji ZWJ ligatures preserved); a 50k-character message can no longer allocate a bitmap for 1200+ lines — an uncapped `max_message_lines` now bottoms out at 200 lines with an ellipsis.
+  - **Process lifecycle**: media-health decode subprocesses are tree-tracked (no more 24h orphans); the POSIX kill path sweeps escaped descendants via `/proc` (Windows `taskkill /T` unchanged); `make_job_dir` seeds marker+meta in a staging dir and renames atomically, closing the `--clean-all` race; compose publish and review-table export/publish use the shared `atomic_replace_with_retry` (Windows sharing violations no longer kill hours of translation work); `--clean` now claims orphaned `.bak` and `.publish.guard` files; the promote guard is no longer unlinked on POSIX (ABA), relying on `--clean`.
+  - **Correctness**: BOM-ed translation JSON is accepted at all 8 remaining read sites (review tables, lint, import, render fallback); `--download-output-fps` accepts exact fractions like `30000/1001` (previous float-only drifted ~1 frame per 9.3h); the chat-HTML validator's emote regex covers `second-` classes symmetric with the parser; `TranslationCache` reads no longer serialize 4 workers behind the global lock.
+  - **Security**: TD CLI downloads verify a release checksum file when GitHub provides one (SHA-256, mismatch aborts and cleans up) and reject URLs with query/fragment; command redaction is single-sourced (`redact_command`), and CLI error paths pass through `redact_text` with URL-embedded credential coverage; `ux_setup`'s copied `.env` gets `0600` on POSIX.
+  - **Hygiene**: `_render_preview_clip` reuses `build_burn_command` (preview-frame/image forwarding restored); dead `Counter`/`OrderedDict` facade re-exports removed; `preview_clip` magic `10` and the emote cap `5000` are named constants; README documents the untrusted-cwd `.env` confirmation gate and job YAML range validation; CLAUDE.md line counts corrected to measured values; the unused `textual` pytest marker and `vod_merge` concat-escaping gap (golden tests, implementation was already correct) are closed.
 
 ## [0.2.5] - 2026-08-31
 
