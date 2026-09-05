@@ -203,10 +203,15 @@ def concat_videos(
     # Resolve encoder via encode_options (auto-detect hardware vs software)
     from encode_options import build_video_encode_args, resolve_encode_options
 
+    # Pass video_preset=None so resolve_encode_options applies its per-family
+    # defaults (qsv -> "medium", amf -> "balanced", nvenc -> "p4", x264 ->
+    # "fast"), which are the only values the concrete encoders accept.
+    # Hard-coding "medium" here leaked into the AMF branch as an illegal
+    # `-quality medium` when auto resolved to amf.
     enc_opts = resolve_encode_options(
         encoder=encoder,
         crf=18,
-        video_preset="medium" if encoder in ("auto", "qsv") else None,
+        video_preset=None,
     )
     # QSV look_ahead is beneficial but only valid for h264_qsv
     enc_args = build_video_encode_args(enc_opts)

@@ -226,11 +226,17 @@ def resolve_encode_options(
                     )
         resolved = encoder
 
-    # Default presets differ by family.
+    # Default presets differ by family. Values must be legal for the concrete
+    # encoder: h264_qsv -preset only accepts veryfast..veryslow (no "balanced";
+    # verified via `ffmpeg -h encoder=h264_qsv` and a live exit-0 encode with
+    # "medium"), h264_amf -quality accepts balanced/speed/quality/high_quality,
+    # h264_nvenc accepts p1..p7.
     if video_preset is None or str(video_preset).strip() == "":
         if resolved == "nvenc":
             video_preset = "p4"
-        elif resolved in ("qsv", "amf"):
+        elif resolved == "qsv":
+            video_preset = "medium"
+        elif resolved == "amf":
             video_preset = "balanced"
         else:
             video_preset = "fast"
