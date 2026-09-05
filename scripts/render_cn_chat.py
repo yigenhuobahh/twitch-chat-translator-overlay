@@ -208,24 +208,19 @@ def _render_preview_clip(
         return None
     preview_dir.mkdir(parents=True, exist_ok=True)
 
-    cmd = [
-        sys.executable, str(burn), str(video), str(chat_html),
-        "--x", str(args.x), "--y", str(args.y),
-        "--w", str(args.width), "--h", str(args.height),
-        "--font-size", str(args.font_size),
-        "--font-path", args.font_path,
-        "--font-bold-path", args.font_bold_path,
-        "--bg-alpha", str(args.bg_alpha),
-        "--import-translation", str(trans_json),
-        "--preview-clip", str(seconds),
-        "--out-dir", str(preview_dir),
-    ]
-    append_strict_import_arg(cmd, args)
-    append_shared_burn_args(cmd, args)
-    if args.offset is not None:
-        cmd.extend(["--offset", str(args.offset)])
-    if getattr(args, "preview_dense", False):
-        cmd.append("--preview-dense")
+    # 命令组装单源：preview 分支与主管线（render-original / import-translation）
+    # 共用 pipeline_plan.build_burn_command，避免三处手搓命令漂移。生成主体
+    # （--import-translation + --strict-import + 共享表 + --offset +
+    # keep-temp/no-backup-prev/preview-frame/preview-image 转发 + 收尾
+    # --preview-dense）与主管线一致；preview 只追加自己特有的
+    # --out-dir 与 --preview-clip（秒数来自交互输入而非 args.preview_clip，
+    # 追加在最后使 argparse last-wins 语义正确）。
+    cmd = build_burn_command(
+        args, video, chat_html, burn,
+        trans_json=trans_json,
+    )
+    cmd.extend(["--out-dir", str(preview_dir)])
+    cmd.extend(["--preview-clip", str(seconds)])
 
     log(f"\n[预览] 渲染 {seconds}s 预览片段...")
     try:
@@ -562,7 +557,10 @@ def _fallback_manual_after_export(
     filled = translation_json_nonempty_count(trans_json)
     total = 0
     try:
-        data = json.loads(trans_json.read_text(encoding="utf-8")) if trans_json.is_file() else {}
+        # utf-8-sig：手工编辑（记事本等）常在 JSON 头部留下 BOM；utf-8-sig
+        # 对无 BOM 文件行为不变，有 BOM 时自动剥离。与 translation_io /
+        # translate_chat_openai.load_json 的读取口径一致，避免 total 被算成 0。
+        data = json.loads(trans_json.read_text(encoding="utf-8-sig")) if trans_json.is_file() else {}
         total = len((data.get("messages") if isinstance(data, dict) else None) or [])
     except Exception:
         total = 0

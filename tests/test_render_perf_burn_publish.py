@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from PIL import Image
 import pytest
 
 from helpers import load_module
+import media_health
 import media_probe
 import overlay_compose
 
@@ -351,6 +353,111 @@ def test_compose_publish_restores_bak_on_replace_failure(tmp_path: Path, make_te
     assert existing.read_bytes() == b"OLD_OUTPUT_BYTES"
 
 
+@pytest.mark.smoke
+def test_compose_publish_retries_transient_permission_error(tmp_path: Path, make_test_video):
+    """C-4: publish must retry os.replace on transient PermissionError.
+
+    A player/editor holding the destination open makes MoveFileEx fail once
+    with WinError 5/32 and succeed right after the reader closes — previously
+    a single os.replace turned that into a hard publish failure. Now
+    atomic_replace_with_retry backs off and retries: 2 transient
+    PermissionErrors then success must publish the new output while keeping
+    .bak semantics (old bytes preserved under .bak, new bytes at out_path).
+    """
+    burn = load_module("twitch_chat_burn", "twitch_chat_burn.py")
+    from render_perf import frame_path
+
+    video = make_test_video(duration=1.0, fps=10)
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    img = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
+    for i in range(10):
+        img.save(frame_path(frames, i))
+
+    # Seed an existing published output so backup path is taken.
+    out_name = f"{video.stem}_chat.mp4"
+    existing = tmp_path / out_name
+    existing.write_bytes(b"OLD_OUTPUT_BYTES")
+
+    config = SimpleNamespace(
+        fps=10,
+        x=0,
+        y=0,
+        encode=None,
+        no_backup_prev=False,
+        output_fps=10,
+        stage_timings={},
+    )
+
+    partial_bytes = b"NEW_PARTIAL_BYTES"
+
+    def fake_run_tracked(cmd, **kwargs):
+        out = cmd[-1]
+        Path(out).write_bytes(partial_bytes)
+        return SimpleNamespace(returncode=0)
+
+    def fake_validate(path, **kwargs):
+        return True, {"duration": 1.0, "has_video": True, "has_audio": True}, ""
+
+    def fake_resolve_encode_options(**kwargs):
+        return SimpleNamespace(
+            overlay_codec="png",
+            notes=[],
+            resolved_encoder="x264",
+            webm_cpu_used=4,
+            video_codec="libx264",
+        )
+
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def flaky_replace(src, dst):
+        calls["n"] += 1
+        # Publish replace fails twice with PermissionError (sharing violation),
+        # succeeds on the 3rd attempt once the "player" closed the file.
+        if str(dst).endswith(out_name) and str(src).endswith(".partial.mp4"):
+            if calls["n"] <= 2:
+                raise PermissionError(5, "simulated sharing violation")
+        return real_replace(src, dst)
+
+    with mock.patch.object(overlay_compose, "run_tracked", side_effect=fake_run_tracked), mock.patch.object(
+        overlay_compose, "validate_rendered_output", side_effect=fake_validate
+    ), mock.patch.object(
+        overlay_compose, "resolve_encode_options", side_effect=fake_resolve_encode_options
+    ), mock.patch.object(
+        overlay_compose, "resolve_source_av_timing", return_value={
+            "source_duration": 1.0,
+            "video_start": 0.0,
+            "audio_start": 0.0,
+            "video_lead_in": 0.0,
+            "has_audio": True,
+            "summary": {},
+        }
+    ), mock.patch.object(
+        media_probe, "resolve_output_fps", return_value=10
+    ), mock.patch.object(
+        overlay_compose, "build_video_encode_args", return_value=["-c:v", "libx264"]
+    ), mock.patch.object(
+        overlay_compose, "build_audio_encode_args", return_value=["-c:a", "aac"]
+    ), mock.patch.object(
+        overlay_compose, "summarize_encode_options", return_value="stub"
+    ), mock.patch.object(
+        media_health, "validate_media_health", return_value=SimpleNamespace(ok=True, warnings=[])
+    ), mock.patch("os.replace", side_effect=flaky_replace):
+        result = burn.compose_video(str(video), str(frames), str(tmp_path), config, duration=1.0)
+
+    # Publish must have succeeded on the 3rd retry attempt (not on attempt 1,
+    # proving the retry actually engaged).
+    assert calls["n"] >= 3
+    assert result is not None, "transient PermissionError must be retried, not fail publish"
+    # New output published, old bytes preserved under .bak.
+    assert existing.is_file()
+    assert existing.read_bytes() == partial_bytes
+    bak = tmp_path / (out_name + ".bak")
+    assert bak.is_file()
+    assert bak.read_bytes() == b"OLD_OUTPUT_BYTES"
+
+
 # ---------------------------------------------------------------------------
 # validate_rendered_output short-check floor semantics (overlay_compose.py).
 #
@@ -460,4 +567,51 @@ def test_validate_min_floor_applies_independently_without_expected(monkeypatch):
         min_duration=1.6,
     )
     assert not ok
-    assert "min_duration" in reason, reason
+    assert "min_duration" in reason
+
+
+# ---------------------------------------------------------------------------
+# P2-8: _fallback_manual_after_export must read the translation JSON with
+# utf-8-sig. Sibling paths (translation_io.load_translation_file via the
+# twitch_chat_burn facade, translate_chat_openai.load_json) already strip a
+# leading BOM; the manual-fallback counter read with plain utf-8, so a JSON
+# saved by Notepad (BOM prefixed) silently parsed as total=0 and printed
+# "1/?" instead of "1/2" in the hand-translation hint.
+# ---------------------------------------------------------------------------
+
+
+def test_fallback_manual_after_export_accepts_bom_json(tmp_path: Path, monkeypatch, capsys):
+    import render_cn_chat as pipe
+
+    tj = tmp_path / "t.json"
+    payload = json.dumps(
+        {
+            "messages": [
+                {"index": 0, "translation": "已译"},
+                {"index": 1, "translation": ""},
+            ]
+        },
+        ensure_ascii=False,
+    )
+    # Notepad-style write: UTF-8 BOM in front of the JSON.
+    tj.write_bytes(b"\xef\xbb\xbf" + payload.encode("utf-8"))
+
+    monkeypatch.setattr(pipe, "export_review_tsv", lambda *a, **k: None)
+    monkeypatch.setattr(pipe, "export_review_xlsx", lambda *a, **k: None)
+
+    pipe._fallback_manual_after_export(
+        video=tmp_path / "v.mp4",
+        chat_html=tmp_path / "c.html",
+        trans_json=tj,
+        review_tsv=tmp_path / "r.tsv",
+        review_xlsx=tmp_path / "r.xlsx",
+        workdir=None,
+        final_output=tmp_path / "o.mp4",
+        reason="API down",
+    )
+
+    out = capsys.readouterr().out
+    # filled=1 (utf-8-sig sibling already worked); total must be 2, not the
+    # BOM-broken fallback "?".
+    assert "1/2" in out, f"expected filled/total 1/2 in hint, got: {out}"
+    assert "1/?" not in out

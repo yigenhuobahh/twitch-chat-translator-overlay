@@ -274,6 +274,101 @@ def test_render_preview_clip_forwards_strict_import():
     # shared tables still applied
     assert _has(cmd, "--encoder", "x264")
     assert "--lazy-message-images" in cmd
+    # command body must come from the shared builder (D-10): the head is
+    # byte-identical to pipeline_plan.build_burn_command's trans_json branch.
+    import pipeline_plan
+
+    head = cmd[: cmd.index("--out-dir")]
+    expected_head = pipeline_plan.build_burn_command(
+        args, Path("v.mp4"), Path("c.html"), Path("burn.py"),
+        trans_json=Path("t.json"),
+    )
+    assert head == expected_head, (
+        "preview cmd must be built by build_burn_command; drift:\n"
+        f"  head={head}\n  expected={expected_head}"
+    )
+
+
+def test_render_preview_clip_forwards_preview_frame_and_image():
+    """D-10: preview clip cmd forwards --preview-frame/--preview-image when set.
+
+    Previously _render_preview_clip hand-rolled the burn command and dropped
+    these flags (the main pipeline's build_burn_command forwards them); now the
+    preview path uses the same builder, so a user asking for a preview frame
+    while generating the 10s preview clip gets the frame export too.
+    """
+    import render_cn_chat as pipe
+
+    seen: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = list(cmd)
+
+    pipe.run = fake_run  # type: ignore
+    args = _representative_namespace(
+        strict_import=False, offset=None, preview_dense=False,
+        preview_frame=42.5, preview_image=str(Path("somewhere") / "prev.png"),
+    )
+    args.x = 10
+    args.y = 20
+    args.width = 100
+    args.height = 200
+    args.font_size = 16
+    args.font_path = "auto"
+    args.font_bold_path = "auto"
+    args.bg_alpha = 200
+
+    out = pipe._render_preview_clip(
+        video=Path("v.mp4"),
+        chat_html=Path("c.html"),
+        trans_json=Path("t.json"),
+        args=args,
+        workdir=None,
+        seconds=10.0,
+        burn=Path("burn.py"),
+    )
+    assert out is None  # no real file produced
+    cmd = seen["cmd"]
+    assert _has(cmd, "--preview-frame", "42.5")
+    # builder resolves the preview image to an absolute path
+    assert _has(cmd, "--preview-image", str((Path("somewhere") / "prev.png").resolve()))
+
+
+def test_render_preview_clip_omits_preview_frame_when_unset():
+    """D-10: no --preview-frame/--preview-image/--keep-temp/--no-backup-prev
+    tokens when args lack/leave them falsy (defensive getattr parity)."""
+    import render_cn_chat as pipe
+
+    seen: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = list(cmd)
+
+    pipe.run = fake_run  # type: ignore
+    args = _representative_namespace(strict_import=False, offset=None, preview_dense=False)
+    args.x = 10
+    args.y = 20
+    args.width = 100
+    args.height = 200
+    args.font_size = 16
+    args.font_path = "auto"
+    args.font_bold_path = "auto"
+    args.bg_alpha = 200
+
+    pipe._render_preview_clip(
+        video=Path("v.mp4"),
+        chat_html=Path("c.html"),
+        trans_json=Path("t.json"),
+        args=args,
+        workdir=None,
+        seconds=10.0,
+        burn=Path("burn.py"),
+    )
+    cmd = seen["cmd"]
+    assert "--preview-frame" not in cmd
+    assert "--preview-image" not in cmd
+    assert "--keep-temp" not in cmd
+    assert "--no-backup-prev" not in cmd
 
 
 def test_pipeline_parser_exposes_strict_import():

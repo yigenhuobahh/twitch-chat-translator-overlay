@@ -25,7 +25,7 @@ import subprocess
 import time
 from typing import Any
 
-from common_utils import require_executable
+from common_utils import atomic_replace_with_retry, require_executable
 from encode_options import (
     build_audio_encode_args,
     build_video_encode_args,
@@ -567,7 +567,13 @@ def compose_video(video_path, frames_dir, out_dir, config, duration):
             backup = None
             backup_created = False
     try:
-        os.replace(partial_path, out_path)
+        # C-4: 发布走重试。播放器/编辑器占着旧输出文件时，单次 os.replace
+        # 会在 Windows 上以 PermissionError (WinError 5/32) 失败；多数情况
+        # 只是瞬时共享冲突（读方关闭后即可成功）。atomic_replace_with_retry
+        # 仅对 PermissionError 做短退避重试（非 PermissionError 的 OSError
+        # 原样抛出），耗尽后仍抛 PermissionError，由下方 except OSError
+        # 接住并走既有 .bak 回滚分支——最终失败语义不变。
+        atomic_replace_with_retry(partial_path, out_path)
     except OSError as e:
         print(f"  发布失败: 无法将 {partial_path} 替换为 {out_path}: {e}", flush=True)
         if backup_created and backup and os.path.isfile(backup) and not os.path.isfile(out_path):
