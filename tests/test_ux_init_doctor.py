@@ -21,6 +21,15 @@ def ux_mod():
     return load_module("ux_setup", "ux_setup.py")
 
 
+def monkeypatch_platform(ux_mod, name: str) -> None:
+    """Force ux_setup's os.name branch regardless of the host OS.
+
+    Uses SimpleNamespace on the module binding (load_module gives ux_setup its
+    own module namespace), so the global stdlib os module is untouched.
+    """
+    ux_mod.os = SimpleNamespace(name=name, chmod=lambda p, m: os.chmod(p, m))
+
+
 @pytest.fixture(scope="module")
 def cw_mod():
     return load_module("chat_window", "chat_window.py")
@@ -32,22 +41,27 @@ def pipeline():
 
 
 def test_tighten_env_permissions_skipped_on_windows(ux_mod, tmp_path: Path):
-    """本机(Windows)直接调用:跳过收紧、不抛错、返回 False。"""
+    """Windows 分支:跳过收紧、不抛错、返回 False。
+
+    平台判定经 monkeypatch 强制,两个平台都能跑完整断言矩阵
+    (CI 上真实 os.name 是 posix,直接断言会与 chmods_on_posix 重复)。
+    """
     env_file = tmp_path / ".env"
     env_file.write_text("OPENAI_COMPAT_API_KEY=x\n", encoding="utf-8")
+    monkeypatch_platform(ux_mod, "nt")
 
     assert ux_mod._tighten_env_permissions(env_file) is False
 
 
-def test_tighten_env_permissions_chmods_on_posix(ux_mod, tmp_path: Path, monkeypatch):
+def test_tighten_env_permissions_chmods_on_posix(ux_mod, tmp_path: Path):
     """POSIX 分支:收紧到仅属主读写并返回 True。
 
-    monkeypatch os.name 为 "posix" 只影响 ux_setup 模块内的分支判定;
-    Windows 上对文件 chmod 0o600 合法(MSVCRT 只处理只读位),不会抛错。
+    平台判定经 monkeypatch_platform 强制(Windows 上对文件 chmod 0o600
+    合法,MSVCRT 只处理只读位,不会抛错;POSIX 上真实 chmod 也成立)。
     """
     env_file = tmp_path / ".env"
     env_file.write_text("OPENAI_COMPAT_API_KEY=x\n", encoding="utf-8")
-    monkeypatch.setattr(ux_mod.os, "name", "posix")
+    monkeypatch_platform(ux_mod, "posix")
 
     assert ux_mod._tighten_env_permissions(env_file) is True
 

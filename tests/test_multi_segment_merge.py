@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sys
 
@@ -791,17 +792,23 @@ def test_ffmpeg_concat_list_line_golden(tmp_path: Path):
     # golden 精确断言（含转义序列 '\''）
     assert _ffmpeg_concat_list_line(quote).endswith("it'\\''s.mp4'")
 
-    # Windows 反斜杠路径形态: C:\a b\file.mp4 → 全部正斜杠
+    # Windows 反斜杠路径形态: C:\a b\file.mp4 → 全部正斜杠。
+    # 仅在 Windows 上断言盘符形态——POSIX 的 Path.resolve() 会把 "C:\a b\file.mp4"
+    # 当作相对路径名拼到 cwd 前（CI 失败证据: "file '<repo>/C:/a b/file.mp4'"），
+    # golden 语义只承诺"分隔符转正斜杠 + 单引号包裹"，两个平台都满足。
     line = _ffmpeg_concat_list_line(Path("C:\\a b\\file.mp4"))
-    assert line.startswith("file 'C:/a b/file.mp4'") or line.startswith("file 'c:/a b/file.mp4'")
+    if os.name == "nt":
+        assert line.startswith("file 'C:/a b/file.mp4'") or line.startswith("file 'c:/a b/file.mp4'")
     assert "\\" not in line
 
     # 混合: 引号 + 空格 + 反斜杠（golden 按现有实现实际输出）
     # 注意: 转义序列 '\' 自带一个反斜杠，因此这里不能断言"无反斜杠"，
     # 而是精确断言整行：路径分隔符已全部转为 '/'，仅剩转义反斜杠。
+    # 盘符 golden 同样仅限 Windows（POSIX resolve 会前拼 cwd，见上）。
     mixed = Path("C:\\a b\\it's file.mp4")
     mixed_line = _ffmpeg_concat_list_line(mixed)
-    assert mixed_line == "file 'C:/a b/it'\\''s file.mp4'" or mixed_line == "file 'c:/a b/it'\\''s file.mp4'"
+    if os.name == "nt":
+        assert mixed_line == "file 'C:/a b/it'\\''s file.mp4'" or mixed_line == "file 'c:/a b/it'\\''s file.mp4'"
 
 
 def test_concat_list_file_roundtrip_written_lines(tmp_path: Path, monkeypatch):

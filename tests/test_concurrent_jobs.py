@@ -226,8 +226,15 @@ def test_promote_to_out_base_uses_job_unique_name_on_collision(tmp_path: Path, m
     alt = out_base / f"{video.stem}_preview_1.5s__{job_b.name}.png"
     assert alt.is_file(), (r2.stdout or "") + (r2.stderr or "")
     assert "[concurrent]" in (r2.stdout or "")
-    # Wave 2 guard cleanup: publish lock file is removed after successful publish.
-    assert not list(out_base.glob(".*.publish.guard"))
+    # Wave 2 guard cleanup: on Windows the publish lock file is removed after
+    # a successful publish; on POSIX it is intentionally kept (C-12 ABA) and
+    # claimed later by --clean. The forced-platform matrix lives in
+    # test_promote_guard_kept_on_posix_deleted_on_windows below; here we only
+    # assert the current platform's contract.
+    from twitch_chat_burn import _should_unlink_guard
+
+    if _should_unlink_guard():
+        assert not list(out_base.glob(".*.publish.guard"))
 
 
 @pytest.mark.max
@@ -317,10 +324,11 @@ def test_promote_guard_kept_on_posix_deleted_on_windows(tmp_path: Path, make_tes
     """End-to-end promote: guard file survives on POSIX, is removed on Windows.
 
     promote_to_out_base is a main() closure and cannot be patched directly, so
-    the platform decision is forced in a real child burn process: a tiny driver
+    the unlink decision is forced in a real child burn process: a tiny driver
     imports the burn module, flips the module-level _GUARD_UNLINK_ON constant,
     then calls main(). Runs two preview jobs into the same out_base so the
-    second one goes through the real promote/collision path.
+    second one goes through the real promote/collision path. Both policies
+    ('keep' / 'unlink') are exercised regardless of the host OS.
     """
     video = make_test_video(duration=2.0, fps=10)
     html = ROOT / "tests" / "fixtures" / "twitchdownloader_chat.html"
@@ -332,15 +340,19 @@ def test_promote_guard_kept_on_posix_deleted_on_windows(tmp_path: Path, make_tes
         "import sys\n"
         "sys.argv = ['twitch_chat_burn.py'] + sys.argv[1:]\n"
         "import twitch_chat_burn as burn\n"
-        "burn._GUARD_UNLINK_ON = (sys.argv[1],)\n"
+        # sys.argv[1] is the unlink-policy token: 'unlink' -> ('nt',)-like
+        # (guard removed after publish), 'keep' -> () (guard always kept,
+        # the C-12 POSIX contract). Flipping to a platform name would be
+        # ambiguous — e.g. ('posix',) means "unlink ON posix".
+        "burn._GUARD_UNLINK_ON = ('nt',) if sys.argv[1] == 'unlink' else ()\n"
         "sys.argv = [sys.argv[0]] + sys.argv[2:]\n"
         "rc = burn.main()\n"
         "sys.exit(rc if isinstance(rc, int) else 0)\n",
         encoding="utf-8",
     )
 
-    for platform, expect_guard in (("posix", True), ("nt", False)):
-        out_base = tmp_path / f"out_{platform}"
+    for policy, expect_guard in (("keep", True), ("unlink", False)):
+        out_base = tmp_path / f"out_{policy}"
         out_base.mkdir()
 
         # First run seeds the colliding basename in out_base.
@@ -371,13 +383,13 @@ def test_promote_guard_kept_on_posix_deleted_on_windows(tmp_path: Path, make_tes
 
         # Second run with an isolated job dir under out_base: promote must run
         # (out_dir != out_base) with the platform decision forced by the driver.
-        job_dir = out_base / f"job_c12_{platform}"
+        job_dir = out_base / f"job_c12_{policy}"
         job_dir.mkdir()
         r2 = subprocess.run(
             [
                 sys.executable,
                 str(driver),
-                platform,
+                policy,
                 str(video),
                 str(html),
                 "--preview-frame",
@@ -403,12 +415,12 @@ def test_promote_guard_kept_on_posix_deleted_on_windows(tmp_path: Path, make_tes
             # POSIX: guard intentionally left behind for --clean to claim.
             guards = list(out_base.glob(".*.publish.guard"))
             assert guards, (
-                f"[{platform}] expected a leftover publish.guard, got none; "
+                f"[{policy}] expected a leftover publish.guard, got none; "
                 + (r2.stdout or "") + (r2.stderr or "")
             )
         else:
             # Windows: guard removed after successful publish.
             assert not list(out_base.glob(".*.publish.guard")), (
-                f"[{platform}] expected no publish.guard leftovers; "
+                f"[{policy}] expected no publish.guard leftovers; "
                 + (r2.stdout or "") + (r2.stderr or "")
             )
