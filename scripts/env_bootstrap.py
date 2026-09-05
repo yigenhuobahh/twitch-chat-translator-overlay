@@ -26,6 +26,7 @@ import uuid
 import zipfile
 
 from common_utils import (
+    atomic_replace_with_retry,
     current_cli_invocation,
     current_cli_script,
     is_console_entry_script,
@@ -184,9 +185,11 @@ def atomic_replace_directory(staged: Path, destination: Path) -> None:
     backup: Path | None = None
     if destination.exists() or destination.is_symlink():
         backup = destination.with_name(f".{destination.name}.backup-{uuid.uuid4().hex}")
-        os.replace(destination, backup)
+        # Retry guards the transient Windows sharing violation (WinError 32/5)
+        # while a process briefly holds the directory (e.g. its CWD is inside).
+        atomic_replace_with_retry(destination, backup)
     try:
-        os.replace(staged, destination)
+        atomic_replace_with_retry(staged, destination)
     except Exception:
         if backup is not None and not destination.exists():
             os.replace(backup, destination)

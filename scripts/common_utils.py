@@ -16,6 +16,7 @@ import site
 import sys
 import sysconfig
 import tempfile
+import time
 
 _DISTRIBUTION_SHARE = Path("share") / "twitch-chat-translator-overlay"
 _CONSOLE_ENTRY_NAMES = {
@@ -167,6 +168,26 @@ def translate_api_env_config() -> dict[str, str | None]:
     }
 
 
+def atomic_replace_with_retry(src: str | Path, dst: str | Path, *, attempts: int = 10) -> None:
+    """os.replace with a short retry for Windows sharing violations.
+
+    Shared twin of run_meta._replace_with_retry: a concurrent reader holding
+    the destination open without FILE_SHARE_DELETE makes MoveFileEx fail once
+    with PermissionError (WinError 5/32) and succeed right after the reader
+    closes. Retries only the transient PermissionError path with exponential
+    backoff (~2.3s worst case over 10 attempts); re-raises on the last
+    attempt so permanent failures keep their original semantics.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.02 * (2**attempt))
+
+
 def atomic_write_json(path: str | Path, data) -> None:
     """原子写 JSON：先写同目录唯一临时文件，成功后 os.replace 原子替换。
 
@@ -180,7 +201,7 @@ def atomic_write_json(path: str | Path, data) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as file:
             json.dump(data, file, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, path)
+        atomic_replace_with_retry(tmp_path, path)
     finally:
         try:
             tmp_path.unlink(missing_ok=True)

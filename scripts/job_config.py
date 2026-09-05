@@ -16,7 +16,7 @@ try:
 except ImportError:  # pragma: no cover
     yaml = None
 
-from common_utils import current_cli_invocation
+from common_utils import atomic_replace_with_retry, current_cli_invocation
 
 # Canonical argparse attribute names accepted from job YAML (kebab or snake).
 JOB_FIELD_ALIASES: dict[str, str] = {
@@ -1034,7 +1034,7 @@ def write_job_file(
             file.write(text)
             file.flush()
             os.fsync(file.fileno())
-        os.replace(tmp_path, p)
+        atomic_replace_with_retry(tmp_path, p)
     finally:
         try:
             tmp_path.unlink(missing_ok=True)
