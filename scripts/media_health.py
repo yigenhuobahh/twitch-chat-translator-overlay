@@ -10,12 +10,49 @@ import math
 import os
 from pathlib import Path
 import queue
-import subprocess
+import subprocess as _subprocess_module
 import threading
 import time
 
 from common_utils import require_executable, safe_which
+from process_util import popen_kwargs, run_tracked, tracked_process
 from task_events import EVENT_FILE_ENV, emit_task_event
+
+
+class _TrackedSubprocess:
+    """``subprocess`` facade whose children are tracked by process_util.
+
+    ``run()`` executes through ``process_util.run_tracked`` and ``Popen()``
+    injects ``process_util.popen_kwargs()`` (tree-killable spawn flags), so
+    media-health children (ffprobe/ffmpeg, decode checks up to 24 h) are
+    visible to ``kill_active_processes`` and get reaped on parent exit/cancel
+    instead of being orphaned. Every other attribute (``PIPE``, ``STDOUT``,
+    ``TimeoutExpired``, ...) delegates to the real module, so call shapes and
+    constants are unchanged. This facade is also the seam tests patch:
+    ``monkeypatch.setattr(media_health.subprocess, "run"/"Popen", ...)``.
+    """
+
+    def __getattr__(self, name):
+        return getattr(_subprocess_module, name)
+
+    def Popen(self, command, **kwargs):  # noqa: N802 - mirrors subprocess.Popen API
+        for key, value in popen_kwargs().items():
+            kwargs.setdefault(key, value)
+        return _subprocess_module.Popen(command, **kwargs)
+
+    def run(self, command, **kwargs):
+        """``subprocess.run`` equivalent backed by run_tracked.
+
+        On timeout the child tree is killed and reaped before
+        ``subprocess.TimeoutExpired`` propagates (run parity).
+        """
+        if kwargs.pop("capture_output", False):
+            kwargs.setdefault("stdout", _subprocess_module.PIPE)
+            kwargs.setdefault("stderr", _subprocess_module.PIPE)
+        return run_tracked(command, **kwargs)
+
+
+subprocess = _TrackedSubprocess()
 
 _BENIGN_EXTRA_STREAMS = {"attachment", "data", "subtitle"}
 _AUDIO_PACKET_SAMPLE_SECONDS = 60.0
@@ -208,87 +245,93 @@ def _decode_check_with_progress(path: Path, *, duration: float) -> tuple[bool, s
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            **popen_kwargs(),
         )
     except OSError as exc:
         return False, f"Full decode check failed: {exc}"
 
     emit_task_event("stage_started", stage="media_decode", completed=0, total=100)
-    deadline = time.monotonic() + 24 * 3600
-    lines: queue.Queue[str | None] = queue.Queue(maxsize=256)
-    errors: deque[str] = deque(maxlen=20)
-    last_percent = -1
+    # Track the decode child in process_util's registry (same one run_tracked
+    # feeds) so parent exit/cancel paths (kill_active_processes) can reap a
+    # potentially 24 h decode instead of orphaning it. The raw Popen handle is
+    # preserved so per-line progress parsing behaves exactly as before.
+    with tracked_process(process):
+        deadline = time.monotonic() + 24 * 3600
+        lines: queue.Queue[str | None] = queue.Queue(maxsize=256)
+        errors: deque[str] = deque(maxlen=20)
+        last_percent = -1
 
-    def read_output() -> None:
-        if process.stdout is None:
-            lines.put(None)
-            return
-        for output_line in iter(lambda: process.stdout.readline(8192), ""):
-            try:
-                lines.put_nowait(output_line)
-            except queue.Full:
-                try:
-                    lines.get_nowait()
-                except queue.Empty:
-                    pass
+        def read_output() -> None:
+            if process.stdout is None:
+                lines.put(None)
+                return
+            for output_line in iter(lambda: process.stdout.readline(8192), ""):
                 try:
                     lines.put_nowait(output_line)
                 except queue.Full:
-                    pass
-        try:
-            lines.put_nowait(None)
-        except queue.Full:
-            pass
-
-    reader = threading.Thread(target=read_output, name="media-health-progress", daemon=True)
-    reader.start()
-    timed_out = False
-    output_finished = False
-    while True:
-        if time.monotonic() >= deadline:
-            timed_out = True
+                    try:
+                        lines.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        lines.put_nowait(output_line)
+                    except queue.Full:
+                        pass
             try:
-                process.kill()
-            except OSError:
+                lines.put_nowait(None)
+            except queue.Full:
                 pass
-            process.wait()
-            break
-        try:
-            line = lines.get(timeout=0.2)
-        except queue.Empty:
-            if process.poll() is not None and (output_finished or not reader.is_alive()):
+
+        reader = threading.Thread(target=read_output, name="media-health-progress", daemon=True)
+        reader.start()
+        timed_out = False
+        output_finished = False
+        while True:
+            if time.monotonic() >= deadline:
+                timed_out = True
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                process.wait()
                 break
-            continue
-        if line is None:
-            output_finished = True
-            if process.poll() is not None:
-                break
-            continue
-        text = line.strip()
-        if text.startswith("out_time_ms="):
             try:
-                current_us = max(0.0, float(text.split("=", 1)[1]))
-            except ValueError:
+                line = lines.get(timeout=0.2)
+            except queue.Empty:
+                if process.poll() is not None and (output_finished or not reader.is_alive()):
+                    break
                 continue
-            if duration > 0:
-                percent = min(99, max(0, int(current_us / 1_000_000 / duration * 100)))
-                if percent > last_percent:
-                    last_percent = percent
-                    emit_task_event("stage_progress", stage="media_decode", completed=percent, total=100)
-        elif text == "progress=end":
-            last_percent = 100
-            emit_task_event("stage_progress", stage="media_decode", completed=100, total=100)
-        elif text:
-            errors.append(text[-500:])
-    reader.join(timeout=1.0)
-    if timed_out:
+            if line is None:
+                output_finished = True
+                if process.poll() is not None:
+                    break
+                continue
+            text = line.strip()
+            if text.startswith("out_time_ms="):
+                try:
+                    current_us = max(0.0, float(text.split("=", 1)[1]))
+                except ValueError:
+                    continue
+                if duration > 0:
+                    percent = min(99, max(0, int(current_us / 1_000_000 / duration * 100)))
+                    if percent > last_percent:
+                        last_percent = percent
+                        emit_task_event("stage_progress", stage="media_decode", completed=percent, total=100)
+            elif text == "progress=end":
+                last_percent = 100
+                emit_task_event("stage_progress", stage="media_decode", completed=100, total=100)
+            elif text:
+                errors.append(text[-500:])
+        reader.join(timeout=1.0)
+        if timed_out:
+            emit_task_event("stage_failed", stage="media_decode", completed=max(0, last_percent), total=100)
+            return False, "Full decode check timed out"
+        returncode = process.wait()
+        if returncode == 0:
+            emit_task_event("stage_completed", stage="media_decode", completed=100, total=100)
+            return True, ""
         emit_task_event("stage_failed", stage="media_decode", completed=max(0, last_percent), total=100)
-        return False, "Full decode check timed out"
-    returncode = process.wait()
-    if returncode == 0:
-        emit_task_event("stage_completed", stage="media_decode", completed=100, total=100)
-        return True, ""
-    emit_task_event("stage_failed", stage="media_decode", completed=max(0, last_percent), total=100)
-    return False, "\n".join(errors)[-700:]
+        return False, "\n".join(errors)[-700:]
 
 
 def decode_check_media(path: Path, *, duration: float = 0.0) -> tuple[bool, str]:
@@ -298,9 +341,14 @@ def decode_check_media(path: Path, *, duration: float = 0.0) -> tuple[bool, str]
     if not safe_which("ffmpeg"):
         return False, "未找到 ffmpeg，无法执行完整解码检查"
     try:
+        # Tracked subprocess.run: the 24 h decode child is registered in
+        # process_util's _active registry, so kill_active_processes (atexit /
+        # Ctrl+C / cancel) can reap it; on timeout the child is killed first.
         proc = subprocess.run(
-            [require_executable("ffmpeg"), "-v", "error", "-xerror", "-i", str(path), "-map", "0:v:0", "-map", "0:a:0?", "-f", "null", "-"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=24 * 3600,
+            [require_executable("ffmpeg"), "-v", "error", "-xerror", "-i", str(path),
+             "-map", "0:v:0", "-map", "0:a:0?", "-f", "null", "-"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=24 * 3600,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, f"完整解码检查失败: {e}"

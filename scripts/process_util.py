@@ -294,11 +294,20 @@ def run_tracked(
     cwd: str | Path | None = None,
     env: dict | None = None,
     check: bool = False,
+    timeout: float | None = None,
+    encoding: str | None = None,
+    errors: str | None = None,
 ) -> subprocess.CompletedProcess:
     """
     Run a command while tracking the process for cancel/atexit cleanup.
 
     Prefer this for long-running FFmpeg/FFprobe-adjacent encode steps.
+
+    ``timeout``: like ``subprocess.run``; on expiry the child tree is killed,
+    waited for, and ``subprocess.TimeoutExpired`` re-raised. ``encoding`` /
+    ``errors`` mirror the ``subprocess.run`` capture options (``encoding``
+    implies text mode). Existing callers are unaffected: defaults reproduce
+    the previous behavior exactly.
     """
     install_process_cleanup_handlers()
     kwargs = _popen_kwargs()
@@ -307,13 +316,21 @@ def run_tracked(
         stdout=stdout,
         stderr=stderr,
         text=text,
+        encoding=encoding,
+        errors=errors,
         cwd=str(cwd) if cwd is not None else None,
         env=env,
         **kwargs,
     )
     _register(proc)
     try:
-        out, err = proc.communicate()
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Mirror subprocess.run: kill the timed-out child before raising.
+            kill_process_tree(proc.pid, force=True)
+            proc.wait()
+            raise
         completed = subprocess.CompletedProcess(list(cmd), proc.returncode, out, err)
         if check and proc.returncode != 0:
             raise subprocess.CalledProcessError(proc.returncode, list(cmd), out, err)
@@ -321,6 +338,36 @@ def run_tracked(
     finally:
         _unregister(proc)
         if proc.poll() is None:
+            kill_process_tree(proc.pid, force=True)
+
+
+def popen_kwargs() -> dict:
+    """Public ``_popen_kwargs()``: flags that make a child tree killable.
+
+    Pass the result to ``subprocess.Popen`` when spawning a child that will
+    then be tracked via :func:`tracked_process`, so cancel/atexit cleanup can
+    terminate the whole tree exactly as ``run_tracked`` does.
+    """
+    return _popen_kwargs()
+
+
+@contextlib.contextmanager
+def tracked_process(proc: subprocess.Popen) -> Iterator[subprocess.Popen]:
+    """Track an externally created Popen in the same registry as run_tracked.
+
+    While the context is active, ``kill_active_processes`` (atexit / SIGINT /
+    cancel paths) targets ``proc``; the process is unregistered on exit. If an
+    exception propagates out of the block while the child is still running, it
+    is killed and reaped (same contract as ``run_tracked``). Spawn the child
+    with :func:`popen_kwargs` so its whole tree stays killable.
+    """
+    install_process_cleanup_handlers()
+    _register(proc)
+    try:
+        yield proc
+    finally:
+        _unregister(proc)
+        if sys.exc_info()[0] is not None and proc.poll() is None:
             kill_process_tree(proc.pid, force=True)
 
 
