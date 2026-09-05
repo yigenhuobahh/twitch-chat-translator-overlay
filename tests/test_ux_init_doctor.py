@@ -31,6 +31,49 @@ def pipeline():
     return load_module("render_cn_chat", "render_cn_chat.py")
 
 
+def test_tighten_env_permissions_skipped_on_windows(ux_mod, tmp_path: Path):
+    """本机(Windows)直接调用:跳过收紧、不抛错、返回 False。"""
+    env_file = tmp_path / ".env"
+    env_file.write_text("OPENAI_COMPAT_API_KEY=x\n", encoding="utf-8")
+
+    assert ux_mod._tighten_env_permissions(env_file) is False
+
+
+def test_tighten_env_permissions_chmods_on_posix(ux_mod, tmp_path: Path, monkeypatch):
+    """POSIX 分支:收紧到仅属主读写并返回 True。
+
+    monkeypatch os.name 为 "posix" 只影响 ux_setup 模块内的分支判定;
+    Windows 上对文件 chmod 0o600 合法(MSVCRT 只处理只读位),不会抛错。
+    """
+    env_file = tmp_path / ".env"
+    env_file.write_text("OPENAI_COMPAT_API_KEY=x\n", encoding="utf-8")
+    monkeypatch.setattr(ux_mod.os, "name", "posix")
+
+    assert ux_mod._tighten_env_permissions(env_file) is True
+
+
+def test_ensure_dotenv_tightens_created_env(
+    tmp_path: Path, ux_mod, monkeypatch
+):
+    """ensure_dotenv 创建 .env 后必须走权限收紧助手(接缝 spy)。"""
+    example = tmp_path / ".env.example"
+    example.write_text("OPENAI_COMPAT_API_KEY=\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    tightened: list[Path] = []
+    monkeypatch.setattr(
+        ux_mod, "_tighten_env_permissions", lambda p: (tightened.append(p), True)[1]
+    )
+
+    path, status = ux_mod.ensure_dotenv(tmp_path)
+
+    assert status == "created"
+    assert tightened == [tmp_path / ".env"]
+    assert path is not None and path.read_text(encoding="utf-8") == example.read_text(
+        encoding="utf-8"
+    )
+
+
 def test_ensure_dotenv_creates_from_example(tmp_path: Path, ux_mod, monkeypatch):
     example = tmp_path / ".env.example"
     example.write_text("OPENAI_COMPAT_API_KEY=\n", encoding="utf-8")

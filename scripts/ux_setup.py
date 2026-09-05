@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -87,6 +88,18 @@ def find_env_example() -> Path | None:
     return None
 
 
+def _tighten_env_permissions(env_path: Path) -> bool:
+    """Tighten .env permissions after creation. Returns True if chmod ran.
+
+    .env 明文含 API key:POSIX 侧收紧到仅属主可读写(0o600)。Windows 的
+    ACL 继承模型不适用 chmod 语义,跳过(对齐 env_bootstrap 原子写先例)。
+    """
+    if os.name == "nt":
+        return False
+    env_path.chmod(0o600)
+    return True
+
+
 def ensure_dotenv(cwd: Path | None = None) -> tuple[Path | None, str]:
     """Create .env from .env.example if missing.
 
@@ -104,6 +117,7 @@ def ensure_dotenv(cwd: Path | None = None) -> tuple[Path | None, str]:
 
     try:
         shutil.copyfile(example, env_path)
+        _tighten_env_permissions(env_path)
     except OSError:
         return None, "error"
     return env_path, "created"

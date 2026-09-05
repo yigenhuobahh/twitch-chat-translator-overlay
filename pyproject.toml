@@ -159,7 +159,6 @@ markers = [
   "smoke: short end-to-end render checks that need FFmpeg",
   "max: comprehensive / long-term suite extras (run via scripts/run_tests.py --max)",
   "slow: longer than usual; included in --max, excluded from default PR loop",
-  "textual: Textual headless app tests",
 ]
 # Blanket DeprecationWarning ignore is deliberate: third-party deps (textual,
 # openai/httpx, PIL) emit deprecations that vary across the CI matrix
