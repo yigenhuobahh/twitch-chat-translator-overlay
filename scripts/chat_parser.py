@@ -40,17 +40,23 @@ def _read_html_text(html_path: str) -> str:
                 f"聊天 HTML 超过 {limit / 2**30:.0f} GiB 上限({size / 2**30:.1f} GiB),拒绝解析"
             )
         raw = bf.read()
+    # 尽早释放 raw bytes:解码后原文不再需要,避免 bytes+str 双份峰值(大文件 ~2x)。
+    decoded: str
     if raw.startswith(b"\xef\xbb\xbf"):
-        return raw.decode("utf-8-sig", errors="replace")
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        # A damaged byte must not force valid UTF-8 CJK through latin-1.
-        # Keep latin-1 only for genuinely legacy ASCII-plus-latin-1 exports.
-        repaired = raw.decode("utf-8", errors="replace")
-        if any(ch != "\ufffd" and ord(ch) > 127 for ch in repaired):
-            return repaired
-        return raw.decode("latin-1")
+        decoded = raw.decode("utf-8-sig", errors="replace")
+    else:
+        try:
+            decoded = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            # A damaged byte must not force valid UTF-8 CJK through latin-1.
+            # Keep latin-1 only for genuinely legacy ASCII-plus-latin-1 exports.
+            repaired = raw.decode("utf-8", errors="replace")
+            if any(ch != "\ufffd" and ord(ch) > 127 for ch in repaired):
+                decoded = repaired
+            else:
+                decoded = raw.decode("latin-1")
+    del raw  # 释放字节副本,只保留解码后的 str
+    return decoded
 
 
 def _class_has_token(class_value: str, token: str) -> bool:
@@ -89,6 +95,177 @@ class _ParseProgress:
             print(f"  … {label}: {n} 用时 {elapsed:.1f}s", flush=True)
 
 
+class _MessageAssembler:
+    """单条 comment-root 消息的 fragment 装配(从主循环抽出,避免重复代码)。"""
+
+    def __init__(self, token_pattern, token_pattern_no_title) -> None:
+        self._token_pattern = token_pattern
+        self._token_pattern_no_title = token_pattern_no_title
+
+    def append(self, messages, msg_content, timestamp, author, color, badges) -> None:
+        fragments: list[dict] = []
+        # 去掉开头的 ": "
+        if msg_content.startswith(": "):
+            msg_content = msg_content[2:]
+        elif msg_content.startswith(":"):
+            msg_content = msg_content[1:]
+
+        # Collect emote matches (with and without title). Prefer titled matches.
+        matches: list[tuple[int, int, str, str]] = []  # start, end, class, title
+        occupied: list[tuple[int, int]] = []
+
+        def _overlaps(a0: int, a1: int, ranges: list[tuple[int, int]] = occupied) -> bool:
+            for b0, b1 in ranges:
+                if a0 < b1 and a1 > b0:
+                    return True
+            return False
+
+        for tm in self._token_pattern.finditer(msg_content):
+            class_value = tm.group(2) or ""
+            if not _class_has_token(class_value, "emote-image"):
+                continue
+            emote_cls = _first_emote_class(class_value)
+            if not emote_cls:
+                continue
+            title = html_mod.unescape(tm.group(3) or "")
+            matches.append((tm.start(), tm.end(), emote_cls, title))
+            occupied.append((tm.start(), tm.end()))
+
+        for tm in self._token_pattern_no_title.finditer(msg_content):
+            if _overlaps(tm.start(), tm.end()):
+                continue
+            class_value = tm.group(2) or ""
+            if not _class_has_token(class_value, "emote-image"):
+                continue
+            emote_cls = _first_emote_class(class_value)
+            if not emote_cls:
+                continue
+            matches.append((tm.start(), tm.end(), emote_cls, emote_cls))
+            occupied.append((tm.start(), tm.end()))
+
+        matches.sort(key=lambda x: x[0])
+
+        last_end = 0
+        for match_start, match_end, emote_cls, title in matches:
+            text_before = msg_content[last_end:match_start]
+            # Strip residual tags (including text-hide leftovers) before keeping text.
+            text_clean = re.sub(
+                r'<span\b[^>]*\bclass\s*=\s*["\'][^"\']*\btext-hide\b[^"\']*["\'][^>]*>[^<]*</span>',
+                "",
+                text_before,
+                flags=re.IGNORECASE,
+            )
+            text_clean = re.sub(r"<[^>]+>", "", text_clean)
+            text_clean = html_mod.unescape(text_clean).strip()
+            if text_clean:
+                fragments.append({"type": "text", "text": text_clean})
+            fragments.append(
+                {
+                    "type": "emote",
+                    "class": emote_cls,
+                    "title": title,
+                }
+            )
+            last_end = match_end
+
+        # 剩余文本
+        text_after = msg_content[last_end:]
+        text_after = re.sub(
+            r'<span\b[^>]*\bclass\s*=\s*["\'][^"\']*\btext-hide\b[^"\']*["\'][^>]*>[^<]*</span>',
+            "",
+            text_after,
+            flags=re.IGNORECASE,
+        )
+        text_clean = re.sub(r"<[^>]+>", "", text_after)
+        text_clean = html_mod.unescape(text_clean).strip()
+        if text_clean:
+            fragments.append({"type": "text", "text": text_clean})
+
+        if not fragments:
+            # 纯文本消息
+            text_only = re.sub(
+                r'<span\b[^>]*\bclass\s*=\s*["\'][^"\']*\btext-hide\b[^"\']*["\'][^>]*>[^<]*</span>',
+                "",
+                msg_content,
+                flags=re.IGNORECASE,
+            )
+            text_only = re.sub(r"<[^>]+>", "", text_only)
+            text_only = html_mod.unescape(text_only).strip()
+            if text_only:
+                fragments.append({"type": "text", "text": text_only})
+
+        if fragments:
+            messages.append(
+                {
+                    "timestamp": timestamp,
+                    "author": author,
+                    "color": color.strip() if color else "",
+                    "badges": badges,
+                    "fragments": fragments,
+                }
+            )
+
+
+def _extract_comment_root_fields(
+    line: str,
+    *,
+    time_link_pattern,
+    author_pattern,
+    author_color_pattern,
+    badge_img_pattern,
+    comment_message_open,
+):
+    """从单个 comment-root 块提取 (timestamp, author, color, badges, msg_content)。
+
+    任一字段缺失时返回 None,与旧逐块主循环的 continue 语义一致。
+    """
+    ts_match = time_link_pattern.search(line)
+    if not ts_match:
+        return None
+    h, m, s = int(ts_match.group(1)), int(ts_match.group(2)), int(ts_match.group(3))
+    timestamp = h * 3600 + m * 60 + s
+    author_match = author_pattern.search(line)
+    if not author_match:
+        return None
+    attr_blob = author_match.group(1) or ""
+    color_match = author_color_pattern.search(attr_blob)
+    color = color_match.group(1) if color_match else ""
+    author = html_mod.unescape(author_match.group(2).strip())
+    badges = []
+    for bm in badge_img_pattern.finditer(line):
+        badges.append({"title": html_mod.unescape(bm.group(1))})
+    # 提取 comment-message 内容
+    # comment-message 内部嵌套有 <span class="text-hide">，其 </span> 会干扰非贪婪匹配
+    # 直接找 comment-message 开始到 </pre> 之间的内容
+    msg_start = -1
+    # Fast exact markers first (common TD export)
+    for marker in (
+        '<span class="comment-message">',
+        "<span class='comment-message'>",
+    ):
+        pos = line.find(marker)
+        if pos != -1:
+            msg_start = pos + len(marker)
+            break
+    if msg_start == -1:
+        m_msg = comment_message_open.search(line)
+        if not m_msg:
+            return None
+        msg_start = m_msg.end()
+    # 找对应的 </pre> 结尾
+    pre_end = line.find("</pre>", msg_start)
+    if pre_end == -1:
+        return None
+    # comment-message 的 </span> 在 </pre> 之前
+    msg_raw = line[msg_start:pre_end]
+    # 去掉末尾的 </span>
+    if msg_raw.rstrip().endswith("</span>"):
+        msg_content = msg_raw.rstrip()[: -len("</span>")]
+    else:
+        msg_content = msg_raw
+    return timestamp, author, color, badges, msg_content
+
+
 def parse_chat_html(html_path, out_dir):
     """从 Twitch HTML 聊天记录中提取消息和 emote 图片。"""
     print(f"[1/4] 解析聊天 HTML: {html_path}", flush=True)
@@ -113,18 +290,28 @@ def parse_chat_html(html_path, out_dir):
     # Prefer scoped regions: TD puts emote CSS in <style> and messages in <body>.
     # Scan every style block: exports can have general page CSS before the emote
     # rules, and looking only at the first block loses those emotes.
-    style_blocks = [
-        match.group(1)
-        for match in re.finditer(r"<style\b[^>]*>(.*?)</style\s*>", html, re.IGNORECASE | re.DOTALL)
-    ]
+    style_block_re = re.compile(r"<style\b[^>]*>(.*?)</style\s*>", re.IGNORECASE | re.DOTALL)
     body_match = re.search(r"<body\b[^>]*>(.*?)</body\s*>", html, re.IGNORECASE | re.DOTALL)
     body_region = body_match.group(1) if body_match else html
-    if style_blocks:
-        css_region = "\n".join(style_blocks)
+    del body_match  # group(1) 已切出,match 对象本身不再需要
+    css_region: str
+    if style_block_re.search(html):
+        # 流式拼接 style 块:与逐块列表 + join 结果逐字符一致,但任一时刻
+        # 只额外持有一份 css_region(增长式拼接按 12.5% 过摊增),峰值更低。
+        css_parts: list[str] = []
+        css_len = 0
+        n_style_blocks = 0
+        for match in style_block_re.finditer(html):
+            block = match.group(1)
+            css_parts.append(block)
+            css_len += len(block)
+            n_style_blocks += 1
+        css_region = "".join(css_parts)
+        del css_parts  # 拼接完成后释放分块列表
         print(
             f"  已载入 {html_chars / (1024 * 1024):.1f}M 字符"
             f"（style {len(css_region) / (1024 * 1024):.1f}M / body {len(body_region) / (1024 * 1024):.1f}M，"
-            f"共 {len(style_blocks)} 个 style 块），"
+            f"共 {n_style_blocks} 个 style 块），"
             f"开始扫描 emote CSS…",
             flush=True,
         )
@@ -290,11 +477,22 @@ def parse_chat_html(html_path, out_dir):
         f"（CSS 规则命中 {emote_rules_seen}，用时 {time.perf_counter() - t_parse0:.1f}s）",
         flush=True,
     )
+    # emote CSS 扫描结束:释放 css_region。注意无 <style> 时 css_region 即 html,
+    # 而 body_region 可能与它同引用,故仅在与 body_region 不同时才释放。
+    if css_region is not body_region:
+        del css_region
 
     # --- 提取消息 ---
     messages = []
     # Message markup lives in body; avoid re-scanning multi-MB CSS.
     msg_html = body_region
+    # 全量 html 在 body_region 切出后不再需要;body_region 为 body 切片时与
+    # html 共享底层缓冲,直接切头会保留 body 之外的字符。这里把 body 文本
+    # 平移到缓冲头部(str 拼接产出的新串),使 html 的其余部分可立即释放,
+    # 也让流式解析期间的逐块内存占用只由 body 本身决定。
+    if body_region is not html:
+        body_region = body_region + ""
+    del html  # 尽早释放原始 html 大字符串
     # Strip HTML comments before any body splitting: exports may embed
     # commented-out sample messages (a full <pre class="comment-root"> block
     # inside <!-- -->) that would otherwise be parsed as real chat lines.
@@ -360,15 +558,19 @@ def parse_chat_html(html_path, out_dir):
             r"<span\b(?=[^>]*\bclass\s*=\s*[\"'][^\"']*\bcomment-message\b[^\"']*[\"'])[^>]*>",
             re.IGNORECASE,
         )
+        # fragment 装配器:token_pattern 与主循环内联版本一致。
+        assembler = _MessageAssembler(token_pattern, token_pattern_no_title)
         # Split on comment-root regardless of quote style around class value.
+        # 流式切分:与 re.split 的零宽断言逐点一致,但每块在下一块起点处截断,
+        # 任一时刻只持有单块副本,避免一次性生成 ~163k 个全量切片(峰值 ~1x)。
+        # 计数与进度语义不变:root_total 仍统计含 comment-root 的块。
         print("  切分 comment-root 消息块…", flush=True)
         t_split = time.perf_counter()
-        pre_lines = re.split(
+        pre_split_re = re.compile(
             r'(?=<pre\b[^>]*\bclass\s*=\s*["\'][^"\']*\bcomment-root\b)',
-            msg_html,
-            flags=re.IGNORECASE,
+            re.IGNORECASE,
         )
-        root_total = sum(1 for part in pre_lines if "comment-root" in part)
+        root_total = sum(1 for _ in pre_split_re.finditer(msg_html))
         print(
             f"  消息块约 {root_total} 个（切分用时 {time.perf_counter() - t_split:.1f}s）",
             flush=True,
@@ -376,167 +578,50 @@ def parse_chat_html(html_path, out_dir):
         msg_prog = _ParseProgress(every_n=50, every_sec=2.0)
         roots_seen = 0
 
-        for line in pre_lines:
+        # 逐块游标:start/end 为当前块边界,每块在下一块起点处截断。
+        start = 0
+        for match in pre_split_re.finditer(msg_html):
+            end = match.start()
+            line = msg_html[start:end]
+            start = end
             if "comment-root" not in line:
+                # 块间夹带的前导/杂项文本,同旧 split 的"跳过非消息块"分支。
                 continue
             roots_seen += 1
             msg_prog.tick(roots_seen, "解析消息块", total=root_total or None)
-
-            # 时间戳: 从链接 ?t=0h12m26s 解析
-            ts_match = time_link_pattern.search(line)
-            if not ts_match:
-                continue
-            h, m, s = int(ts_match.group(1)), int(ts_match.group(2)), int(ts_match.group(3))
-            timestamp = h * 3600 + m * 60 + s
-
-            # 作者（属性顺序 / 引号无关）
-            author_match = author_pattern.search(line)
-            if not author_match:
-                continue
-            attr_blob = author_match.group(1) or ""
-            color_match = author_color_pattern.search(attr_blob)
-            color = color_match.group(1) if color_match else ""
-            author = html_mod.unescape(author_match.group(2).strip())
-
-            # Badges
-            badges = []
-            for bm in badge_img_pattern.finditer(line):
-                badges.append({"title": html_mod.unescape(bm.group(1))})
-
-            # 提取 comment-message 内容
-            # comment-message 内部嵌套有 <span class="text-hide">，其 </span> 会干扰非贪婪匹配
-            # 直接找 comment-message 开始到 </pre> 之间的内容
-            msg_start = -1
-            # Fast exact markers first (common TD export)
-            for marker in (
-                '<span class="comment-message">',
-                "<span class='comment-message'>",
-            ):
-                pos = line.find(marker)
-                if pos != -1:
-                    msg_start = pos + len(marker)
-                    break
-            if msg_start == -1:
-                m_msg = comment_message_open.search(line)
-                if not m_msg:
-                    continue
-                msg_start = m_msg.end()
-            # 找对应的 </pre> 结尾
-            pre_end = line.find("</pre>", msg_start)
-            if pre_end == -1:
-                continue
-            # comment-message 的 </span> 在 </pre> 之前
-            msg_raw = line[msg_start:pre_end]
-            # 去掉末尾的 </span>
-            if msg_raw.rstrip().endswith("</span>"):
-                msg_content = msg_raw.rstrip()[: -len("</span>")]
-            else:
-                msg_content = msg_raw
-
-            # 解析 fragments: text + emote 混合
-            fragments = []
-
-            # 去掉开头的 ": "
-            if msg_content.startswith(": "):
-                msg_content = msg_content[2:]
-            elif msg_content.startswith(":"):
-                msg_content = msg_content[1:]
-
-            # Collect emote matches (with and without title). Prefer titled matches.
-            matches: list[tuple[int, int, str, str]] = []  # start, end, class, title
-            occupied: list[tuple[int, int]] = []
-
-            def _overlaps(a0: int, a1: int, ranges: list[tuple[int, int]] = occupied) -> bool:
-                for b0, b1 in ranges:
-                    if a0 < b1 and a1 > b0:
-                        return True
-                return False
-
-            for tm in token_pattern.finditer(msg_content):
-                class_value = tm.group(2) or ""
-                if not _class_has_token(class_value, "emote-image"):
-                    continue
-                emote_cls = _first_emote_class(class_value)
-                if not emote_cls:
-                    continue
-                title = html_mod.unescape(tm.group(3) or "")
-                matches.append((tm.start(), tm.end(), emote_cls, title))
-                occupied.append((tm.start(), tm.end()))
-
-            for tm in token_pattern_no_title.finditer(msg_content):
-                if _overlaps(tm.start(), tm.end()):
-                    continue
-                class_value = tm.group(2) or ""
-                if not _class_has_token(class_value, "emote-image"):
-                    continue
-                emote_cls = _first_emote_class(class_value)
-                if not emote_cls:
-                    continue
-                matches.append((tm.start(), tm.end(), emote_cls, emote_cls))
-                occupied.append((tm.start(), tm.end()))
-
-            matches.sort(key=lambda x: x[0])
-
-            last_end = 0
-            for start, end, emote_cls, title in matches:
-                text_before = msg_content[last_end:start]
-                # Strip residual tags (including text-hide leftovers) before keeping text.
-                text_clean = re.sub(
-                    r'<span\b[^>]*\bclass\s*=\s*["\'][^"\']*\btext-hide\b[^"\']*["\'][^>]*>[^<]*</span>',
-                    "",
-                    text_before,
-                    flags=re.IGNORECASE,
-                )
-                text_clean = re.sub(r"<[^>]+>", "", text_clean)
-                text_clean = html_mod.unescape(text_clean).strip()
-                if text_clean:
-                    fragments.append({"type": "text", "text": text_clean})
-                fragments.append(
-                    {
-                        "type": "emote",
-                        "class": emote_cls,
-                        "title": title,
-                    }
-                )
-                last_end = end
-
-            # 剩余文本
-            text_after = msg_content[last_end:]
-            text_after = re.sub(
-                r'<span\b[^>]*\bclass\s*=\s*["\'][^"\']*\btext-hide\b[^"\']*["\'][^>]*>[^<]*</span>',
-                "",
-                text_after,
-                flags=re.IGNORECASE,
+            fields = _extract_comment_root_fields(
+                line,
+                time_link_pattern=time_link_pattern,
+                author_pattern=author_pattern,
+                author_color_pattern=author_color_pattern,
+                badge_img_pattern=badge_img_pattern,
+                comment_message_open=comment_message_open,
             )
-            text_clean = re.sub(r"<[^>]+>", "", text_after)
-            text_clean = html_mod.unescape(text_clean).strip()
-            if text_clean:
-                fragments.append({"type": "text", "text": text_clean})
-
-            if not fragments:
-                # 纯文本消息
-                text_only = re.sub(
-                    r'<span\b[^>]*\bclass\s*=\s*["\'][^"\']*\btext-hide\b[^"\']*["\'][^>]*>[^<]*</span>',
-                    "",
-                    msg_content,
-                    flags=re.IGNORECASE,
-                )
-                text_only = re.sub(r"<[^>]+>", "", text_only)
-                text_only = html_mod.unescape(text_only).strip()
-                if text_only:
-                    fragments.append({"type": "text", "text": text_only})
-
-            if fragments:
-                messages.append(
-                    {
-                        "timestamp": timestamp,
-                        "author": author,
-                        "color": color.strip() if color else "",
-                        "badges": badges,
-                        "fragments": fragments,
-                    }
-                )
+            if fields is None:
+                continue
+            timestamp, author, color, badges, msg_content = fields
+            # 解析 fragments: text + emote 混合(与旧内联实现逐行等价)。
+            assembler.append(messages, msg_content, timestamp, author, color, badges)
+        # 与 re.split 对齐:最后一个消息块之后没有新的匹配点,但 split 仍会
+        # 把末尾残余文本作为一个分块返回,这里同样补切尾块。
+        tail_line = msg_html[start:]
+        if "comment-root" in tail_line:
+            roots_seen += 1
+            msg_prog.tick(roots_seen, "解析消息块", total=root_total or None)
+            fields = _extract_comment_root_fields(
+                tail_line,
+                time_link_pattern=time_link_pattern,
+                author_pattern=author_pattern,
+                author_color_pattern=author_color_pattern,
+                badge_img_pattern=badge_img_pattern,
+                comment_message_open=comment_message_open,
+            )
+            if fields is not None:
+                timestamp, author, color, badges, msg_content = fields
+                assembler.append(messages, msg_content, timestamp, author, color, badges)
         msg_prog.tick(roots_seen, "解析消息块", force=True, total=root_total or None)
+        # 流式遍历结束,释放 msg_html 本体(游标切完后不再引用)。
+        del msg_html, pre_split_re
 
     else:
         # ===== 旧格式 (Twitch Web HTML) =====
@@ -599,6 +684,8 @@ def parse_chat_html(html_path, out_dir):
                     }
                 )
         msg_prog.tick(lines_seen, "解析消息块", force=True, total=line_total or None)
+        # 旧格式切分列表同理,遍历完尽早释放。
+        del lines
 
     messages.sort(key=lambda m: m["timestamp"])
     if messages:
