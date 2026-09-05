@@ -285,6 +285,16 @@ def build_message_frag_list(msg, *, text_width_fn, emote_width_fn, emote_availab
     return frag_list
 
 
+# S-3: 硬上限兜底。max_message_lines 默认 0 = 不限行数,但一条恶意/意外的
+# 超长消息(如 50k 字符)会先按全量行数分配 RGBA 位图再裁剪,数百行即可
+# 产生数十 MB 级单消息贴图。此常量只在"用户未配置行数上限"时兜底截断
+# (截断复用现有省略号路径,与显式配置截断观感一致);显式配置的
+# max_message_lines > 200 是用户的明确选择,不会被本兜底压缩。
+# 默认行为变化: 未配置 max_message_lines 时,单消息最多渲染
+# _HARD_MAX_MESSAGE_LINES 行,末行以 "..." 结尾(此前为无限行)。
+_HARD_MAX_MESSAGE_LINES = 200
+
+
 def truncate_wrapped_lines_with_ellipsis(
     lines,
     *,
@@ -295,10 +305,18 @@ def truncate_wrapped_lines_with_ellipsis(
     gap,
     text_width_fn,
 ):
-    """Cap wrapped lines and append '...' so truncation is visible (not silent crop)."""
-    if not max_message_lines or len(lines) <= max_message_lines:
+    """Cap wrapped lines and append '...' so truncation is visible (not silent crop).
+
+    When ``max_message_lines`` is unset (0/negative), the hard cap
+    ``_HARD_MAX_MESSAGE_LINES`` bounds the line count instead — the ellipsis
+    path is reused so the fallback truncation looks identical to an explicit
+    configured limit. An explicit ``max_message_lines`` above the hard cap is
+    honored as-is (user's explicit choice).
+    """
+    limit = max_message_lines if max_message_lines and max_message_lines > 0 else _HARD_MAX_MESSAGE_LINES
+    if len(lines) <= limit:
         return lines
-    lines = lines[:max_message_lines]
+    lines = lines[:limit]
     ellipsis = "..."
     ellipsis_w = text_width_fn(ellipsis)
     last_is_first_line = len(lines) == 1
@@ -365,6 +383,11 @@ def layout_message_lines(
         num_lines = len(lines)
     else:
         num_lines = max(1, len(lines))
-        if max_message_lines:
-            num_lines = min(num_lines, max_message_lines)
+        # S-3 hard cap: mirror the render-side fallback so the line-count
+        # prepass never reports more lines than truncate_wrapped_lines_with_ellipsis
+        # would actually produce when no explicit limit is configured.
+        effective_limit = (
+            max_message_lines if max_message_lines and max_message_lines > 0 else _HARD_MAX_MESSAGE_LINES
+        )
+        num_lines = min(num_lines, effective_limit)
     return lines, header, num_lines

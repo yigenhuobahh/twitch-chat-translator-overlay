@@ -40,6 +40,7 @@ from chat_text_layout import (
     badge_color_for,
     hex_to_rgb,
     layout_message_lines,
+    truncate_wrapped_lines_with_ellipsis,
 )
 from common_utils import require_executable
 import media_probe
@@ -228,6 +229,23 @@ class FrameRenderer:
         self.max_w = config.width - 4
         self.max_message_lines = max(0, int(getattr(config, "max_message_lines", 0) or 0))
 
+        # P-5: per-instance text-width memo. self.font is created once in
+        # __init__ and never swapped for the instance's lifetime, so caching
+        # by string alone is sound. Bounded growth: chat messages draw from a
+        # small per-message alphabet (words/chars), so this stays far below
+        # any memory concern on even multi-hour VODs.
+        self._width_cache: dict[str, int] = {}
+
+        # P-5: layout reuse cache for static (non-animated) messages, keyed by
+        # the message object identity — messages are dict objects held for the
+        # whole render session and their text/fragments are never mutated after
+        # parse, so id() is the correct key (content keys would collide when a
+        # stream repeats the same text). Only num_lines is consumed via this
+        # cache from calc_msg_lines; render_message keeps its own per-idx cache
+        # (see _layout_cache) so each message is laid out at most once per
+        # render session instead of once in the prepass + once per rasterization.
+        self._layout_cache: dict[int, tuple] = {}
+
         # Message bitmap cache state (filled by prepare_message_cache).
         self.animated_message_ids: set[int] = set()
         self.msg_images = OrderedDict()  # idx -> Image
@@ -257,28 +275,71 @@ class FrameRenderer:
         return self.emote_imgs[cls]["width"]
 
     def text_width(self, s):
+        # P-5 memo: same string -> same width for a fixed font instance; skips
+        # the per-character getbbox storm in split_text_for_wrap.
+        cached = self._width_cache.get(s)
+        if cached is not None:
+            return cached
         bb = self.font.getbbox(s)
-        return bb[2] - bb[0]
+        w = bb[2] - bb[0]
+        self._width_cache[s] = w
+        return w
 
     # --- line measurement (verbatim prepass) ---
 
+    def _layout_for_message(self, msg, *, truncate_with_ellipsis):
+        """P-5: shared layout entry for static messages.
+
+        layout_message_lines is deterministic for a given message under this
+        renderer's immutable layout settings, and the prepass lines are a
+        prefix-superset of the truncated render lines (truncation only drops
+        tail lines and appends the ellipsis). Caching keyed by message object
+        identity lets calc_msg_lines and render_message share one layout pass
+        per static message. Animated messages (message_age-dependent emote
+        frame selection) do not vary in *layout* either, but their render path
+        is deliberately kept uncached — bitmap rasterization stays per-frame.
+        """
+        key = id(msg)
+        cached = self._layout_cache.get(key)
+        if cached is None:
+            lines, header, num_lines = layout_message_lines(
+                msg,
+                max_w=self.max_w,
+                font=self.font,
+                font_bold=self.font_bold,
+                text_width_fn=self.text_width,
+                emote_width_fn=self.emote_width,
+                emote_available_fn=lambda cls: cls in self.emote_imgs,
+                max_message_lines=self.max_message_lines,
+                truncate_with_ellipsis=False,
+                padding=self.padding,
+                badge_size=self.badge_size,
+                gap=self.gap,
+                indent=self.indent,
+            )
+            cached = (lines, header, num_lines)
+            self._layout_cache[key] = cached
+        lines, header, num_lines = cached
+        if truncate_with_ellipsis:
+            # Derive the truncated render view from the cached untruncated
+            # layout so ellipsis semantics stay in exactly one place.
+            lines = truncate_wrapped_lines_with_ellipsis(
+                lines,
+                max_message_lines=self.max_message_lines,
+                max_w=self.max_w,
+                padding=self.padding,
+                indent=self.indent,
+                gap=self.gap,
+                text_width_fn=self.text_width,
+            )
+            if not lines:
+                lines = [[]]
+            num_lines = len(lines)
+        return lines, header, num_lines
+
     def calc_msg_lines(self, msg):
         """计算消息需要多少行（与 render_message 共用 layout_message_lines）。"""
-        _lines, _header, num_lines = layout_message_lines(
-            msg,
-            max_w=self.max_w,
-            font=self.font,
-            font_bold=self.font_bold,
-            text_width_fn=self.text_width,
-            emote_width_fn=self.emote_width,
-            emote_available_fn=lambda cls: cls in self.emote_imgs,
-            max_message_lines=self.max_message_lines,
-            truncate_with_ellipsis=False,
-            padding=self.padding,
-            badge_size=self.badge_size,
-            gap=self.gap,
-            indent=self.indent,
-        )
+        _lines, _header, num_lines = self._layout_for_message(msg, truncate_with_ellipsis=False)
         return num_lines
 
     def measure_message_lines(self, messages, duration):
@@ -307,23 +368,8 @@ class FrameRenderer:
         padding = self.padding
         badge_size = self.badge_size
         gap = self.gap
-        indent = self.indent
 
-        lines, header, num_lines = layout_message_lines(
-            msg,
-            max_w=MAX_W,
-            font=font,
-            font_bold=font_bold,
-            text_width_fn=self.text_width,
-            emote_width_fn=self.emote_width,
-            emote_available_fn=lambda cls: cls in self.emote_imgs,
-            max_message_lines=self.max_message_lines,
-            truncate_with_ellipsis=True,
-            padding=padding,
-            badge_size=badge_size,
-            gap=gap,
-            indent=indent,
-        )
+        lines, header, num_lines = self._layout_for_message(msg, truncate_with_ellipsis=True)
         author = header["author"]
         author_w = header["author_w"]
         colon_w = header["colon_w"]
@@ -365,7 +411,7 @@ class FrameRenderer:
         # --- 绘制续行 ---
         for line_idx in range(1, num_lines):
             y = line_idx * LINE_H
-            x = padding + indent
+            x = padding + self.indent
             for fi in lines[line_idx]:
                 if fi[0] == "text":
                     draw.text((x + 1, y + 1), fi[1], fill=(0, 0, 0, 200), font=font)
@@ -636,6 +682,10 @@ def render_overlay(chat_data, out_dir, video_path, config):
         "filled": 0,
     }
     written_indexes: list[int] = []
+    # P-6: parallel set for O(1) coverage counting at the progress print.
+    # written_indexes itself stays (list semantics preserved for
+    # expand_frame_sequence_for_ffmpeg, which de-duplicates internally).
+    written_index_set: set[int] = set()
     last_static_key = None
     last_static_frame_idx = None
     lane_visibility = None if stack_mode == "float" else _LaneVisibilityCursor(msg_schedule)
@@ -716,6 +766,7 @@ def render_overlay(chat_data, out_dir, video_path, config):
                 stats[action] = stats.get(action, 0) + 1
                 stats["reused_static"] += 1
                 written_indexes.append(out_frame_num)
+                written_index_set.add(out_frame_num)
                 frame_num += 1
                 continue
 
@@ -738,6 +789,7 @@ def render_overlay(chat_data, out_dir, video_path, config):
                 # Keep a dummy non-None marker so subsequent frames in this segment reuse.
                 segment_template = True
                 written_indexes.append(out_frame_num)
+                written_index_set.add(out_frame_num)
                 frame_num += 1
                 continue
 
@@ -754,6 +806,7 @@ def render_overlay(chat_data, out_dir, video_path, config):
             stats[action] = stats.get(action, 0) + 1
             stats["composited"] += 1
             written_indexes.append(out_frame_num)
+            written_index_set.add(out_frame_num)
             frame_num += 1
 
             if static_key is not None:
@@ -769,7 +822,7 @@ def render_overlay(chat_data, out_dir, video_path, config):
         now = time.time()
         if (cp_idx + 1) % 10 == 0 or cp_idx == len(change_points) - 1 or now - last_progress_time >= 5:
             # Progress against timeline coverage, not sparse write count.
-            covered = len(set(written_indexes))
+            covered = len(written_index_set)
             pct = (covered / total_frames * 100) if total_frames > 0 else 100
             elapsed = now - render_start_time
             if covered > 0 and covered < total_frames:
