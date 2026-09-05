@@ -25,7 +25,7 @@ EVENT_DIRECTORY = Path("outputs") / ".tui-events"
 _BASE_URL_VALUE = re.compile(
     r"(?im)([^\r\n]*(?:(?:OPENAI_COMPAT|AGNES)_BASE_URL|翻译 Base URL|Translation Base URL)\s*[:=]\s*)[^\r\n]*"
 )
-_URL_USERINFO = re.compile(r"(?i)(https?://)[^\s/@]+@")
+_URL_USERINFO = re.compile(r"(?i)(https?://)[^\s/@]*[^\s/@]@[^\s/]*/?")
 _AUTHORIZATION_SECRET = re.compile(
     r"(?i)(authorization\s*[:=]\s*(?:bearer|oauth|basic)\s+)[^\s,;]+"
 )
@@ -34,7 +34,7 @@ _AUTHORIZATION_SECRET = re.compile(
 # ``authorization: <value>`` form.
 _NAMED_SECRET = re.compile(
     r"(?i)((?:api[_ -]?key|token|password|oauth|authorization|(?:client[_ -]?)?secret)\s*[:=]\s*)"
-    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;&]+)"
 )
 _JSON_SECRET = re.compile(
     r"(?i)(\"(?:api[_ -]?key|token|password|oauth|(?:client[_ -]?)?secret)\"\s*:\s*)"
@@ -52,7 +52,7 @@ _ENVIRONMENT_VARIABLE = re.compile(
 def redact_text(value: str) -> str:
     """Remove common secret-shaped log fragments before they reach UI/export."""
     value = _BASE_URL_VALUE.sub(r"\1[redacted]", value)
-    value = _URL_USERINFO.sub(r"\1[redacted]@", value)
+    value = _URL_USERINFO.sub(r"\1[redacted]/", value)
     value = _OAUTH_ARGUMENT.sub(r"\1[redacted]", value)
     value = _AUTHORIZATION_SECRET.sub(r"\1[redacted]", value)
     value = _JSON_SECRET.sub(r"\1\"[redacted]\"", value)

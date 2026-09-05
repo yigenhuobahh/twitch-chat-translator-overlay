@@ -11,6 +11,12 @@ from typing import Any
 # 保证恰好落在预览时刻的消息仍可见。
 _PREVIEW_WINDOW_SLACK_S = 0.05
 
+# 预览模式成片时长（秒）：预览模式下未显式给 --preview-clip/--preview-frame 时
+# 回退到此值。与 job_wizard._PREVIEW_CLIP_SECONDS 同源（job_wizard 侧写入
+# job.yaml 的 preview_clip 与转发 "--preview-clip 10" 都取同一常量；勿只改一处）。
+# 上波 8b3da86 预览常量化（_PREVIEW_WINDOW_SLACK_S / _PREVIEW_MODES）的延续。
+_PREVIEW_CLIP_SECONDS = 10.0
+
 
 def compute_time_offset(
     messages: list[dict],
@@ -140,7 +146,7 @@ def apply_preview_first_defaults(
         return applied
 
     if getattr(args, "preview_clip", None) is None and getattr(args, "preview_frame", None) is None:
-        args.preview_clip = 10.0
+        args.preview_clip = _PREVIEW_CLIP_SECONDS
         applied.append("preview_clip")
 
     defaults = dict(cli_defaults or {})

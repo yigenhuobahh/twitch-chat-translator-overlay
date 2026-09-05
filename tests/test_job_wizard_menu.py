@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import builtins
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -873,26 +874,55 @@ def test_run_offline_demo_launches_quick_demo_subprocess(monkeypatch):
 
     seen: dict[str, object] = {}
 
-    def fake_run(cmd, **kwargs):
+    def fake_run_tracked(cmd, **kwargs):
         seen["cmd"] = cmd
+        seen["kwargs"] = kwargs
         return SimpleNamespace(returncode=4)
 
-    monkeypatch.setattr(wizard.subprocess, "run", fake_run)
+    # job_wizard 以 from-import 绑定 run_tracked，须 patch wizard 命名空间里的引用。
+    monkeypatch.setattr(wizard, "run_tracked", fake_run_tracked)
 
     assert wizard._run_offline_demo() == 4
     assert seen["cmd"][1].endswith("quick_demo.py")
+    # check=False 语义保持（离线演示失败不抛 CalledProcessError）。
+    assert seen["kwargs"].get("check") is False
 
 
 def test_run_pipeline_reports_launch_failure(monkeypatch, capsys):
     import job_wizard as wizard
 
-    def raise_os(cmd):
+    def raise_os(cmd, **_kwargs):
         raise OSError("spawn blocked")
 
-    monkeypatch.setattr(wizard.subprocess, "run", raise_os)
+    # job_wizard 以 from-import 绑定 run_tracked，须 patch wizard 命名空间里的引用。
+    monkeypatch.setattr(wizard, "run_tracked", raise_os)
 
     assert wizard._run_pipeline("--doctor") == 1
     assert "[FAIL]" in capsys.readouterr().out
+
+
+def test_run_pipeline_success_path_calls_run_tracked_with_argv(monkeypatch, capsys):
+    """成功路径：run_tracked 收到完整 argv，returncode 透传，仍先回显 $ 命令。"""
+    import job_wizard as wizard
+
+    seen: dict[str, object] = {}
+
+    def fake_run_tracked(cmd, **kwargs):
+        seen["cmd"] = [str(c) for c in cmd]
+        seen["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(wizard, "run_tracked", fake_run_tracked)
+
+    assert wizard._run_pipeline("--doctor") == 0
+    cmd = seen["cmd"]
+    assert cmd[0] == sys.executable
+    assert cmd[1].endswith("render_cn_chat.py")
+    assert cmd[2:] == ["--doctor"]
+    # stdout/stderr 直通终端（不捕获），与旧 subprocess.run 行为一致。
+    assert seen["kwargs"].get("stdout") is None
+    assert seen["kwargs"].get("stderr") is None
+    assert "$ " in capsys.readouterr().out
 
 
 def _download_answers(next_step: str) -> list[str]:

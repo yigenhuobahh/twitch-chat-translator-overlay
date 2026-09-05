@@ -226,8 +226,9 @@ def test_event_format_and_redaction_are_safe():
 
     # 单段 userinfo（只有用户名没有密码）也必须剥掉。
     bare_userinfo = redact_text("request to https://token@host.example/v1 failed")
-    assert "[redacted]@" in bare_userinfo
+    assert "[redacted]" in bare_userinfo
     assert "token@" not in bare_userinfo
+    assert "token" not in bare_userinfo.split("failed")[0]
 
     # 密钥后缀白名单之外的普通环境变量名不再被整体脱敏；
     # 但只要值里带 Base URL，值本身必须被 _BASE_URL_VALUE 规则剥掉。
@@ -236,6 +237,32 @@ def test_event_format_and_redaction_are_safe():
     with_value = redact_text("AGNES_BASE_URL=https://alice:url-password@example.invalid/v1")
     assert "AGNES_BASE_URL" in with_value
     assert "url-password" not in with_value and "alice" not in with_value
+
+
+def test_redact_text_covers_user_pass_userinfo_and_oauth_value_shapes():
+    """S-6 缺口回归：user:pass@、多段 @ 的 userinfo 与 oauth= 值形态都要脱敏。"""
+    # user:pass 形态（含冒号）的 userinfo 整段剥掉（host 与路径保留）。
+    user_pass = redact_text("https://user:pass@host/")
+    assert "user" not in user_pass and "pass" not in user_pass
+    assert user_pass == "https://[redacted]/"
+    # userinfo 里出现多个 @：从 https?:// 起整段剥到路径前，不留中间残段。
+    chained = redact_text("https://u:p@x:tok@host/")
+    assert "tok" not in chained and "u:p" not in chained
+    assert chained == "https://[redacted]/"
+    # query 里 oauth= 值：_NAMED_SECRET 命中（oauth 出现在中段同样剥值）。
+    query = redact_text("url https://host/?token=abc&oauth=def&x=1")
+    assert "def" not in query
+    assert "oauth=[redacted]" in query
+    # --oauth= 引参数形态（对齐 process_util._SECRET_ARGUMENT_FLAGS 语义）。
+    arg = redact_text("pass '--oauth=abc def'")
+    assert "abc" not in arg
+    # 引号包裹形态也剥值。
+    quoted = redact_text('failed: oauth="abc";retry')
+    assert "abc" not in quoted
+    # 不误伤：普通词/库名 oauth2、裸 "oauth" 一词、无 URL 前缀的邮箱保持原样。
+    assert redact_text("oauth2 library") == "oauth2 library"
+    assert redact_text("oauth is a protocol") == "oauth is a protocol"
+    assert redact_text("contact me at bob@example.com") == "contact me at bob@example.com"
 
 
 def test_sanitize_download_source_strips_url_credentials():

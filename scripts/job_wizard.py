@@ -32,8 +32,15 @@ from job_config import (
     summarize_job,
     write_job_file,
 )
+from process_util import run_tracked
+from tui_task import redact_text
 
 _VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"}
+# 预览模式成片时长（秒）：与 CLI --preview-clip 的预览默认值一致（cli_spec 中
+# --preview-clip 本身 default=None，由预览模式回退到此值）。预览用途的任务写进
+# job.yaml 的 preview_clip、拖放/下载后续转发的 "--preview-clip" 参数都取自这里。
+# chat_window._PREVIEW_CLIP_SECONDS 与本常量同源（勿只改一处）。
+_PREVIEW_CLIP_SECONDS = 10.0
 
 
 def run_drag_drop(arguments: list[str]) -> int:
@@ -251,7 +258,9 @@ def _run_pipeline(*args: str) -> int:
     cmd = _pipeline_cmd(*args)
     print("\n$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd))
     try:
-        p = subprocess.run(cmd)
+        # run_tracked 把子进程注册进 process_util._active：wizard 是交互长驻进程，
+        # 用户 Ctrl+C / 退出时管线子进程会被 kill_active_processes 一并清理。
+        p = run_tracked(cmd, stdout=None, stderr=None)
         return int(p.returncode)
     except OSError as e:
         print(f"[FAIL] 无法启动: {e}")
@@ -1063,7 +1072,7 @@ def run_job_wizard(
                 elif tj == "__preview__":
                     fields["mode"] = "preview"
                     fields["render_original"] = True
-                    fields["preview_clip"] = 10
+                    fields["preview_clip"] = int(_PREVIEW_CLIP_SECONDS)
                     fields.pop("reuse_translation", None)
                 else:
                     tj_pinned = tj
@@ -1071,7 +1080,7 @@ def run_job_wizard(
         else:
             fields["mode"] = "preview"
             fields["render_original"] = True
-            fields["preview_clip"] = 10
+            fields["preview_clip"] = int(_PREVIEW_CLIP_SECONDS)
 
         if layout:
             fields["layout_preset"] = layout
@@ -1176,7 +1185,8 @@ def _prompt_multi_segments() -> list[tuple[str, str]]:
         try:
             seg = parse_segment_line(line)
         except TwitchDownloadError as e:
-            print(f"  [FAIL] {e}")
+            # 错误文本可能携带 URL/query 凭据（oauth 等），进终端前先脱敏。
+            print(f"  [FAIL] {redact_text(str(e))}")
             continue
         if seg is None:
             break
@@ -1309,7 +1319,8 @@ def _menu_download_and_continue() -> int:
         # EOFError 沿用本函数既有的"已取消"处理分支。
         oauth = _prompt_secret().strip() or None
     except TwitchDownloadError as e:
-        print(f"[FAIL] {e}")
+        # 异常文本可能含 URL/PATH 上下文中的凭据（oauth 等），打印前先脱敏。
+        print(f"[FAIL] {redact_text(str(e))}")
         return 2
     except EOFError:
         print("已取消")
@@ -1345,7 +1356,8 @@ def _menu_download_and_continue() -> int:
                 media_repair=media_repair,
             )
     except TwitchDownloadError as e:
-        print(f"[FAIL] {e}")
+        # provider 错误文本可能回显带凭据的 URL（oauth query 等），先脱敏再打印。
+        print(f"[FAIL] {redact_text(str(e))}")
         return 2
     except Exception as e:
         print(f"[FAIL] 下载异常: {e}")
@@ -1528,7 +1540,8 @@ def _run_tools_menu(root: Path) -> None:
 
 def _run_offline_demo() -> int:
     script = Path(__file__).with_name("quick_demo.py")
-    return subprocess.run([sys.executable, str(script)], check=False).returncode
+    # 与 _run_pipeline 同理由 run_tracked 跟踪，保证菜单退出时示例子进程被清理。
+    return int(run_tracked([sys.executable, str(script)], stdout=None, stderr=None, check=False).returncode)
 
 
 def run_menu() -> int:
