@@ -626,6 +626,13 @@ def test_textual_task_mode_selector_routes_all_supported_tui_modes(monkeypatch):
             mode_select = app.query_one("#task-mode", Select)
             mode_select.value = MODE_TRANSLATE_ONLY
             await pilot.click("#run-mode")
+            # pilot.click 只保证消息入队,慢 CI 上 Button.Pressed 的处理可能
+            # 晚于下面的直接调用;轮询直到第一次路由落账,再切换模式,保证
+            # 两次调用顺序确定。
+            for _ in range(200):
+                if calls:
+                    break
+                await pilot.pause(0.02)
             mode_select.value = "render_original"
             app._start_selected_mode()
 
