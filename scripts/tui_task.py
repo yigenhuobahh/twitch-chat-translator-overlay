@@ -9,12 +9,14 @@ import json
 import os
 from pathlib import Path
 import queue
-import re
 import shutil
 import subprocess
 import tempfile
 import threading
+import time
 
+from common_utils import atomic_replace_with_retry
+import process_util as _process_util
 from process_util import (  # noqa: F401  (redact_command re-exported; single source in process_util)
     kill_process_tree,
     redact_command,
@@ -22,42 +24,33 @@ from process_util import (  # noqa: F401  (redact_command re-exported; single so
 from task_results import read_task_result
 
 EVENT_DIRECTORY = Path("outputs") / ".tui-events"
-_BASE_URL_VALUE = re.compile(
-    r"(?im)([^\r\n]*(?:(?:OPENAI_COMPAT|AGNES)_BASE_URL|翻译 Base URL|Translation Base URL)\s*[:=]\s*)[^\r\n]*"
-)
-_URL_USERINFO = re.compile(r"(?i)(https?://)[^\s/@]*[^\s/@]@[^\s/]*/?")
-_AUTHORIZATION_SECRET = re.compile(
-    r"(?i)(authorization\s*[:=]\s*(?:bearer|oauth|basic)\s+)[^\s,;]+"
-)
-# ``authorization`` is handled after _AUTHORIZATION_SECRET so scheme-prefixed
-# values keep their dedicated rule; the named-secret rule catches the bare
-# ``authorization: <value>`` form.
-_NAMED_SECRET = re.compile(
-    r"(?i)((?:api[_ -]?key|token|password|oauth|authorization|(?:client[_ -]?)?secret)\s*[:=]\s*)"
-    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;&]+)"
-)
-_JSON_SECRET = re.compile(
-    r"(?i)(\"(?:api[_ -]?key|token|password|oauth|(?:client[_ -]?)?secret)\"\s*:\s*)"
-    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)"
-)
-_OAUTH_ARGUMENT = re.compile(r"(?i)(--oauth(?:\s+|=))(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)")
-# 只脱敏密钥形态的变量名（后缀白名单）；BASE_URL 等普通名称交给值侧规则，
-# 避免“抹名不抹值”式过度脱敏。
-_ENVIRONMENT_VARIABLE = re.compile(
-    r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_(?:KEY|TOKEN|SECRET|PASSWORD)\b"
-)
-# 现由 process_util.redact_command / _SECRET_ARGUMENT_FLAGS 单源维护。
+_RESIDUE_MAX_AGE_SEC = _process_util._RESIDUE_MAX_AGE_SEC
 
 
-def redact_text(value: str) -> str:
-    """Remove common secret-shaped log fragments before they reach UI/export."""
-    value = _BASE_URL_VALUE.sub(r"\1[redacted]", value)
-    value = _URL_USERINFO.sub(r"\1[redacted]/", value)
-    value = _OAUTH_ARGUMENT.sub(r"\1[redacted]", value)
-    value = _AUTHORIZATION_SECRET.sub(r"\1[redacted]", value)
-    value = _JSON_SECRET.sub(r"\1\"[redacted]\"", value)
-    value = _NAMED_SECRET.sub(r"\1[redacted]", value)
-    return _ENVIRONMENT_VARIABLE.sub("[environment variable]", value)
+def _sweep_stale_event_files(directory: Path) -> None:
+    """Claim task event/result files left by a hard-killed TUI session.
+
+    Ctrl+C 硬杀路径跳过 finally，task_*.jsonl / task_*.result.json 会残留；
+    只删超过阈值的老文件（新文件可能属于正在运行的会话），best-effort。
+    """
+    try:
+        for entry in directory.iterdir():
+            try:
+                if (
+                    entry.is_file()
+                    and entry.name.startswith("task_")
+                    and entry.suffix in {".jsonl", ".json"}
+                    and time.time() - entry.stat().st_mtime > _RESIDUE_MAX_AGE_SEC
+                ):
+                    entry.unlink()
+            except OSError:
+                continue
+    except OSError:
+        pass
+# redact_text + regex table 单源在 process_util（紧邻 redact_command）；此处
+# re-export 供 tui_run/tui_history/job_wizard/support_report/download_flow/
+# render_cn_chat 及测试继续 `tui_task.redact_text` 使用。
+from process_util import redact_text  # noqa: E402,F401
 
 
 def _diagnostic_line(value: str) -> str:
@@ -143,6 +136,7 @@ class TaskSession:
             raise RuntimeError("A task is already running")
         directory = (Path(self.cwd) if self.cwd else Path.cwd()) / EVENT_DIRECTORY
         directory.mkdir(parents=True, exist_ok=True)
+        _sweep_stale_event_files(directory)
         with tempfile.NamedTemporaryFile(prefix="task_", suffix=".jsonl", dir=directory, delete=False) as handle:
             self.event_path = Path(handle.name)
         with tempfile.NamedTemporaryFile(prefix="task_", suffix=".result.json", dir=directory, delete=False) as handle:
@@ -277,9 +271,13 @@ class TaskSession:
             # History can be redirected to another drive in tests or by a
             # portable install.  Copy-then-replace remains atomic at target.
             # 唯一临时名：固定 ".tmp" 兄弟名在两个会话并发 retain 同一目标时互踩。
+            # replace 走 common_utils.atomic_replace_with_retry（规范 helper，
+            # 替代 run_meta._replace_with_retry 样板）：另一 TUI 实例恰在读
+            # 目标 manifest 时的瞬时 PermissionError 退避重试，重试耗尽仍失败
+            # 才按原语义吞掉返回 None。
             temporary = _unique_sibling_temp(target)
             shutil.copyfile(self.result_path, temporary)
-            os.replace(temporary, target)
+            atomic_replace_with_retry(temporary, target)
             self.result_path.unlink(missing_ok=True)
         except OSError:
             return None

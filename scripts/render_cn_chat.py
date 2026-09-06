@@ -100,6 +100,7 @@ from review_tables import (  # noqa: F401 - re-exported for tests/CLI compatibil
     load_yaml_rules,
     publish_output,
 )
+from tui_task import redact_text
 
 # C-O8：非空译文计数单源在 translation_io.py，经 twitch_chat_burn 门面
 # re-export 引入；render_cn_chat 不再保留 _translation_nonempty_count 本地副本。
@@ -620,6 +621,9 @@ def ensure_translate_api_or_fallback(
             log(f"[翻译 API] {msg}")
             return "api"
 
+        # 服务端错误文本可能回显请求头/URL 凭据（与 tui_run 的 API 探测同一
+        # 规则）；在 CLI 收口处统一脱敏，print 与 fallback reason 共用同一条。
+        msg = redact_text(msg)
         print(f"\n[!] 翻译 API 不可用: {msg}", flush=True)
         print("  可检查 .env 中 OPENAI_COMPAT_BASE_URL / MODEL / API_KEY，以及网络。", flush=True)
 

@@ -16,6 +16,7 @@ import sys
 
 from pipeline_runner import active_runner
 from process_util import is_dangerous_publish_path
+from tui_task import redact_text
 
 
 def _parse_cli_segments(raw_segments) -> list[tuple[str, str]]:
@@ -127,11 +128,13 @@ def run_download_flow(args, *, runner=None, emit, next_steps) -> int:
             )
     except TwitchDownloadError as e:
         emit("stage_failed", stage="download", completed=0, total=1)
-        print(f"错误: {e}", file=sys.stderr)
+        # 异常文本可能回显含凭据的源 URL（userinfo@/?oauth=），与 job_wizard
+        # 的 [FAIL] 分支同规则脱敏后再进 stderr。
+        print(f"错误: {redact_text(str(e))}", file=sys.stderr)
         return 2
     except Exception as e:
         emit("stage_failed", stage="download", completed=0, total=1)
-        print(f"错误: 下载失败: {e}", file=sys.stderr)
+        print(f"错误: 下载失败: {redact_text(str(e))}", file=sys.stderr)
         return 1
     task_runner = runner or active_runner()
     if task_runner is not None:

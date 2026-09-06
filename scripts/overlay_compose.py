@@ -367,7 +367,11 @@ def compose_video(video_path, frames_dir, out_dir, config, duration):
     partial_path = os.path.join(out_dir, Path(video_path).stem + "_chat.partial.mp4")
     try:
         os.remove(partial_path)
-    except FileNotFoundError:
+    except OSError:
+        # FileNotFoundError: 无残留。PermissionError: 旧 partial 被其他进程
+        # 占用（播放器/杀毒/上次崩溃未关闭）——此时 ffmpeg -y 也写不进去，
+        # 交给下方合成失败分支统一报告，compose_video 保持“失败返回 None”
+        # 契约，绝不向调用方抛异常。
         pass
     # 源文件可能用时间戳表达“音频先开始、视频稍后进入”。VLC 会遵守，
     # 但部分剪辑软件会忽略该非零 start_time。把这段差显式编码为首帧冻结，
@@ -515,7 +519,7 @@ def compose_video(video_path, frames_dir, out_dir, config, duration):
     if r.returncode != 0:
         try:
             tail = Path(log_path).read_text(encoding="utf-8", errors="replace")[-1200:]
-        except OSError:
+        except FileNotFoundError:
             tail = "日志不可读取"
         print(f"  视频合成错误；完整日志: {log_path}\n{tail}", flush=True)
         # If hardware encoder failed under auto/nvenc/qsv/amf, surface a clear hint.

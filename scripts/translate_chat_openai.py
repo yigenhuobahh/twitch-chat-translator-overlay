@@ -43,6 +43,7 @@ except ImportError:
     OpenAI = None  # type: ignore
 
 from common_utils import (
+    atomic_replace_with_retry,
     ensure_utf8_stdio,
     load_dotenv_if_present,
     positive_float_arg,
@@ -128,7 +129,9 @@ def save_json(path, data):
     try:
         with open(tmp, "w", encoding="utf-8") as file:
             json.dump(data, file, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
+        # 读方（预览/复核窗口）可能正持有目标文件句柄：Windows 上 MoveFileEx
+        # 会瞬时 PermissionError，交给共享 helper 退避重试（concurrency-1）。
+        atomic_replace_with_retry(tmp, path)
     finally:
         try:
             tmp.unlink(missing_ok=True)

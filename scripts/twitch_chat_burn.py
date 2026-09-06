@@ -52,6 +52,7 @@ from chat_window import (
     trim_float_carry_in_messages,
 )
 from common_utils import (
+    atomic_replace_with_retry,
     current_cli_invocation,
     ensure_utf8_stdio,
     positive_float_arg,
@@ -81,6 +82,7 @@ from encode_options import (
     resolve_encode_options,
     summarize_encode_options,
 )
+import job_config
 from layout_preset import apply_layout_preset_to_namespace, load_layout_preset
 import media_probe
 from overlay_config import OverlayConfig
@@ -133,7 +135,6 @@ probe_video_dimensions = media_probe.probe_video_dimensions
 probe_video_duration = media_probe.probe_video_duration
 probe_video_fps = media_probe.probe_video_fps
 probe_media_summary = media_probe.probe_media_summary
-_quantize_fps = media_probe._quantize_fps
 fps_to_ffmpeg_rate = media_probe.fps_to_ffmpeg_rate
 resolve_output_fps = media_probe.resolve_output_fps
 
@@ -343,33 +344,18 @@ def adapt_absolute_layout_to_source(config, video_path) -> str | None:
 def parse_output_fps_arg(text: str) -> float:
     """argparse type for --output-fps: decimal ("29.97") or exact rational ("30000/1001").
 
-    Rationals are normalized to float for the config contract; the NTSC family
+    Thin wrapper over media_probe.parse_rational_fps_text (C1 单源化): the
+    value always normalizes to float for the config contract; the NTSC family
     snaps back to the exact rate in _quantize_fps, so fps_to_ffmpeg_rate still
     emits "30000/1001" for -r instead of a drifting 29.97 decimal.
     """
-    s = str(text).strip()
-    if "/" in s:
-        num_s, _, den_s = s.partition("/")
-        try:
-            num = float(num_s.strip())
-            den = float(den_s.strip())
-        except ValueError:
-            raise argparse.ArgumentTypeError(
-                f"invalid rational fps value: {text!r} (expected N/M, e.g. 30000/1001)"
-            ) from None
-        if not (math.isfinite(num) and math.isfinite(den)) or den == 0:
-            raise argparse.ArgumentTypeError(f"invalid rational fps value: {text!r}")
-        fps = num / den
-        if not math.isfinite(fps):
-            raise argparse.ArgumentTypeError(f"fps out of range: {text!r}")
-        return fps
     try:
-        parsed = float(s)
-    except (TypeError, ValueError) as exc:
-        raise argparse.ArgumentTypeError(f"invalid float value: {text!r}") from exc
-    if not math.isfinite(parsed):
-        raise argparse.ArgumentTypeError("must be finite")
-    return parsed
+        _, fps_value = media_probe.parse_rational_fps_text(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    if fps_value <= 0:
+        raise argparse.ArgumentTypeError(f"fps must be positive: {text!r}")
+    return fps_value
 
 
 def layout_bounds_warnings(config, video_path) -> list[str]:
@@ -434,38 +420,181 @@ def _validate_offset(value) -> float:
     return offset
 
 
+def _publish_promotable_locked(src_path: str, *, out_dir: str, out_base: str, args) -> str | None:
+    """Copy a job-dir artifact to out_base with temp+replace and .bak restore.
+
+    D3: lifted verbatim from the former _main closure `_promote_to_out_base_locked`
+    (captured out_dir / out_base / args became parameters). Concurrent runs
+    sharing the same out_base each have a unique job_ dir. If the basenames
+    would collide (e.g. both promote video_chat.mp4), derive a job-unique name
+    so the last writer does not silently overwrite the other.
+    """
+    if not src_path or not os.path.isfile(src_path):
+        return None
+    if os.path.abspath(out_dir) == os.path.abspath(out_base):
+        return src_path
+    base_name = os.path.basename(src_path)
+    promoted = os.path.join(out_base, base_name)
+    # 另一并发任务可能占用了同名默认输出。默认名被占且 alt（job 唯一名）
+    # 空闲时才改用 alt 名；alt 也被占用时沿用默认名，走下方 .bak 备份流程。
+    if os.path.isfile(promoted):
+        job_tag = os.path.basename(os.path.abspath(out_dir))
+        if job_tag.startswith("job_") or job_tag.startswith("batch_"):
+            stem, ext = os.path.splitext(base_name)
+            alt = os.path.join(out_base, f"{stem}__{job_tag}{ext}")
+            if not os.path.isfile(alt):
+                print(
+                    f"  [concurrent] 输出目录已有 {base_name}，改用唯一名: {os.path.basename(alt)}",
+                    flush=True,
+                )
+                promoted = alt
+    backup = None
+    backup_created = False
+    # Back up existing output before overwriting (default behavior).
+    if not getattr(args, "no_backup_prev", False) and os.path.isfile(promoted):
+        backup = promoted + ".bak"
+        try:
+            if os.path.isfile(backup):
+                os.remove(backup)
+            os.rename(promoted, backup)
+            backup_created = True
+            print(f"  [backup] {backup}", flush=True)
+        except OSError as e:
+            print(f"  warning: cannot backup {promoted}: {e}", flush=True)
+            backup = None
+            backup_created = False
+    partial_promoted = promoted + ".partial"
+    try:
+        try:
+            os.remove(partial_promoted)
+        except OSError:
+            pass  # FileNotFoundError 常态；PermissionError（残留 partial 被占用）等一并放行，
+            # 由下方发布尝试经 OSError 警告路径报告真实原因。
+        shutil.copy2(src_path, partial_promoted)
+        # 同 overlay_compose.py 的发布点：读方占用目标时 MoveFileEx 会瞬时
+        # PermissionError，交给共享 helper 退避重试（concurrency-2）。
+        atomic_replace_with_retry(partial_promoted, promoted)
+        print(f"  已发布到输出目录: {promoted}", flush=True)
+        return promoted
+    except OSError as e:
+        print(f"  警告: 无法发布到 {promoted}: {e}; 保留 job 内文件: {src_path}", flush=True)
+        if backup_created and backup and os.path.isfile(backup) and not os.path.isfile(promoted):
+            try:
+                os.rename(backup, promoted)
+                print(f"  已从备份恢复: {promoted}", flush=True)
+            except OSError as restore_err:
+                print(f"  警告: 无法从备份恢复 {backup}: {restore_err}", flush=True)
+        return None
+
+
+def publish_promotable(src_path: str, *, out_dir: str, out_base: str, args) -> str | None:
+    """Serialize basename selection and publication across concurrent jobs.
+
+    D3: lifted verbatim from the former _main closure `promote_to_out_base`
+    (captured out_dir / out_base / args became parameters). The unlink-policy
+    probe resolves the CURRENT module-global _should_unlink_guard at call time,
+    so drivers/tests can still patch burn._should_unlink_guard.
+    """
+    if not src_path or not os.path.isfile(src_path):
+        return None
+    if os.path.abspath(out_dir) == os.path.abspath(out_base):
+        return src_path
+    base_name = os.path.basename(src_path)
+    lock_path = os.path.join(out_base, f".{base_name}.publish.guard")
+    published = None
+    try:
+        with exclusive_file_lock(lock_path, timeout=30.0):
+            published = _publish_promotable_locked(src_path, out_dir=out_dir, out_base=out_base, args=args)
+    except OSError as exc:
+        print(f"  警告: 等待输出发布锁失败 {lock_path}: {exc}", flush=True)
+        return None
+    if published:
+        # Success path. On Windows the guard file is unlinked so out_base
+        # is not littered; failure / exception paths keep it for
+        # post-mortem. Best-effort — a concurrent waiter still holding the
+        # lock open (notably on Windows) can block the unlink; that only
+        # leaves the file behind, never breaks publishing.
+        # On POSIX the guard is intentionally kept (module-level
+        # _should_unlink_guard / _GUARD_UNLINK_ON): unlinking here invites
+        # an ABA race where waiter B still holds the old inode while a
+        # newcomer C creates a fresh guard, giving B/C distinct locks.
+        # POSIX leftovers are claimed later by --clean's
+        # `.*.publish.guard` rule — see C-12.
+        if _should_unlink_guard():
+            try:
+                os.remove(lock_path)
+            except OSError:
+                pass
+    return published
+
+
 def _validate_runtime_args(args) -> None:
-    validate_positive_int("--fps", args.fps, minimum=1, maximum=240)
-    if args.output_fps is not None:
-        validate_positive_float("--output-fps", args.output_fps, minimum=1.0, maximum=240.0)
-    validate_positive_int("--w/--width", args.width, minimum=16, maximum=7680)
-    validate_positive_int("--h/--height", args.height, minimum=16, maximum=4320)
-    validate_positive_int("--font-size", args.font_size, minimum=8, maximum=128)
-    validate_positive_int("--emote-height", args.emote_height, minimum=8, maximum=256)
-    validate_positive_int("--max-visible", args.max_visible, minimum=0, maximum=100)  # minimum=0 实为非负校验，名称沿用历史
-    validate_positive_int(
-        "--message-image-cache-size",
-        args.message_image_cache_size,
-        minimum=8,
-        maximum=100000,
+    """Final runtime validation, driven by job_config's declarative range tables.
+
+    C2 单源化: FLOAT_RANGE / INT_RANGE（字段 -> (low, high[, low_inc, high_inc])）
+    是 job 载入侧与 burn 运行时侧共用的唯一范围权威。这里按 (attr, flag 名,
+    表, 校验器种类) 逐字段迭代并调用既有的 validate_* helper——错误文案保持
+    与原手写逐条完全一致（byte-identical）。表刻意排除的条目（x/y/crf/webm_crf
+    无 burn 侧校验；workers/batch_size 不在 burn 校验）不在映射里；条件性 /
+    特殊语义（stack_mode 交叉检查、preview_clip>0、offset、bg_alpha、
+    blank_hold_seconds>0、msg_lifetime 仅 lanes）留在表循环之后的手写段。
+    """
+    # (attr, flag-label, table, kind) — kind: "int" → validate_positive_int,
+    # "float_pos" → validate_positive_float, "float_nonneg" → validate_non_negative_float.
+    _RANGE_FIELD_SPECS = (
+        # ---- INT_RANGE-driven (validate_positive_int) ----
+        ("fps", "--fps", "int", "int"),
+        ("width", "--w/--width", "int", "int"),
+        ("height", "--h/--height", "int", "int"),
+        ("font_size", "--font-size", "int", "int"),
+        ("emote_height", "--emote-height", "int", "int"),
+        ("max_visible", "--max-visible", "int", "int"),
+        ("message_image_cache_size", "--message-image-cache-size", "int", "int"),
+        ("max_message_lines", "--max-message-lines", "int", "int"),
+        ("webm_cpu_used", "--webm-cpu-used", "int", "int"),
+        # ---- FLOAT_RANGE-driven ----
+        ("output_fps", "--output-fps", "float", "float_pos"),
+        ("min_visible_seconds", "--min-visible-seconds", "float", "float_nonneg"),
+        ("arrival_interval", "--arrival-interval", "float", "float_nonneg"),
+        ("x_ratio", "--x-ratio", "float", "float_nonneg"),
+        ("y_ratio", "--y-ratio", "float", "float_nonneg"),
+        ("width_ratio", "--width-ratio", "float", "float_nonneg"),
+        ("height_ratio", "--height-ratio", "float", "float_nonneg"),
+        ("font_size_ratio", "--font-size-ratio", "float", "float_nonneg"),
+        ("preview_frame", "--preview-frame", "float", "float_nonneg"),
+        ("preview_clip", "--preview-clip", "float", "float_nonneg"),
     )
+    for attr, flag, table, kind in _RANGE_FIELD_SPECS:
+        if not hasattr(args, attr):
+            # 老调用方（测试 SimpleNamespace / 部分 stage 入口）可能不带全部
+            # 字段；与旧手写逐条行为一致——不存在的字段跳过。
+            continue
+        value = getattr(args, attr)
+        if value is None:
+            continue
+        if table == "int":
+            low, high = job_config.INT_RANGE[attr]
+            validate_positive_int(flag, value, minimum=low, maximum=high)
+        else:
+            low, high, _low_inc, _high_inc = job_config.FLOAT_RANGE[attr]
+            if kind == "float_pos":
+                # positive_float 本身要求 > 0 / >= minimum；low_inc=False 时
+                # 表语义（> low）与 helper（>= low 且 > 0）在 low>0 时一致。
+                validate_positive_float(flag, value, minimum=low, maximum=high)
+            else:
+                # 非负校验：表为 [low, high] 闭区间且 low==0 时等价于
+                # validate_non_negative_float 的 0..maximum；本组字段全部如此。
+                validate_non_negative_float(flag, value, maximum=high)
+
     stack_mode = str(getattr(args, "stack_mode", "lanes") or "lanes").strip().lower()
     if stack_mode not in ("float", "lanes"):
         raise ValueError(f"--stack-mode must be float or lanes, got {args.stack_mode!r}")
     args.stack_mode = stack_mode
     if stack_mode == "lanes":
         validate_positive_float("--msg-lifetime", args.msg_lifetime, minimum=0.1, maximum=600.0)
-    validate_positive_int("--max-message-lines", args.max_message_lines, minimum=0, maximum=100)  # minimum=0 实为非负校验，名称沿用历史
-    validate_non_negative_float("--min-visible-seconds", args.min_visible_seconds, maximum=600.0)
-    validate_non_negative_float("--arrival-interval", args.arrival_interval, maximum=600.0)
-    for ratio_arg in ("x_ratio", "y_ratio", "width_ratio", "height_ratio", "font_size_ratio"):
-        validate_non_negative_float(f"--{ratio_arg.replace('_', '-')}", getattr(args, ratio_arg), maximum=1.0)
     if stack_mode == "lanes" and args.msg_lifetime > 0 and args.min_visible_seconds > args.msg_lifetime:
         raise ValueError("--min-visible-seconds must be <= --msg-lifetime")
-    if args.preview_frame is not None:
-        validate_non_negative_float("--preview-frame", args.preview_frame, maximum=24 * 3600.0)
     if args.preview_clip is not None:
-        validate_non_negative_float("--preview-clip", args.preview_clip, maximum=24 * 3600.0)
         if float(args.preview_clip) <= 0:
             raise ValueError("--preview-clip must be > 0")
     if args.offset is not None:
@@ -1255,99 +1384,17 @@ def _main(status_sink=None):
         duration = min(duration, max(0.1, float(args.preview_clip)))
 
     def _promote_to_out_base_locked(src_path: str) -> str | None:
-        """Copy a job-dir artifact to out_base with temp+replace and .bak restore.
-
-        Concurrent runs sharing the same out_base each have a unique job_ dir.
-        If the basenames would collide (e.g. both promote video_chat.mp4), derive a
-        job-unique name so the last writer does not silently overwrite the other.
-        """
-        if not src_path or not os.path.isfile(src_path):
-            return None
-        if os.path.abspath(out_dir) == os.path.abspath(out_base):
-            return src_path
-        base_name = os.path.basename(src_path)
-        promoted = os.path.join(out_base, base_name)
-        # 另一并发任务可能占用了同名默认输出。默认名被占且 alt（job 唯一名）
-        # 空闲时才改用 alt 名；alt 也被占用时沿用默认名，走下方 .bak 备份流程。
-        if os.path.isfile(promoted):
-            job_tag = os.path.basename(os.path.abspath(out_dir))
-            if job_tag.startswith("job_") or job_tag.startswith("batch_"):
-                stem, ext = os.path.splitext(base_name)
-                alt = os.path.join(out_base, f"{stem}__{job_tag}{ext}")
-                if not os.path.isfile(alt):
-                    print(
-                        f"  [concurrent] 输出目录已有 {base_name}，改用唯一名: {os.path.basename(alt)}",
-                        flush=True,
-                    )
-                    promoted = alt
-        backup = None
-        backup_created = False
-        # Back up existing output before overwriting (default behavior).
-        if not getattr(args, "no_backup_prev", False) and os.path.isfile(promoted):
-            backup = promoted + ".bak"
-            try:
-                if os.path.isfile(backup):
-                    os.remove(backup)
-                os.rename(promoted, backup)
-                backup_created = True
-                print(f"  [backup] {backup}", flush=True)
-            except OSError as e:
-                print(f"  warning: cannot backup {promoted}: {e}", flush=True)
-                backup = None
-                backup_created = False
-        partial_promoted = promoted + ".partial"
-        try:
-            try:
-                os.remove(partial_promoted)
-            except FileNotFoundError:
-                pass
-            shutil.copy2(src_path, partial_promoted)
-            os.replace(partial_promoted, promoted)
-            print(f"  已发布到输出目录: {promoted}", flush=True)
-            return promoted
-        except OSError as e:
-            print(f"  警告: 无法发布到 {promoted}: {e}; 保留 job 内文件: {src_path}", flush=True)
-            if backup_created and backup and os.path.isfile(backup) and not os.path.isfile(promoted):
-                try:
-                    os.rename(backup, promoted)
-                    print(f"  已从备份恢复: {promoted}", flush=True)
-                except OSError as restore_err:
-                    print(f"  警告: 无法从备份恢复 {backup}: {restore_err}", flush=True)
-            return None
+        """Delegate to the module-level publisher (D3 lifted closure)."""
+        return _publish_promotable_locked(src_path, out_dir=out_dir, out_base=out_base, args=args)
 
     def promote_to_out_base(src_path: str) -> str | None:
-        """Serialize basename selection and publication across concurrent jobs."""
-        if not src_path or not os.path.isfile(src_path):
-            return None
-        if os.path.abspath(out_dir) == os.path.abspath(out_base):
-            return src_path
-        base_name = os.path.basename(src_path)
-        lock_path = os.path.join(out_base, f".{base_name}.publish.guard")
-        published = None
-        try:
-            with exclusive_file_lock(lock_path, timeout=30.0):
-                published = _promote_to_out_base_locked(src_path)
-        except OSError as exc:
-            print(f"  警告: 等待输出发布锁失败 {lock_path}: {exc}", flush=True)
-            return None
-        if published:
-            # Success path. On Windows the guard file is unlinked so out_base
-            # is not littered; failure / exception paths keep it for
-            # post-mortem. Best-effort — a concurrent waiter still holding the
-            # lock open (notably on Windows) can block the unlink; that only
-            # leaves the file behind, never breaks publishing.
-            # On POSIX the guard is intentionally kept (module-level
-            # _should_unlink_guard / _GUARD_UNLINK_ON): unlinking here invites
-            # an ABA race where waiter B still holds the old inode while a
-            # newcomer C creates a fresh guard, giving B/C distinct locks.
-            # POSIX leftovers are claimed later by --clean's
-            # `.*.publish.guard` rule — see C-12.
-            if _should_unlink_guard():
-                try:
-                    os.remove(lock_path)
-                except OSError:
-                    pass
-        return published
+        """Delegate to the module-level publisher (D3 lifted closure).
+
+        _should_unlink_guard is resolved at call time via the module global so
+        tests / drivers can flip the policy (C-12 platform matrix) by patching
+        burn._should_unlink_guard.
+        """
+        return publish_promotable(src_path, out_dir=out_dir, out_base=out_base, args=args)
 
 
     if args.preview_frame is not None:
