@@ -54,8 +54,52 @@ def redact_command(command: Iterable[str]) -> list[str]:
     return safe
 
 
-# Internal alias kept so re-export shims (tui_task) can delegate explicitly.
-_redact_command_impl = redact_command
+# Free-text secret redaction: sibling of redact_command above — redact_command
+# handles argv-shaped values, redact_text handles log/exception prose. Single
+# source re-exported by tui_task (its six consumers import it from there).
+_BASE_URL_VALUE = re.compile(
+    r"(?im)([^\r\n]*(?:(?:OPENAI_COMPAT|AGNES)_BASE_URL|翻译 Base URL|Translation Base URL)\s*[:=]\s*)[^\r\n]*"
+)
+_URL_USERINFO = re.compile(r"(?i)(https?://)[^\s/@]*[^\s/@]@[^\s/]*/?")
+_AUTHORIZATION_SECRET = re.compile(
+    r"(?i)(authorization\s*[:=]\s*(?:bearer|oauth|basic)\s+)[^\s,;]+"
+)
+# ``authorization`` is handled after _AUTHORIZATION_SECRET so scheme-prefixed
+# values keep their dedicated rule; the named-secret rule catches the bare
+# ``authorization: <value>`` form.
+_NAMED_SECRET = re.compile(
+    r"(?i)((?:api[_ -]?key|token|password|oauth|authorization|(?:client[_ -]?)?secret)\s*[:=]\s*)"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;&]+)"
+)
+_JSON_SECRET = re.compile(
+    r"(?i)(\"(?:api[_ -]?key|token|password|oauth|(?:client[_ -]?)?secret)\"\s*:\s*)"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)"
+)
+# DICT-REPR 形态（Python 异常 str / 日志里常见的单引号字典）：
+# ``{'api_key': 'sk-proj-…'}`` —— JSON 规则只匹配双引号键，这里镜像其结构
+# 覆盖单引号键（security-6）。
+_DICT_REPR_SECRET = re.compile(
+    r"(?i)('(?:api[_ -]?key|token|password|oauth|(?:client[_ -]?)?secret)'\s*:\s*)"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)"
+)
+_OAUTH_ARGUMENT = re.compile(r"(?i)(--oauth(?:\s+|=))(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)")
+# 只脱敏密钥形态的变量名（后缀白名单）；BASE_URL 等普通名称交给值侧规则，
+# 避免“抹名不抹值”式过度脱敏。
+_ENVIRONMENT_VARIABLE = re.compile(
+    r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_(?:KEY|TOKEN|SECRET|PASSWORD)\b"
+)
+
+
+def redact_text(value: str) -> str:
+    """Remove common secret-shaped log fragments before they reach UI/export."""
+    value = _BASE_URL_VALUE.sub(r"\1[redacted]", value)
+    value = _URL_USERINFO.sub(r"\1[redacted]/", value)
+    value = _OAUTH_ARGUMENT.sub(r"\1[redacted]", value)
+    value = _AUTHORIZATION_SECRET.sub(r"\1[redacted]", value)
+    value = _JSON_SECRET.sub(r"\1\"[redacted]\"", value)
+    value = _DICT_REPR_SECRET.sub(r"\1'[redacted]'", value)
+    value = _NAMED_SECRET.sub(r"\1[redacted]", value)
+    return _ENVIRONMENT_VARIABLE.sub("[environment variable]", value)
 
 
 class FileLockTimeoutError(TimeoutError):
@@ -694,6 +738,51 @@ def _is_publish_guard_artifact(name: str) -> bool:
     return bool(re.fullmatch(r"\..+\.publish\.guard", name.lower()))
 
 
+# SIGKILL/Ctrl+C 硬杀（SIG_DFL re-raise）会跳过 finally，原子写者与 staging
+# 目录的唯一化隐藏残留因此永远无人认领。以下规则只认领“足够老”的残留：
+# 新文件/新目录可能属于仍在写热的 live writer，绝不删除。
+_RESIDUE_MAX_AGE_SEC = 24 * 3600
+
+# 观测到的真实 tmp 兄弟命名形态：
+#   - mkstemp 系列（run_meta/common_utils/translation_io/task_results/
+#     review_tables/job_config/tui_task）: f".{name}.{rand}.tmp"
+#   - translate_chat_openai: f".{name}.{pid}.{uuid4().hex}.tmp"
+#   - env_bootstrap.save_dotenv_api_config: f".{name}.tmp-{uuid4().hex}"
+# 中段为十六进制随机串（mkstemp 为 8 个小写 hex 字符；uuid hex 为 32 位）。
+_RESIDUE_DOT_TMP_RE = re.compile(
+    r"\..+\.[0-9a-f]{6,}\.tmp|\..+\.tmp-[0-9a-f]{6,}", re.IGNORECASE
+)
+
+# 隐藏 staging 目录残留：
+#   - make_job_dir: f".{job_/batch_}…….<mkdtemp rand>"（mkdtemp 8 字符后缀）
+#   - td_cli_install / env_bootstrap: f".{dest}.install-<rand>" /
+#     f".{dest}.ready-<uuid hex>"
+_RESIDUE_JOB_STAGING_RE = re.compile(r"^\.job_.{6,}|^\.batch_.{6,}")
+_RESIDUE_INSTALL_STAGING_RE = re.compile(
+    r"^\..+\.(?:install|ready)-[0-9a-z_.-]{4,}", re.IGNORECASE
+)
+
+
+def _is_stale_residue(name: str, path: str, *, is_dir: bool) -> bool:
+    """True if ``path`` is a dot-prefixed SIGKILL residue older than the threshold.
+
+    Age check uses the entry's own mtime; a fresh sibling may belong to a live
+    writer and is never touched. Callers still own the symlink/reparse guard.
+    """
+    try:
+        age = time.time() - os.stat(path).st_mtime
+    except OSError:
+        return False
+    if age < _RESIDUE_MAX_AGE_SEC:
+        return False
+    if is_dir:
+        return bool(
+            _RESIDUE_JOB_STAGING_RE.fullmatch(name)
+            or _RESIDUE_INSTALL_STAGING_RE.fullmatch(name)
+        )
+    return bool(_RESIDUE_DOT_TMP_RE.fullmatch(name))
+
+
 def _is_live_tool_job(path: str | Path) -> bool:
     """True if run_meta.json reports this tool job as still running.
 
@@ -769,6 +858,14 @@ def clean_temp_artifacts(
     remove_job_dirs = bool(clean_all or only_abs)
 
     def _should_remove_dir(name: str, path: str) -> bool:
+        if _is_link_or_reparse_point(path):
+            return False
+        # Hidden staging residue (make_job_dir / install): age-gated, same
+        # umbrella as the file-level partial artifacts — every clean pass
+        # claims it. The link guard above still applies so a dot-staging
+        # symlink/junction is never rmtree'd.
+        if only_abs is None and _is_stale_residue(name, path, is_dir=True):
+            return True
         if not remove_job_dirs:
             return False
         # Cheap name filter first (bulk mode); only_job_dir still needs exact path match.
@@ -797,8 +894,13 @@ def clean_temp_artifacts(
             return False
         return True
 
-    def _should_remove_file(name: str) -> bool:
+    def _should_remove_file(name: str, path: str) -> bool:
         if _is_partial_artifact(name):
+            return True
+        # SIGKILL-era unique tmp siblings of atomic writers (".{name}.{rand}.tmp"
+        # and friends): age-gated so a fresh file from a live writer survives.
+        # Same umbrella as partial artifacts — picked up by default --clean.
+        if _is_stale_residue(name, path, is_dir=False):
             return True
         # Crash-leftover publish lock files (.publish.guard) and backup copies
         # (<file>.bak) from promote paths; deletion only — restore stays manual.
@@ -839,7 +941,7 @@ def clean_temp_artifacts(
                     # Top-level estimate only (see _dir_size_bytes): "≈" marks
                     # the size as a lower bound for deep trees.
                     print(f"  [clean] {label} (≈{size / (1024 * 1024):.1f} MB)")
-            elif os.path.isfile(entry_path) and _should_remove_file(name):
+            elif os.path.isfile(entry_path) and _should_remove_file(name, entry_path):
                 size = os.path.getsize(entry_path)
                 os.remove(entry_path)
                 freed += size
