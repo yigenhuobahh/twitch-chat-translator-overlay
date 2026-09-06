@@ -15,7 +15,12 @@ from __future__ import annotations
 
 import pytest
 
-from chat_text_layout import build_message_frag_list, normalize_text
+from chat_text_layout import (
+    build_message_frag_list,
+    compute_message_header_width,
+    normalize_text,
+    sanitize_render_text,
+)
 from translation_support import clean_translation_text
 
 
@@ -41,6 +46,9 @@ def _frag_text(msg):
         ("PDI", "\u2069"),
         ("ZWSP", "\u200b"),         # zero-width
         ("ZWNJ", "\u200c"),
+        ("WJ", "\u2060"),           # word joiner (security-3)
+        ("INVISIBLE_PLUS", "\u2064"),
+        ("TAG_CHAR", "\U000e0030"),  # Tag block (security-3)
         ("BOM", "\ufeff"),
         ("NUL", "\u0000"),          # C0 controls (except \t \n \r)
         ("BEL", "\u0007"),
@@ -123,3 +131,95 @@ def test_zwj_emoji_sequence_kept():
     assert normalize_text("😀\u200d🚀") == "😀\u200d🚀"
     assert normalize_text("🎉") == "🎉"
     assert normalize_text("👍🏽") == "👍🏽"  # skin-tone modifier kept
+
+
+# --- security-3: author name + emote title placeholder paths -----------------
+#
+# Both used to bypass sanitize_render_text end-to-end: the author string was
+# stored raw by the parser and drawn verbatim (compute_message_header_width →
+# header["author"] → draw.text), and the missing-emote `[title]` placeholder
+# interpolated the raw HTML title attribute. Both are sanitized at their
+# render-side consumers now; chat_data.json content stays unchanged.
+
+_FAKE_FONT_W = 8.0
+
+
+def _tw(t):
+    return len(t) * _FAKE_FONT_W
+
+
+class _FakeBBoxFont:
+    """Minimal font double for compute_message_header_width."""
+
+    def getbbox(self, s: str):
+        return (0, 0, len(s or "") * 8, 10)
+
+
+def test_author_sanitized_in_header_width():
+    """compute_message_header_width returns a sanitized author (draw path)."""
+    header = compute_message_header_width(
+        {"author": "user\u202eevil\u202c", "badges": []},
+        padding=5,
+        badge_size=9,
+        gap=3,
+        font=_FakeBBoxFont(),
+        font_bold=_FakeBBoxFont(),
+    )
+    assert header["author"] == "userevil"
+    assert "\u202e" not in header["author"] and "\u202c" not in header["author"]
+
+
+@pytest.mark.parametrize(
+    "label,ch",
+    [
+        ("RLO", "\u202e"),
+        ("WJ", "\u2060"),
+        ("INVISIBLE_PLUS", "\u2064"),
+        ("TAG_CHAR", "\U000e0030"),
+    ],
+)
+def test_emote_title_placeholder_sanitized(label, ch):
+    """The [title] placeholder for missing emotes must not carry hostile chars."""
+    dirty = f"em{ch}ote"
+    frags = build_message_frag_list(
+        {
+            "author": "T",
+            "badges": [],
+            "fragments": [{"type": "emote", "class": "nope", "title": dirty}],
+        },
+        text_width_fn=_tw,
+        emote_width_fn=lambda c: 20.0,
+        emote_available_fn=lambda c: False,  # force the [title] placeholder
+    )
+    placeholders = [f[1] for f in frags if f[0] == "text"]
+    assert placeholders == ["[emote]"], f"{label}: {placeholders!r}"
+    assert ch not in "".join(placeholders)
+
+
+def test_author_and_title_stay_raw_in_msg_dict():
+    """Sanitization happens at render consumers: the message dict itself is
+    not mutated (chat_data.json content must remain unchanged)."""
+    msg = {
+        "author": "user\u202eevil",
+        "badges": [],
+        "fragments": [{"type": "emote", "class": "nope", "title": "em\u202eote\u2060x"}],
+    }
+    build_message_frag_list(
+        msg,
+        text_width_fn=_tw,
+        emote_width_fn=lambda c: 20.0,
+        emote_available_fn=lambda c: False,
+    )
+    assert msg["author"] == "user\u202eevil"
+    assert msg["fragments"][0]["title"] == "em\u202eote\u2060x"
+
+
+def test_sanitize_strips_u2060_u2064_and_tag_block_keeps_zwj():
+    """Direct sanitizer coverage: U+2060-U+2064 and Tag block U+E0000-U+E007F
+    are invisible/format characters and get stripped; U+200D (ZWJ) is kept."""
+    out = sanitize_render_text("a\u2060b\u2061c\u2062d\u2063e\u2064f")
+    assert out == "abcdef"
+    out2 = sanitize_render_text("a\U000e0000b\U000e0030c\U000e007fd")
+    assert out2 == "abcd"
+    # ZWJ retention is unchanged by the coverage extension.
+    assert sanitize_render_text("x\u200dy") == "x\u200dy"

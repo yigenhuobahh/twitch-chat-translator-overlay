@@ -17,17 +17,19 @@ from common_utils import hex_to_rgb_soft
 # Invisible/hostile characters that must never reach Pillow draw.text:
 # - bidi embedding/override controls (U+202A-U+202E, U+2066-U+2069) can visually
 #   reorder/reverse rendered text (display spoofing, e.g. U+202E RLO).
-# - zero-width characters (U+200B, U+200C, U+FEFF) are invisible but occupy
-#   layout space and can hide content from human review. U+200D (ZWJ) is
-#   deliberately kept: it carries no display-spoofing capability and removing
-#   it breaks emoji ZWJ ligature sequences (e.g. 😀‍🚀).
+# - zero-width characters (U+200B, U+200C, U+2060-U+2064, U+FEFF) are invisible
+#   but occupy layout space and can hide content from human review. U+200D
+#   (ZWJ) is deliberately kept: it carries no display-spoofing capability and
+#   removing it breaks emoji ZWJ ligature sequences (e.g. 😀‍🚀).
+# - Tag block characters (U+E0000-U+E007F, e.g. emoji flag tag sequences) are
+#   invisible or tofu in bitmap fonts and carry no visible payload.
 # - C0/C1 control characters render as tofu boxes (or are otherwise undefined
 #   glyphs) in bitmap fonts.
 # \t \n \r are excluded from the control class because they are normalized to
 # plain spaces (matching common_utils.normalize_text and the space-based
 # wrapping in split_text_for_wrap, which draws a bare newline as tofu).
 _BIDI_CONTROL_RE = re.compile(r"[\u202a-\u202e\u2066-\u2069]")
-_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\ufeff]")
+_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u2060-\u2064\ufeff\U000e0000-\U000e007f]")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
 
@@ -237,10 +239,15 @@ def badge_color_for(title) -> tuple[int, int, int]:
 
 
 def compute_message_header_width(msg, *, padding, badge_size, gap, font, font_bold):
-    """Width of badges + author + colon on the first line (before body fragments)."""
+    """Width of badges + author + colon on the first line (before body fragments).
+
+    security-3: the author name comes straight from chat HTML and is drawn
+    verbatim, so it is sanitized here (same control as body text) — the
+    sanitized value is also what render_message draws via header["author"].
+    """
     badge_count = len(msg.get("badges") or [])
     badge_total_w = badge_count * (badge_size + gap) if badge_count else 0
-    author = msg.get("author") or ""
+    author = sanitize_render_text(msg.get("author") or "")
     ab = font_bold.getbbox(author)
     author_w = ab[2] - ab[0]
     cb = font.getbbox(":")
@@ -280,7 +287,10 @@ def build_message_frag_list(msg, *, text_width_fn, emote_width_fn, emote_availab
             if emote_available_fn(cls):
                 frag_list.append(("emote", cls, emote_width_fn(cls)))
             else:
-                t = f'[{frag.get("title", "")}]'
+                # security-3: the emote title comes from an HTML attribute and
+                # the [title] placeholder is drawn verbatim, so sanitize it
+                # exactly like body text (bidi/zero-width/control strip).
+                t = f'[{sanitize_render_text(frag.get("title", ""))}]'
                 frag_list.append(("text", t, text_width_fn(t)))
     return frag_list
 
