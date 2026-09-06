@@ -27,45 +27,29 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from common_utils import positive_float_arg
+import media_probe
 
 
 def _download_output_fps(value: str):
     """argparse type for --download-output-fps.
 
-    Accepts a plain float ("60", "29.97") → float, or an exact fraction like
-    "30000/1001" → the original string passed through (validated as a/b with
-    b != 0; ffmpeg fps filter and -r both accept fractional expressions).
+    Thin wrapper over media_probe.parse_rational_fps_text (C1 单源化): a plain
+    float ("60", "29.97") parses to float; an exact fraction like "30000/1001"
+    passes the original string through (ffmpeg fps filter and -r both accept
+    fractional expressions). Negative / zero-denominator / non-finite values
+    are rejected everywhere via the shared helper.
     """
-    text = str(value).strip()
-    if "/" in text:
-        num, sep, den = text.partition("/")
-        if not sep or not num.strip() or not den.strip():
-            raise argparse.ArgumentTypeError(
-                f"无效帧率分数: {value!r}（需要 形如 30000/1001 的 a/b 分数）"
-            )
-        try:
-            numerator = float(num)
-            denominator = float(den)
-        except ValueError as exc:
-            raise argparse.ArgumentTypeError(
-                f"无效帧率分数: {value!r}（分子/分母必须是数字）"
-            ) from exc
-        if not all(
-            __import__("math").isfinite(x) for x in (numerator, denominator)
-        ) or denominator == 0:
-            raise argparse.ArgumentTypeError(
-                f"无效帧率分数: {value!r}（分母不能为 0，且必须是有限数值）"
-            )
-        return text
     try:
-        parsed = float(text)
+        normalized, fps_value = media_probe.parse_rational_fps_text(value)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            f"无效帧率: {value!r}（可用 60 / 29.97 或分数 30000/1001）"
-        ) from exc
-    if not __import__("math").isfinite(parsed) or parsed <= 0:
-        raise argparse.ArgumentTypeError(f"帧率必须是正数: {value!r}")
-    return parsed
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    if "/" in normalized:
+        # Fraction syntax parses; a non-positive quotient (0/1, negatives) is
+        # still rejected — ffmpeg may accept 0/1 but it never means a usable fps.
+        if fps_value <= 0:
+            raise argparse.ArgumentTypeError(f"无效帧率: {value!r}（帧率必须为正）")
+        return normalized
+    return fps_value
 
 # argparse defaults used by job/layout/render “CLI wins” application.
 PIPELINE_CLI_DEFAULTS = {

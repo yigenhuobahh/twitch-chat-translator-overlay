@@ -5,8 +5,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-import re
 from typing import Any
+
+import media_probe
 
 try:
     import yaml  # type: ignore
@@ -14,11 +15,9 @@ except ImportError:  # pragma: no cover
     yaml = None
 
 
-# N/M 有理数帧率（如 30000/1001）：与 twitch_chat_burn.parse_output_fps_arg
-# 的 str 语义对齐（返回原字符串，供下游 fps_to_ffmpeg_rate 精确重建 -r）。
-# 本地实现同样的解析而非 import —— render_preset 被 burn 加载，反向 import
-# 会构成循环依赖。
-_RATIONAL_FPS_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*/\s*(-?\d+(?:\.\d+)?)\s*$")
+# N/M 有理数帧率（如 30000/1001）的解析已单源化到
+# media_probe.parse_rational_fps_text（C1）；本模块只保留"分数保留原字符串"
+# 的透传语义（供下游 fps_to_ffmpeg_rate 精确重建 -r）。
 
 
 # Canonical fields accepted under top-level `render:` or flattened at root.
@@ -79,16 +78,28 @@ def _coerce(key: str, value: Any) -> Any:
             # _validated_float_field（output_fps 走 str 语义）对齐；
             # CLI 的 parse_output_fps_arg 会把该字符串归一化为 float，
             # 而 preset 层保留 str 可避免 float("30000/1001") ValueError
-            # 打崩 preset 加载。
+            # 打崩 preset 加载。解析/校验单源走 media_probe 的共享 helper（C1）。
             if "/" in s:
-                match = _RATIONAL_FPS_RE.match(s)
-                if not match or float(match.group(2)) == 0:
-                    raise ValueError(f"render preset 字段 {key} 的有理数帧率无效: {value!r}（期望 N/M，如 30000/1001）")
+                try:
+                    _, quotient = media_probe.parse_rational_fps_text(s)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"render preset 字段 {key} 的有理数帧率无效: {value!r}（期望 N/M，如 30000/1001）"
+                    ) from exc
+                if quotient <= 0:
+                    # 分数语法合法但商非正（0、负分数）：与 plain 分支的
+                    # 正数语义对齐（范围钳制在 burn 侧 _validate_runtime_args）。
+                    raise ValueError(
+                        f"render preset 字段 {key} 的有理数帧率无效: {value!r}（期望 N/M，如 30000/1001）"
+                    )
                 return s
             try:
-                return float(s)
+                coerced = float(s)
             except ValueError as exc:
                 raise ValueError(f"render preset 字段 {key} 需要数字或 N/M 有理数帧率，收到 {value!r}") from exc
+            if coerced <= 0:
+                raise ValueError(f"render preset 字段 {key} 需要数字或 N/M 有理数帧率，收到 {value!r}")
+            return coerced
         return float(value)
     if nk == "blank_hold_seconds":
         return float(value)

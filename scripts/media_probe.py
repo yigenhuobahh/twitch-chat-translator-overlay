@@ -15,6 +15,7 @@ import functools
 import json
 import math
 import os
+import re
 import subprocess
 
 from common_utils import require_executable
@@ -165,6 +166,50 @@ def probe_video_fps(video_path):
         flush=True,
     )
     return None
+
+
+# 有理数帧率 "a/b"（a、b 允许整数或小数，如 30000/1001）。负号、分母 0、
+# 非有限值与垃圾文本统一由 parse_rational_fps_text 拒绝。
+_RATIONAL_FPS_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\s*$")
+
+
+def parse_rational_fps_text(text: str) -> tuple[str, float]:
+    """Parse an fps spec: exact fraction ("30000/1001") or plain decimal ("29.97").
+
+    单一权威解析器（converged）：cli_spec._download_output_fps、
+    twitch_chat_burn.parse_output_fps_arg、render_preset._coerce(output_fps) 与
+    job_config._validated_float_field(output_fps) 全部经由这里，四处的语义从
+    此一致——负数（分子或分母任一侧）、分母 0、非有限值与垃圾文本一律
+    ValueError。
+
+    Returns (normalized_text, float_value):
+    - fraction form: normalized_text is the stripped input (downstream
+      str-passthrough contracts keep the exact user text so fps_to_ffmpeg_rate
+      can rebuild precise -r), float_value = a/b.
+    - plain form: normalized_text is the stripped input, float_value = float(a.b).
+    Raises ValueError on anything invalid.
+    """
+    raw = str(text).strip()
+    match = _RATIONAL_FPS_RE.match(raw)
+    if match:
+        try:
+            numerator = float(match.group(1))
+            denominator = float(match.group(2))
+        except ValueError as exc:  # pragma: no cover - regex already guards digits
+            raise ValueError(f"无效帧率: {text!r}（可用 60 / 29.97 或正分数 30000/1001）") from exc
+        if denominator == 0 or not (math.isfinite(numerator) and math.isfinite(denominator)):
+            raise ValueError(f"无效帧率: {text!r}（可用 60 / 29.97 或正分数 30000/1001）")
+        value = numerator / denominator
+        if not math.isfinite(value):
+            raise ValueError(f"无效帧率: {text!r}（可用 60 / 29.97 或正分数 30000/1001）")
+        return raw, value
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"无效帧率: {text!r}（可用 60 / 29.97 或正分数 30000/1001）") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"无效帧率: {text!r}（可用 60 / 29.97 或正分数 30000/1001）")
+    return raw, value
 
 
 def _quantize_fps(value: float) -> float:
