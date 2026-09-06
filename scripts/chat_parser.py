@@ -704,7 +704,9 @@ def parse_chat_html(html_path, out_dir):
     # 保存 chat_data.json
     chat_data = {"messages": messages, "emote_map": emote_map}
     json_path = os.path.join(out_dir, "chat_data.json")
+    # 紧凑 JSON（不带 indent）：chat_data.json 是机器中间产物，下游全走
+    # json.load（对空白不敏感）；indent 会禁用 C 加速编码器并显著增大体积。
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(chat_data, f, ensure_ascii=False, indent=2)
+        json.dump(chat_data, f, ensure_ascii=False, separators=(",", ":"))
 
     return chat_data

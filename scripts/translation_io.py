@@ -133,10 +133,13 @@ def write_export_translation_json(
     tmp_path = Path(tmp_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as file:
-            json.dump(payload, file, ensure_ascii=False, indent=2)
+            # 紧凑 JSON（不带 indent）：导出 JSON 由导入侧 json.load 回读（对空白
+            # 不敏感）；人工编辑面是 TSV/XLSX 复核表。indent 会禁用 C 加速编码器，
+            # 大批量导出时体积/耗时显著增大。
+            json.dump(payload, file, ensure_ascii=False, separators=(",", ":"))
         # os.replace 可能在 Windows 上因并发读者/写者持有目标句柄
         # (FILE_SHARE_DELETE 缺失) 短暂 PermissionError —— 与
-        # run_meta._replace_with_retry 同款小退避重试。
+        # common_utils.atomic_replace_with_retry（规范样板）同款小退避重试。
         for attempt in range(10):
             try:
                 os.replace(tmp_path, export_path)

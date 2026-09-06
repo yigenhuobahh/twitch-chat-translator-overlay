@@ -235,16 +235,20 @@ def export_review_xlsx(
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
 
+    # 共享样式对象提到循环外只建一次（openpyxl 赋值时共享 style proxy，
+    # 官方文档模式）：逐格新建 Font/Alignment 在 10 万行量级会让样式遍历
+    # 耗时超过 wb.save 本身（perf-5）。语义不变：number_format、按行 fill、
+    # 行高逻辑保持原样。
+    body_font = Font(name="Arial")
+    body_alignment = Alignment(vertical="top", wrap_text=True)
     for row in ws.iter_rows(min_row=2):
         for cell in row:
-            cell.font = Font(name="Arial")
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            cell.font = body_font
+            cell.alignment = body_alignment
         # 类型漂移防护：original/translation 一律按文本存储，防止 "=1+1"
         # 之类内容被 Excel 重解释成数字/公式后类型丢失。
         row[3].number_format = "@"
         row[4].number_format = "@"
-        row[3].alignment = Alignment(vertical="top", wrap_text=True)
-        row[4].alignment = Alignment(vertical="top", wrap_text=True)
         sev = str(row[5].value or "").upper()
         if sev == "FAIL":
             row[5].fill = fail_fill
