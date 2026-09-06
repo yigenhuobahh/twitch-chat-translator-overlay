@@ -129,3 +129,50 @@ def test_inline_single_quote_author_and_emote(tmp_path: Path):
     assert len(emotes) == 1 and emotes[0]["title"] == "LUL"
     texts = " ".join(f["text"] for f in msg["fragments"] if f["type"] == "text")
     assert "hi" in texts and "there" in texts
+
+
+def _make_html(t_param: str) -> str:
+    """Minimal single-message TD-format chat export with the given ?t= query."""
+    return (
+        '<html><body><pre class="comment-root">'
+        f'[<a href="https://www.twitch.tv/videos/1{t_param}">link</a>] '
+        '<span class="comment-author">User</span>'
+        '<span class="comment-message">: hello</span></pre></body></html>'
+    )
+
+
+def test_timestamp_hour_minute_multipliers_nonzero(tmp_path: Path):
+    """tests-1 (a): h/m 倍率 pin —— ?t=1h2m3s 必须解析为 3723.0。
+
+    Mutation evidence (verifier-confirmed): h*3600→h*60 and m*60→m*61 both
+    survive the full 94-test parser subset because every fixture uses
+    t=0h0mNs. This nonzero case pins both multipliers simultaneously
+    (1*3600 + 2*60 + 3 = 3723; under the mutations it would be 125/3724).
+    """
+    data = _parse(tmp_path, _make_html("?t=1h2m3s"), "hm_mult.html")
+    assert len(data["messages"]) == 1
+    assert data["messages"][0]["timestamp"] == 3723.0
+
+
+def test_timestamp_extra_query_and_hash_after_t(tmp_path: Path):
+    """tests-1 (b): t= 之后的额外 query/hash 按正则文档化后缀规则允许。
+
+    ?t=0h2m3s&foo=1#chat → 2m3s = 192... 即 0*3600 + 2*60 + 3 = 123 秒。
+    (The regex's documented suffix allowance is [&#'\"] or end-of-href; the
+    href here continues with &foo=1#chat so both separators are exercised.)
+    """
+    data = _parse(tmp_path, _make_html("?t=0h2m3s&foo=1#chat"), "suffix.html")
+    assert len(data["messages"]) == 1
+    assert data["messages"][0]["timestamp"] == 123.0
+
+
+def test_timestamp_invalid_unit_suffix_drops_message(tmp_path: Path):
+    """tests-1 (c): ?t=0h0m5x 不是合法时间链接 → 整条消息按缺时间戳语义丢弃。
+
+    `_extract_comment_root_fields` returns None when time_link_pattern does
+    not match, so `5x` (x is not in the allowed terminator set) must leave
+    zero messages — pinning that the pattern does not loosen to accept
+    malformed suffixes.
+    """
+    data = _parse(tmp_path, _make_html("?t=0h0m5x"), "bad_suffix.html")
+    assert data["messages"] == []

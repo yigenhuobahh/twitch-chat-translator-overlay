@@ -678,3 +678,52 @@ def test_td_install_checksum_parses_helper_units(tmp_path: Path):
     # <stem>.sha256 命名（名字本身不含 sha256 关键字以外的提示）也可命中
     assets2 = [{"name": "cli.sha256", "browser_download_url": "https://github.com/y"}]
     assert _find_checksum_asset(assets2, "cli.zip") is not None
+
+
+def test_verify_download_checksum_skips_non_github_checksum_url(monkeypatch, tmp_path: Path):
+    """checksums.txt 的 browser_download_url 不在 GitHub allowlist 内 → 跳过校验。
+
+    Pin for td_cli_install._verify_download_checksum's scheme/host/path guard
+    (http://evil.example/checksums.txt must be rejected WITHOUT any fetch and
+    the download must proceed unverified — current best-effort semantics).
+    Mutation evidence (verifier-confirmed, product code left untouched here):
+    disabling the guard at td_cli_install.py:291-299 leaves all 26 existing
+    checksum tests green — this is the only discriminating test.
+    """
+    import td_cli_install
+
+    recorded_urls: list[str] = []
+
+    def fake_urlopen(req, timeout=None):
+        recorded_urls.append(getattr(req, "full_url", req))
+        raise AssertionError("checksum fetch must not happen for non-allowlisted URL")
+
+    def fail_request_factory(target):
+        raise AssertionError("request must not be built for non-allowlisted URL")
+
+    def fail_stream(resp, path, max_bytes=None):
+        raise AssertionError("checksum body must not be downloaded")
+
+    # 独立进程内全局 _LAST_RELEASE_ASSETS 只包含恶意 checksum 资产。
+    monkeypatch.setattr(
+        td_cli_install,
+        "_LAST_RELEASE_ASSETS",
+        [{"name": "checksums.txt", "browser_download_url": "http://evil.example/checksums.txt"}],
+    )
+
+    zip_path = tmp_path / "download.zip"
+    zip_path.write_bytes(b"MZ-fake")
+
+    # 跳过校验 = 正常返回（不抛错、不删 zip、不发任何请求）。
+    td_cli_install._verify_download_checksum(
+        asset_name="TwitchDownloaderCLI-test-Windows-x64.zip",
+        zip_path=zip_path,
+        urlopen=fake_urlopen,
+        request_factory=fail_request_factory,
+        timeout=30.0,
+        max_bytes=1024,
+        stream_to_path=fail_stream,
+    )
+
+    assert recorded_urls == []
+    assert zip_path.read_bytes() == b"MZ-fake"

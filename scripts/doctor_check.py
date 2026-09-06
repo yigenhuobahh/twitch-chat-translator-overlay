@@ -8,7 +8,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
 import platform
 import subprocess
@@ -23,6 +22,7 @@ from common_utils import (
     translate_api_env_config,
 )
 from env_bootstrap import (
+    collect_readiness,
     maybe_prompt_offer_fixes,
     offer_fixes,
     prepend_tools_ffmpeg_to_path,
@@ -84,37 +84,37 @@ def doctor(args):
             )
         check(exe, bool(path), path or "未找到", fix)
 
-    packages = {
-        "Pillow": "PIL",
-        "beautifulsoup4": "bs4",
-        "openai": "openai",
-        "openpyxl": "openpyxl",
-        "PyYAML": "yaml",
-    }
-    # WARN-only packages: 与下方「翻译 API 三件套」口径一致——不装也能渲染，
-    # 只有对应功能需要（openai: 仅复用翻译；openpyxl: 仅导出 XLSX 复核表）。
-    optional_pkgs = {"openai", "openpyxl"}
-    optional_pkg_hints = {
-        "openai": "仅复用翻译需要；不使用翻译功能可忽略",
-        "openpyxl": "仅导出 XLSX 复核表需要",
-    }
+    # D1 单源：包清单从 env_bootstrap.collect_readiness 的 pkg:* 检查项派生，
+    # 不再手抄一份（否则两处 dict 会漂移：新增/下线依赖只改一处时口径分裂）。
+    # required_for_render 对齐下方的 required/WARN 分级（openai/openpyxl 仅
+    # 复用翻译/导出 XLSX 需要，WARN-only）。这里只固定「显示顺序」（历史上
+    # doctor 的打印顺序），内容与判定全部来自 env_bootstrap；未知的新依赖
+    # 仍会按 collect_readiness 顺序追加在末尾，不会漏显。
+    _pkg_display_order = ("Pillow", "beautifulsoup4", "openai", "openpyxl", "PyYAML", "textual")
+    readiness_items = collect_readiness()
+    pkg_items = [item for item in readiness_items if item.key.startswith("pkg:")]
+    pkg_items.sort(
+        key=lambda item: _pkg_display_order.index(item.name)
+        if item.name in _pkg_display_order
+        else len(_pkg_display_order)
+    )
     missing_required_pkgs: list[str] = []
-    for display, module in packages.items():
-        try:
-            present = importlib.util.find_spec(module) is not None
-        except (ValueError, ModuleNotFoundError):
-            # Stub modules in tests may set __spec__ = None.
-            present = module in sys.modules
-        if not present and module in ("PIL", "bs4", "yaml"):
+    for item in pkg_items:
+        display = item.name
+        present = item.ok
+        if not present and item.required_for_render:
             missing_required_pkgs.append(display)
         fix = f"pip install {display}\n      或: pip install -r requirements.txt"
-        if display in optional_pkg_hints:
-            fix += f"\n      {optional_pkg_hints[display]}"
+        if not item.required_for_render:
+            if display == "openai":
+                fix += "\n      仅复用翻译需要；不使用翻译功能可忽略"
+            elif display == "openpyxl":
+                fix += "\n      仅导出 XLSX 复核表需要"
         check(
             display,
             present,
             fix=fix,
-            required=display not in optional_pkgs,
+            required=item.required_for_render,
         )
 
     # 系统字体探测代价高：detect_cjk_font() 返回 (regular, bold) 元组，只调用一次，

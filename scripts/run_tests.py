@@ -375,7 +375,7 @@ def main() -> int:
     )
     parser.add_argument("-k", dest="keyword", default=None, help="pytest -k expression")
     parser.add_argument("-q", "--quiet", action="store_true")
-    parser.add_argument("--strict", action="store_true", help="fail on pytest warnings (useful for CI hardening)")
+    parser.add_argument("--strict", action="store_true", help="fail on unhandled thread-exception warnings (CI hardening aid)")
     parser.add_argument("--maxfail", type=int, default=None, help="pytest --maxfail N")
     args = parser.parse_args()
 

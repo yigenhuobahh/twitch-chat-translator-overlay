@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import stat
 import sys
 from types import SimpleNamespace
 
@@ -53,7 +54,7 @@ def test_tighten_env_permissions_skipped_on_windows(ux_mod, tmp_path: Path):
     assert ux_mod._tighten_env_permissions(env_file) is False
 
 
-def test_tighten_env_permissions_chmods_on_posix(ux_mod, tmp_path: Path):
+def test_tighten_env_permissions_chmods_on_posix(ux_mod, tmp_path: Path, monkeypatch):
     """POSIX 分支:收紧到仅属主读写并返回 True。
 
     平台判定经 monkeypatch_platform 强制(Windows 上对文件 chmod 0o600
@@ -63,7 +64,25 @@ def test_tighten_env_permissions_chmods_on_posix(ux_mod, tmp_path: Path):
     env_file.write_text("OPENAI_COMPAT_API_KEY=x\n", encoding="utf-8")
     monkeypatch_platform(ux_mod, "posix")
 
+    # Pin the exact mode, not just the boolean return: the POSIX branch must
+    # request owner-rw only (0o600). Path.chmod() routes through the global
+    # os.chmod, so a spy records the mode argument on every host. (We cannot
+    # read it back from st_mode on Windows: MSVCRT's _chmod maps every
+    # write-enabled mode to 0o666 in st_mode.)
+    chmod_calls: list[tuple[Path, int]] = []
+    real_chmod = os.chmod
+
+    def spy_chmod(p, mode, **kwargs):
+        chmod_calls.append((p, mode))
+        return real_chmod(p, mode, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", spy_chmod)
+
     assert ux_mod._tighten_env_permissions(env_file) is True
+    assert chmod_calls == [(env_file, 0o600)]
+    # On real POSIX hosts the resulting file mode is observable directly.
+    if os.name == "posix":
+        assert stat.S_IMODE(env_file.stat().st_mode) & 0o777 == 0o600
 
 
 def test_ensure_dotenv_tightens_created_env(

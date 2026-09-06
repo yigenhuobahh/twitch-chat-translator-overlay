@@ -12,6 +12,7 @@ Optional: TwitchDownloaderCLI detect (WARN only) + install-time offer_td_cli_gui
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import os
 from pathlib import Path, PurePosixPath
 import platform
@@ -27,6 +28,7 @@ import zipfile
 
 from common_utils import (
     atomic_replace_with_retry,
+    atomic_write_json,
     current_cli_invocation,
     current_cli_script,
     is_console_entry_script,
@@ -351,13 +353,15 @@ def collect_readiness(*, font_path: str | None = "auto", font_bold_path: str | N
         "openai": "openai",
         "PyYAML": "yaml",
         "openpyxl": "openpyxl",
+        # textual: TUI 界面依赖；缺失时渲染就绪全绿但 tui_run 无法启动。
+        "textual": "textual",
     }
     for display, module in packages.items():
         try:
             present = importlib.util.find_spec(module) is not None
         except Exception:
             present = module in sys.modules
-        req = module in ("PIL", "bs4", "yaml")  # openai/openpyxl softer for original-only
+        req = module in ("PIL", "bs4", "yaml", "textual")  # openai/openpyxl softer for original-only
         items.append(
             CheckItem(
                 key=f"pkg:{module}",
@@ -525,6 +529,16 @@ def _dotenv_quote_value(value: str) -> str:
     return f'"{inner}"'
 
 
+def _is_trusted_env_target(target: Path) -> bool:
+    """P2-11 写侧信任判定：repo root 之内的 .env 视为信任目标。"""
+    try:
+        repo_root = _repo_root().resolve()
+        resolved = target.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return resolved == repo_root or repo_root in resolved.parents
+
+
 def save_dotenv_api_config(
     base_url: str,
     api_key: str,
@@ -548,6 +562,15 @@ def save_dotenv_api_config(
                 target = repo_env
             else:
                 target = cwd_env
+            # P2-11: 自动选择的目标落在非信任目录（第三方"项目包"内）时，
+            # 镜像读侧 load_dotenv_if_present 的确认门；显式 env_path 视为
+            # 用户已知情，不走门。非交互 stdin 下确认函数 fail-closed。
+            if not _is_trusted_env_target(target):
+                from common_utils import _confirm_untrusted_dotenv
+
+                print(f"  [!] API key 将写入非信任目录: {target}")
+                if not _confirm_untrusted_dotenv():
+                    return False, "已取消：目标 .env 位于非信任目录"
 
         target.parent.mkdir(parents=True, exist_ok=True)
 
@@ -816,6 +839,57 @@ def _find_ffmpeg_bin(root: Path) -> Path | None:
     return None
 
 
+FFMPEG_INSTALL_MANIFEST_NAME = ".install-manifest.json"
+
+
+def _sha256_of_file(path: Path) -> str:
+    """Chunked SHA-256 (td_cli_install._sha256_file 同款模式)。"""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _read_ffmpeg_manifest(dest_root: Path) -> dict | None:
+    manifest_path = dest_root / FFMPEG_INSTALL_MANIFEST_NAME
+    if not manifest_path.is_file():
+        return None
+    try:
+        import json
+
+        return json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+
+
+def _ffmpeg_tofu_gate(old_digest: str | None, new_digest: str, *, prompt) -> bool:
+    """P2-9 TOFU 轻量门：首装放行并记录；重装 digest 不变放行；变化需确认。
+
+    ``prompt`` is injected for testability (production passes _prompt_yes).
+    """
+    if old_digest is None:
+        return True
+    if old_digest == new_digest:
+        return True
+    print(f"  上次安装 SHA256: {old_digest}")
+    print(f"  本次下载 SHA256: {new_digest}")
+    print("  [!] FFmpeg 来源内容与上次安装不一致（gyan.dev 滚动构建可能正常更新）")
+    return bool(prompt("仍要继续安装该 FFmpeg？"))
+
+
+def _write_ffmpeg_manifest(dest_root: Path, *, url: str, sha256: str, size_bytes: int) -> None:
+    from datetime import datetime, timezone
+
+    manifest = {
+        "url": url,
+        "sha256": sha256,
+        "size_bytes": size_bytes,
+        "installed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    atomic_write_json(dest_root / FFMPEG_INSTALL_MANIFEST_NAME, manifest)
+
+
 def try_portable_ffmpeg(*, assume_yes: bool = False, root: Path | None = None) -> bool:
     """P4: download portable FFmpeg into tools/ffmpeg (Windows primarily)."""
     if safe_which("ffmpeg") and safe_which("ffprobe"):
@@ -835,7 +909,7 @@ def try_portable_ffmpeg(*, assume_yes: bool = False, root: Path | None = None) -
         return False
 
     print("  版本: ffmpeg-release-essentials（gyan.dev 滚动最新版）")
-    print("  注意: 该下载不做哈希校验，请仅通过本项目固定的 HTTPS 来源获取。")
+    print("  注意: TOFU 轻量校验——首次安装记录 SHA256，重装内容变化需确认。")
 
     dest_root = root / "tools" / "ffmpeg"
     dest_root.parent.mkdir(parents=True, exist_ok=True)
@@ -859,11 +933,25 @@ def try_portable_ffmpeg(*, assume_yes: bool = False, root: Path | None = None) -
                 zip_path,
                 max_bytes=MAX_PORTABLE_DOWNLOAD_BYTES,
             )
+        # P2-9 TOFU 轻量校验：与上次安装的 SHA256 对比，变化需显式确认。
+        zip_digest = _sha256_of_file(zip_path)
+        previous = _read_ffmpeg_manifest(dest_root)
+        if not _ffmpeg_tofu_gate(
+            (previous or {}).get("sha256"), zip_digest, prompt=_prompt_yes
+        ):
+            print(f"  已取消安装。如确认来源可信，可手动下载并解压到 {dest_root}")
+            return False
         print("  解压中…")
         with zipfile.ZipFile(zip_path, "r") as archive:
             safe_extract_zip(archive, payload)
         if _find_ffmpeg_bin(payload) is None:
             raise ValueError("archive does not contain sibling ffmpeg.exe and ffprobe.exe")
+        _write_ffmpeg_manifest(
+            dest_root,
+            url=_GYAN_ESSENTIALS_URL,
+            sha256=zip_digest,
+            size_bytes=zip_path.stat().st_size,
+        )
         zip_path.unlink(missing_ok=True)
         ready = dest_root.parent / f".{dest_root.name}.ready-{uuid.uuid4().hex}"
         payload.rename(ready)
