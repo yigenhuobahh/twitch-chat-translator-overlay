@@ -116,7 +116,21 @@ def _coerce(key: str, value: Any) -> Any:
             return False
         raise ValueError(f"layout preset 字段 {key} 需要布尔值，收到 {value!r}")
     if typ is int:
-        return int(value)
+        # 与 job_config._validated_int_field 口径一致：整数值 float(15.0) 收敛为
+        # int；带小数的 float(15.5)、小数字符串("15.5")、bool（int 子类，否则
+        # int(True)=1 静默通过）一律报错，不再静默截断。
+        if isinstance(value, bool):
+            raise ValueError(f"layout preset 字段 {key} 需要整数，收到 {value!r}")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            if value.is_integer():
+                return int(value)
+            raise ValueError(f"layout preset 字段 {key} 需要整数，收到 {value!r}")
+        try:
+            return int(str(value).strip())
+        except ValueError:
+            raise ValueError(f"layout preset 字段 {key} 需要整数，收到 {value!r}") from None
     if typ is float:
         return float(value)
     return str(value)

@@ -30,7 +30,14 @@ from textual.widgets import (
     TabbedContent,
     TabPane,
 )
-from textual.widgets._select import InvalidSelectValueError
+
+try:
+    # textual 私有模块：版本 <9 下提供 Select 非法值异常类型。textual 9+ 移除该
+    # 路径时降级为空 tuple（except 空元组永不匹配 → 守卫退化为 no-op），
+    # 避免 ImportError 直接打崩 TUI 启动；真正的保护仍是 textual<9 的 pin。
+    from textual.widgets._select import InvalidSelectValueError
+except ImportError:  # pragma: no cover - depends on installed textual version
+    InvalidSelectValueError = ()
 from textual.widgets.option_list import Option
 
 from common_utils import load_dotenv_if_present
@@ -110,6 +117,33 @@ _RENDER_PRESET_OPTIONS = (
     ("母带高清 (HQ - 优先显卡高质量模式/CRF 16 + 256k 音频)", "hq"),
     ("无损音轨 (Audio Copy - 音轨直通不重采样，保留100%音质)", "audio_copy"),
 )
+
+
+def _merge_discovered_presets(static: tuple[tuple[str, str], ...], kind: str) -> tuple[tuple[str, str], ...]:
+    """把 profiles/ 中新增的 {kind}_*.yaml 追加到静态下拉项之后（D1.2）。
+
+    静态元组保留作为已知 short 的基座（中文标签比 profiles 注释更丰富），
+    discover_presets 扫出的新 preset（静态里没有的 short）自动出现在 TUI
+    下拉框末尾，新增 profile 不必改 TUI 代码。扫描容错：profiles 目录缺失
+    或 yaml 不可用只是空结果，绝不让 import 失败。
+    """
+    known = {value for _label, value in static}
+    try:
+        from common_utils import discover_presets
+
+        discovered = discover_presets(kind)
+    except Exception:
+        return static
+    extra = tuple(
+        (str(e.get("menu_text") or e.get("short")), str(e["short"]))
+        for e in discovered
+        if str(e.get("short")) not in known
+    )
+    return static + extra
+
+
+_LAYOUT_PRESET_OPTIONS = _merge_discovered_presets(_LAYOUT_PRESET_OPTIONS, "layout")
+_RENDER_PRESET_OPTIONS = _merge_discovered_presets(_RENDER_PRESET_OPTIONS, "render")
 
 _ENCODER_OPTIONS = (
     ("智能识别 (Auto - 优先独显 NVENC/AMF -> QSV -> 回退 x264)", "auto"),
