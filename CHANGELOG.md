@@ -4,9 +4,21 @@ Notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+- Started the next development cycle as `0.2.8.dev0` after the v0.2.7 release.
+
+## [0.2.7] - 2026-09-06
+
 ### Changed
 
-- Started the next development cycle as `0.2.7.dev0` after the v0.2.6 release.
+- Full-codebase review wave (2026-09-06, 6-lens audit + two fix waves; 27 findings fixed, zero left open):
+  - **Security decisions (opt-in hardening)**: portable FFmpeg downloads now record a SHA256 install manifest on first install and require confirmation when a re-download changes content (TOFU, fails closed on non-interactive stdin); the `TWITCHDOWNLOADER_CLI` environment override now only runs binaries from trusted roots without asking, and confirms before executing anything from an untrusted directory (refusal falls back to `tools/` and `PATH`); saving API config to a `.env` outside the repository root mirrors the read-side confirmation gate (explicit paths count as informed consent).
+  - **Data loss / robustness**: three bare `os.replace` publication sites (translation export, burn promote, TUI result retain) now retry transient Windows sharing violations through the shared atomic-replace helper; a stale `.partial` no longer turns a publishable render into a failed one; SIGKILL/Ctrl+C residue (dot-tmp siblings, hidden staging directories, TUI event files) is swept after a 24h age threshold that never touches fresh writers.
+  - **Silent-wrong output**: `layout_preset` integer fields no longer silently truncate (`15.5`/`true` rejected, `15.0` coerced) mirroring job-config semantics; `webm_cpu_used` range enforcement (0-8) now matches the declarative table at runtime; negative fractional fps (`-30000/1001`) is uniformly rejected after unifying all four parsers into `media_probe.parse_rational_fps_text`.
+  - **Config hardening**: job YAML `_yaml_quote` escapes C0/DEL control characters (tab/VT/FF can no longer produce permanently unparseable files); non-string `context` values are rejected at load time; author names and emote titles go through render sanitization (bitmap-verified against U+202E) with zero-width coverage extended to U+2060-2064 and Tag blocks.
+  - **Redaction**: CLI error/probe output paths (download flow, translation probe) pass through `redact_text`, and the regex table gained single-quoted dict-repr secret shapes; the table moved to `process_util` as the single source with `tui_task` re-exporting (consumers untouched).
+  - **Performance**: XLSX review export reuses style objects (20k rows 6.2s → 2.8s); fade alpha uses a 256-entry LUT (exhaustively bit-identical, 1.1-1.4x faster); `chat_data.json` and translation exports drop `indent` (30-48% smaller, machine-read only); the frame layout cache is now bounded with insertion-order eviction.
+  - **Consistency**: doctor package checks derive from `env_bootstrap.collect_readiness` (byte-identical output); TUI preset dropdowns append discovered profiles automatically; `MANIFEST.in` ↔ pyproject data-files get a two-way consistency test; encoder presets validate per-family with a single-source defaults table; burn's runtime validation is table-driven from `job_config` range tables; the promote closure moved to a module-level `publish_promotable`.
+  - **Packaging/tests**: textual private-module import degrades gracefully on textual 9+; `--doctor` requires `textual`; chmod `0600` pinned by argument spy (plus real POSIX stat); new regression tests for parser multipliers, checksum-skip branches, YAML round-trips, range-table consistency, fps unification, residue sweeping, and the shadow inventory (42 files changed, ~150 new tests; suite now 1484 non-smoke + 42 smoke, all green).
 
 ## [0.2.6] - 2026-09-05
 
