@@ -99,6 +99,85 @@ def test_default_preset_x264_unchanged(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# explicit video_preset must be validated against the resolved family
+# (the second half of correctness-1: any explicit value used to pass through
+# verbatim, so x264-style names leaked into amf/nvenc/qsv argv and ffmpeg
+# rejected them at option-parse time with exit 127)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_explicit(monkeypatch, encoder: str, preset: str | None):
+    """Same stubs as _resolve, but with an explicit preset."""
+    import encode_options as mod
+
+    concrete = {"nvenc": "h264_nvenc", "qsv": "h264_qsv", "amf": "h264_amf", "x264": "libx264"}
+    monkeypatch.setattr(mod, "detect_hw_encoders", lambda available=None: {encoder: concrete[encoder]})
+    monkeypatch.setattr(mod, "_trial_encode", lambda codec: True)
+    return mod.resolve_encode_options(encoder=encoder, video_preset=preset)
+
+
+def test_explicit_illegal_preset_amf_falls_back(monkeypatch):
+    import encode_options as mod
+
+    opts = _resolve_explicit(monkeypatch, "amf", "fast")
+    assert opts.resolved_encoder == "amf"
+    assert opts.video_preset == "balanced"  # the amf family default
+    assert any("'fast'" in n and "amf" in n for n in opts.notes), opts.notes
+    argv = mod.build_video_encode_args(opts)
+    assert argv[2:4] == ["-quality", "balanced"]
+
+
+def test_explicit_illegal_preset_nvenc_falls_back(monkeypatch):
+    opts = _resolve_explicit(monkeypatch, "nvenc", "veryfast")
+    assert opts.resolved_encoder == "nvenc"
+    assert opts.video_preset == "p4"  # the nvenc family default
+    assert any("'veryfast'" in n and "nvenc" in n for n in opts.notes), opts.notes
+
+
+def test_explicit_illegal_preset_qsv_falls_back(monkeypatch):
+    opts = _resolve_explicit(monkeypatch, "qsv", "balanced")
+    assert opts.resolved_encoder == "qsv"
+    assert opts.video_preset == "medium"  # the qsv family default
+    assert any("'balanced'" in n and "qsv" in n for n in opts.notes), opts.notes
+
+
+def test_explicit_legal_presets_pass_through(monkeypatch):
+    # amf
+    for preset in ("balanced", "speed", "quality", "high_quality"):
+        opts = _resolve_explicit(monkeypatch, "amf", preset)
+        assert opts.video_preset == preset
+        assert not any("非法" in n for n in opts.notes), opts.notes
+    # nvenc
+    for preset in ("p4", "fast", "slow", "medium"):
+        opts = _resolve_explicit(monkeypatch, "nvenc", preset)
+        assert opts.video_preset == preset
+        assert not any("非法" in n for n in opts.notes), opts.notes
+    # qsv
+    for preset in ("medium", "veryfast", "veryslow"):
+        opts = _resolve_explicit(monkeypatch, "qsv", preset)
+        assert opts.video_preset == preset
+        assert not any("非法" in n for n in opts.notes), opts.notes
+    # x264 keeps the full x264 vocabulary, untouched
+    for preset in ("fast", "veryfast", "slow"):
+        opts = _resolve_explicit(monkeypatch, "x264", preset)
+        assert opts.video_preset == preset
+        assert not any("非法" in n for n in opts.notes), opts.notes
+
+
+def test_explicit_preset_validated_for_auto_resolved_family(monkeypatch):
+    """auto resolving to a hardware family must validate against that family."""
+    import encode_options as mod
+
+    concrete = {"nvenc": "h264_nvenc", "amf": "h264_amf", "qsv": "h264_qsv", "x264": "libx264"}
+    monkeypatch.setattr(mod, "detect_hw_encoders", lambda available=None: concrete)
+    monkeypatch.setattr(mod, "_trial_encode", lambda codec: True)
+    opts = mod.resolve_encode_options(encoder="auto", video_preset="veryfast")
+    assert opts.resolved_encoder == "nvenc"  # nvenc tried first in auto order
+    assert opts.video_preset == "p4"
+    assert any("'veryfast'" in n for n in opts.notes), opts.notes
+
+
+# ---------------------------------------------------------------------------
 # build_video_encode_args emits only legal -preset / -quality values
 # ---------------------------------------------------------------------------
 

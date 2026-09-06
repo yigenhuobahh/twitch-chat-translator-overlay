@@ -226,22 +226,29 @@ def resolve_encode_options(
                     )
         resolved = encoder
 
-    # Default presets differ by family. Values must be legal for the concrete
-    # encoder: h264_qsv -preset only accepts veryfast..veryslow (no "balanced";
-    # verified via `ffmpeg -h encoder=h264_qsv` and a live exit-0 encode with
-    # "medium"), h264_amf -quality accepts balanced/speed/quality/high_quality,
-    # h264_nvenc accepts p1..p7.
+    # Per-family preset domains and defaults (verified against the concrete
+    # encoders: h264_qsv -preset only accepts veryfast..veryslow, h264_amf
+    # -quality accepts balanced/speed/quality/high_quality, h264_nvenc accepts
+    # slow/medium/fast/p1..p7). The default doubles as the fallback when an
+    # explicit preset is illegal for the resolved family, so there is a single
+    # source of truth per family.
+    family_presets: dict[str, tuple[frozenset[str], str]] = {
+        "nvenc": (frozenset({"slow", "medium", "fast", "p1", "p2", "p3", "p4", "p5", "p6", "p7"}), "p4"),
+        "qsv": (frozenset({"veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}), "medium"),
+        "amf": (frozenset({"balanced", "speed", "quality", "high_quality"}), "balanced"),
+        "x264": (None, "fast"),  # libx264 accepts the full x264 speed vocabulary
+    }
+    domain, default_preset = family_presets.get(resolved, family_presets["x264"])
+
     if video_preset is None or str(video_preset).strip() == "":
-        if resolved == "nvenc":
-            video_preset = "p4"
-        elif resolved == "qsv":
-            video_preset = "medium"
-        elif resolved == "amf":
-            video_preset = "balanced"
-        else:
-            video_preset = "fast"
+        video_preset = default_preset
     else:
         video_preset = str(video_preset).strip()
+        if domain is not None and video_preset not in domain:
+            notes.append(
+                f"video_preset '{video_preset}' 对 {resolved} 非法，已回退到 '{default_preset}'"
+            )
+            video_preset = default_preset
 
     return EncodeOptions(
         encoder=encoder,

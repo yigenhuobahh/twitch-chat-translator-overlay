@@ -49,6 +49,7 @@ from overlay_scene import (
     OverlayScenePlan,
     frame_index_range,
     line_height_px,
+    resolve_message_image_cache_policy,
 )
 from process_util import is_dangerous_publish_path, path_is_under
 from render_perf import (
@@ -73,6 +74,21 @@ _PILImage.MAX_IMAGE_PIXELS = 64_000_000
 # its first visible frame and out over FADE_OUT_SECONDS before it leaves.
 FADE_IN_SECONDS = 0.3
 FADE_OUT_SECONDS = 0.5
+
+# Per-alpha 256-entry LUT cache for fade compositing. ``int(v * alpha / 255)``
+# only depends on alpha (int 0..254), so precomputing the byte table per
+# distinct alpha lets Pillow's C-level ``point(lut)`` replace a per-pixel
+# Python lambda in the frame loop. Output is bit-identical to the lambda form.
+_FADE_ALPHA_LUTS: dict[int, bytes] = {}
+
+
+def _fade_alpha_lut(alpha: int) -> bytes:
+    """Return (and cache) the 256-entry byte LUT mapping v -> int(v*alpha/255)."""
+    lut = _FADE_ALPHA_LUTS.get(alpha)
+    if lut is None:
+        lut = bytes(int(v * alpha / 255) for v in range(256))
+        _FADE_ALPHA_LUTS[alpha] = lut
+    return lut
 
 
 def emote_decode_plan(
@@ -244,7 +260,20 @@ class FrameRenderer:
         # cache from calc_msg_lines; render_message keeps its own per-idx cache
         # (see _layout_cache) so each message is laid out at most once per
         # render session instead of once in the prepass + once per rasterization.
+        # performance-1: the cache is BOUNDED with the same cap policy as the
+        # message-image cache (resolve_message_image_cache_policy, default
+        # 256). The prepass lays out every message within the render duration,
+        # so an unbounded cache retained ~1 KB per message (~90 MB at 100k
+        # messages). Eviction drops oldest entries (dict insertion order);
+        # layout_message_lines is a pure function of (msg, config), so a
+        # re-layout after eviction is correctness-safe.
         self._layout_cache: dict[int, tuple] = {}
+        _lazy, _cap, _auto = resolve_message_image_cache_policy(
+            len(messages),
+            bool(getattr(config, "lazy_message_images", False)),
+            int(getattr(config, "message_image_cache_size", 256) or 256),
+        )
+        self._layout_cache_cap = _cap
 
         # Message bitmap cache state (filled by prepare_message_cache).
         self.animated_message_ids: set[int] = set()
@@ -319,6 +348,12 @@ class FrameRenderer:
             )
             cached = (lines, header, num_lines)
             self._layout_cache[key] = cached
+            # performance-1: bound the cache (oldest entries first, matching
+            # the msg_images LRU); eviction only costs a re-layout because
+            # layout_message_lines is deterministic per message.
+            while len(self._layout_cache) > self._layout_cache_cap:
+                oldest = next(iter(self._layout_cache))
+                del self._layout_cache[oldest]
         lines, header, num_lines = cached
         if truncate_with_ellipsis:
             # Derive the truncated render view from the cached untruncated
@@ -529,8 +564,10 @@ class FrameRenderer:
                 if alpha < 255:
                     msg_img = msg_img.copy()
                     r, g, b, a = msg_img.split()
-                    # Bind alpha as default so the lambda does not close over the loop var.
-                    a = a.point(lambda v, alpha=alpha: int(v * alpha / 255))
+                    # LUT keyed by alpha (same loop-capture safety as the old
+                    # default-arg lambda); point() applies it in C, output is
+                    # bit-identical to int(v * alpha / 255) per pixel.
+                    a = a.point(_fade_alpha_lut(alpha))
                     msg_img = Image.merge("RGBA", (r, g, b, a))
 
                 frame.paste(msg_img, (2, y), msg_img)
