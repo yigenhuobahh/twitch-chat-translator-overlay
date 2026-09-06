@@ -97,7 +97,19 @@ def find_twitchdownloader_cli(root: Path | None = None) -> Path | None:
     if env and not env_loaded_from_dotenv("TWITCHDOWNLOADER_CLI"):
         p = Path(env).expanduser()
         if p.is_absolute() and p.is_file():
-            return p.resolve()
+            import common_utils
+
+            if common_utils._is_trusted_executable_path(p):
+                return p.resolve()
+            # P2-10: env 覆盖绕过信任根硬化，非信任目录需显式确认；
+            # 拒绝（含非交互 fail-closed）时回落 tools 目录 / PATH 搜索。
+            if not common_utils._confirm_untrusted_executable(p):
+                print(
+                    "  已忽略 TWITCHDOWNLOADER_CLI（非信任路径，未确认）；"
+                    "改用 tools/ 或 PATH 中的 TwitchDownloaderCLI。"
+                )
+            else:
+                return p.resolve()
     for d in tools_td_bin_dirs(root):
         if not d.is_dir():
             continue

@@ -377,7 +377,18 @@ def test_dotenv_only_loads_translation_keys_and_cannot_override_executable(
     )
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("_TWITCH_TRANSPARENT_TEST_MODE", raising=False)
-    monkeypatch.delenv("OPENAI_COMPAT_API_KEY", raising=False)
+    # 本测试要求"进程环境无任何翻译键"才能走到 cwd .env 加载路径；上游测试
+    # (save_dotenv 的 os.environ 直写,monkeypatch undo 之外)可能留下
+    # BASE_URL/MODEL,这里把六个翻译键全部清掉,而非只清 API key。
+    for _k in (
+        "OPENAI_COMPAT_API_KEY",
+        "OPENAI_COMPAT_BASE_URL",
+        "OPENAI_COMPAT_MODEL",
+        "AGNES_API_KEY",
+        "AGNES_BASE_URL",
+        "AGNES_MODEL",
+    ):
+        monkeypatch.delenv(_k, raising=False)
     monkeypatch.delenv("TWITCHDOWNLOADER_CLI", raising=False)
     monkeypatch.delenv("EDITOR", raising=False)
     monkeypatch.setenv("PATH", "")
@@ -409,6 +420,9 @@ def test_process_environment_cli_override_requires_absolute_path(
     assert td.find_twitchdownloader_cli(tmp_path / "empty") is None
 
     monkeypatch.setenv("TWITCHDOWNLOADER_CLI", str(payload.resolve()))
+    # P2-10: tmp_path 不在信任根 → 走确认门；测试里直接放行以锁定
+    # "绝对路径显式覆盖在用户确认后生效"的契约。
+    monkeypatch.setattr(common_utils, "_confirm_untrusted_executable", lambda p: True)
     assert td.find_twitchdownloader_cli(tmp_path / "empty") == payload.resolve()
 
 

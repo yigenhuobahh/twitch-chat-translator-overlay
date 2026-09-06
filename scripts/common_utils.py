@@ -881,6 +881,41 @@ def _confirm_untrusted_dotenv() -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
+def _is_trusted_executable_path(p: Path) -> bool:
+    """P2-10: env 覆盖的二进制是否位于信任根或已注册的可执行目录。"""
+    try:
+        resolved = Path(p).expanduser().resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+    trusted_dirs = set(_TRUSTED_EXECUTABLE_DIRS)
+    try:
+        trusted_dirs.add(trusted_tools_root(__file__))
+    except (OSError, RuntimeError, TypeError, ValueError):
+        pass
+    return any(resolved == item or _is_within(resolved, item) for item in trusted_dirs)
+
+
+def _confirm_untrusted_executable(path: Path) -> bool:
+    """Confirm executing a binary from an untrusted directory (TWITCHDOWNLOADER_CLI).
+
+    Mirrors _confirm_untrusted_dotenv: fails closed on any non-interactive
+    stdin (pipe, CI, redirected input).
+    """
+    try:
+        if sys.stdin is None or not sys.stdin.isatty():
+            return False
+    except Exception:
+        return False
+    try:
+        answer = input(
+            f"环境变量 TWITCHDOWNLOADER_CLI 指向非信任目录的可执行文件:\n"
+            f"  {path}\n仍要执行该程序? [y/N]: "
+        )
+    except (EOFError, OSError):
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
 def load_dotenv_if_present() -> None:
     """Load translation API keys from the first .env without overriding process vars.
 
