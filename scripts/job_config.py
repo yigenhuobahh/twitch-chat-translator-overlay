@@ -11,6 +11,8 @@ import re
 import tempfile
 from typing import Any
 
+import media_probe
+
 try:
     import yaml  # type: ignore
 except ImportError:  # pragma: no cover
@@ -241,7 +243,8 @@ FLOAT_JOB_FIELDS = frozenset(
 
 # output_fps also accepts exact rationals ("30000/1001") like the burn CLI's
 # --output-fps parser; the value stays a string for that CLI to normalize.
-_RATIONAL_FPS_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?\s*/\s*[+-]?\d+(?:\.\d+)?$")
+# C1 单源化: 语法/有限性/负数/零分母校验统一走 media_probe.parse_rational_fps_text，
+# 本模块不再维护独立的 _RATIONAL_FPS_RE。
 
 # 数值范围表（与 burn 侧 twitch_chat_burn._validate_runtime_args 对齐）：
 #   FLOAT_RANGE: 字段 -> (low, high, low_inclusive, high_inclusive)
@@ -368,19 +371,28 @@ def _validated_float_field(attr: str, value: Any) -> Any:
                 _check_float_range(attr, parsed)
                 return parsed
             raise _numeric_type_error(attr, "有限数值", value)
-        if attr == "output_fps" and _RATIONAL_FPS_RE.match(text):
-            num, _, den = text.partition("/")
+        if attr == "output_fps" and "/" in text:
+            # C1 单源化: 共享 helper 负责语法、有限性、零分母与负数拒绝。
             try:
-                quotient = float(num) / float(den)
-            except (ZeroDivisionError, ValueError):
-                quotient = None
-            if quotient is not None and math.isfinite(quotient):
-                # 有理数形式也要过范围（如 0/1 与 999/1 都应被拒绝）。
-                _check_float_range(attr, quotient)
-                return value
-            raise _numeric_type_error(attr, "数值（整数或小数）", value)
+                _, quotient = media_probe.parse_rational_fps_text(text)
+            except ValueError:
+                raise _numeric_type_error(attr, "数值（整数或小数）", value) from None
+            # 有理数形式也要过范围（如 0/1 与 999/1 都应被拒绝）。
+            _check_float_range(attr, quotient)
+            return value
         raise _numeric_type_error(attr, "数值（整数或小数）", value)
     raise _numeric_type_error(attr, "数值（整数或小数）", value)
+
+
+def _validated_str_field(attr: str, value: Any) -> str:
+    """Free-text job fields (context) must stay strings — reject, never coerce.
+
+    与数值字段同一契约：错误的 YAML 值类型在载入时就报错（D-#7），而不是等
+    到翻译阶段 join/len 才 TypeError（render_cn_chat._prepare_translation_context）。
+    """
+    if isinstance(value, str):
+        return value
+    raise _numeric_type_error(attr, "字符串", value)
 
 
 def _require_yaml() -> None:
@@ -623,6 +635,9 @@ def load_job_file(path: str | Path) -> dict[str, Any]:
         if attr in FLOAT_JOB_FIELDS:
             out[attr] = _validated_float_field(attr, value)
             continue
+        if attr == "context":
+            out[attr] = _validated_str_field(attr, value)
+            continue
         out[attr] = value
 
     if nested:
@@ -824,6 +839,11 @@ def save_last_job(path: str | Path, jobs_dir: str | Path | None = None) -> None:
         pass
 
 
+# \t \n \v \f \r 之外的剩余 C0 控制符与 DEL（\x7f）：_yaml_quote 里统一转成
+# \xXX，否则裸写进 job YAML 后 safe_load 直接拒绝（write 出的文件永久无法 load）。
+_C0_ESCAPE_RE = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
+
+
 def _yaml_quote(value: Any) -> str:
     if value is None:
         return "null"
@@ -837,15 +857,20 @@ def _yaml_quote(value: Any) -> str:
     # Quote if special YAML chars / leading special / newline / "- " sequence
     # indicator: bare `context: - note` parses as a block sequence and breaks
     # safe_load, so those values must be double-quoted with escapes.
+    # Tab/VT/FF 等其余 C0 控制符（含 DEL）同样必须进引号：裸 tab 会让 plain
+    # scalar 无法被 safe_load 解析（ScannerError），裸 VT/FF/DEL 触发 ReaderError。
     if (
         "\n" in s
         or "\r" in s
         or s.startswith("- ")
         or any(c in s for c in (":", "#", "{", "}", "[", "]", ",", "&", "*", "?", "|", ">", "!", "%", "@", "`", "'", '"'))
+        or any(ord(c) < 0x20 and c not in ("\n", "\r") or ord(c) == 0x7F for c in s)
         or s.strip() != s
         or s.lower() in ("null", "true", "false", "yes", "no")
     ):
         esc = s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
+        esc = esc.replace("\t", "\\t").replace("\x0b", "\\v").replace("\x0c", "\\f")
+        esc = _C0_ESCAPE_RE.sub(lambda m: f"\\x{ord(m.group()):02x}", esc)
         return f'"{esc}"'
     return s
 
