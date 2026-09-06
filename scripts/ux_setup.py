@@ -93,10 +93,12 @@ def _tighten_env_permissions(env_path: Path) -> bool:
 
     .env 明文含 API key:POSIX 侧收紧到仅属主可读写(0o600)。Windows 的
     ACL 继承模型不适用 chmod 语义,跳过(对齐 env_bootstrap 原子写先例)。
+    经模块自身的 os 绑定调用(而非 Path.chmod 方法):平台分支与 chmod 都
+    走同一 seam,测试在任意宿主上都能用 SimpleNamespace 替身拦截。
     """
     if os.name == "nt":
         return False
-    env_path.chmod(0o600)
+    os.chmod(env_path, 0o600)
     return True
 
 

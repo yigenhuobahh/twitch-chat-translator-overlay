@@ -65,10 +65,11 @@ def test_tighten_env_permissions_chmods_on_posix(ux_mod, tmp_path: Path, monkeyp
     monkeypatch_platform(ux_mod, "posix")
 
     # Pin the exact mode, not just the boolean return: the POSIX branch must
-    # request owner-rw only (0o600). Path.chmod() routes through the global
-    # os.chmod, so a spy records the mode argument on every host. (We cannot
-    # read it back from st_mode on Windows: MSVCRT's _chmod maps every
-    # write-enabled mode to 0o666 in st_mode.)
+    # request owner-rw only (0o600). 产品的 chmod 走 ux_setup 自身的 os 绑定
+    # (monkeypatch_platform 注入的 SimpleNamespace),所以 spy 直接指向该
+    # namespace——不依赖全局 os.chmod 的拦截时序,任意宿主确定生效。
+    # (We cannot read the mode back from st_mode on Windows: MSVCRT's _chmod
+    # maps every write-enabled mode to 0o666 in st_mode.)
     chmod_calls: list[tuple[Path, int]] = []
     real_chmod = os.chmod
 
@@ -76,7 +77,7 @@ def test_tighten_env_permissions_chmods_on_posix(ux_mod, tmp_path: Path, monkeyp
         chmod_calls.append((p, mode))
         return real_chmod(p, mode, **kwargs)
 
-    monkeypatch.setattr(os, "chmod", spy_chmod)
+    ux_mod.os.chmod = spy_chmod
 
     assert ux_mod._tighten_env_permissions(env_file) is True
     assert chmod_calls == [(env_file, 0o600)]
