@@ -29,8 +29,12 @@ def test_restart_after_cancel_finishes_stale_running_record(tmp_path: Path, monk
             old_id = app.active_history_id
             assert app.history.get(old_id)["state"] == "running"
 
-            # 取消但不在本 pilot 轮询里等待终态分支(模拟 0.15s 窗口内用户重启)。
+            # 取消,并停掉 0.15s 轮询定时器——本用例钉的正是"终态分支还没收割
+            # 旧会话时用户就重启"的窗口;慢机(CI)上等待循环可能跨过一个 tick,
+            # 不停表会让窗口场景变成竞态。
             assert app.session.cancel()
+            if app.poll_timer is not None:
+                app.poll_timer.stop()
             deadline = time.monotonic() + 10.0
             while app.session.running and time.monotonic() < deadline:
                 await pilot.pause(0.02)
