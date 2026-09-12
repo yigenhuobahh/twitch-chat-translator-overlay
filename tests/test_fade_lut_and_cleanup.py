@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import os
 from pathlib import Path
 import re
 import sys
@@ -202,7 +203,7 @@ def _read(name: str) -> str:
     return (SCRIPTS / name).read_text(encoding="utf-8")
 
 
-def test_doctor_packages_include_textual_required():
+def test_doctor_packages_include_textual_required(monkeypatch):
     """doctor_check must check textual as a required package.
 
     D1 单源收敛后 doctor 不再手抄包 dict：textual 的 requiredness 唯一归属
@@ -210,6 +211,9 @@ def test_doctor_packages_include_textual_required():
     doctor 从其派生 pkg 检查项。此测试随之改为行为断言 + env_bootstrap 源码
     门禁（原 doctor_check.py 源码正则只对旧手抄实现成立）。
     """
+    # tests-3: collect_readiness() 直调会触发 prepend_tools_ffmpeg_to_path();
+    # 快照 PATH 让 teardown 还原,测试进程不被污染。
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
     import env_bootstrap
     from env_bootstrap import collect_readiness
 
@@ -241,7 +245,7 @@ def test_env_bootstrap_packages_include_textual_required():
     assert "textual" in guard.group(1)
 
 
-def test_textual_readiness_entry_real_when_installed():
+def test_textual_readiness_entry_real_when_installed(monkeypatch):
     """When textual is importable, collect_readiness reports the pkg:textual item ok."""
     try:
         importlib.util.find_spec("textual")
@@ -250,6 +254,9 @@ def test_textual_readiness_entry_real_when_installed():
 
     import env_bootstrap as env_bootstrap_mod
 
+    # tests-3: collect_readiness() 直调会触发 prepend_tools_ffmpeg_to_path();
+    # 快照 PATH 让 teardown 还原,测试进程不被污染。
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
     items = env_bootstrap_mod.collect_readiness()
     textual_items = [it for it in items if getattr(it, "key", "") == "pkg:textual"]
     assert len(textual_items) == 1, "collect_readiness must emit exactly one pkg:textual check"

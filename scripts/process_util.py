@@ -83,6 +83,15 @@ _DICT_REPR_SECRET = re.compile(
     r"(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)"
 )
 _OAUTH_ARGUMENT = re.compile(r"(?i)(--oauth(?:\s+|=))(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)")
+# 中文键名形态（security-1）：异常/日志里常见的 “OAuth 令牌: <值>” /
+# “oauth token = <值>”。_NAMED_SECRET 只认英文键名（oauth/token 后紧跟
+# [:=]），中文标签需要专门规则；值侧与 _NAMED_SECRET 同风格，额外排除
+# 全角引号/右括号，避免吞掉中文句子尾巴。须在 _NAMED_SECRET 之前应用，
+# 让整个双语键名作为一个单元被消费。
+_OAUTH_TOKEN_ZH = re.compile(
+    r"(?i)(oauth\s*(?:令牌|token)\s*[:=]\s*)"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;'\"）)]+)"
+)
 # 只脱敏密钥形态的变量名（后缀白名单）；BASE_URL 等普通名称交给值侧规则，
 # 避免“抹名不抹值”式过度脱敏。
 _ENVIRONMENT_VARIABLE = re.compile(
@@ -95,6 +104,7 @@ def redact_text(value: str) -> str:
     value = _BASE_URL_VALUE.sub(r"\1[redacted]", value)
     value = _URL_USERINFO.sub(r"\1[redacted]/", value)
     value = _OAUTH_ARGUMENT.sub(r"\1[redacted]", value)
+    value = _OAUTH_TOKEN_ZH.sub(r"\1[redacted]", value)
     value = _AUTHORIZATION_SECRET.sub(r"\1[redacted]", value)
     value = _JSON_SECRET.sub(r"\1\"[redacted]\"", value)
     value = _DICT_REPR_SECRET.sub(r"\1'[redacted]'", value)
@@ -728,6 +738,13 @@ def _is_partial_artifact(name: str) -> bool:
         r"\..+\.download-[0-9a-f]{8,}\.(mp4|html|htm|json|mkv|webm|avi|mov|m4v)", lower
     ):
         return True
+    # 翻译 context 交接文件（render_cn_chat._prepare_translation_context:
+    # f"translation_context_{os.getpid()}_{uuid.uuid4().hex[:8]}.txt"，内容可含
+    # 敏感 glossary）。写盘方只在 finally 里清理，硬杀即无人认领——本规则是
+    # --clean 唯一兜底。命名与写入方互为契约（twin）：改任一侧须同步另一侧
+    # （pid 为十进制数字、随机段恰为 8 位小写 hex，与写入点严格一致）。
+    if re.fullmatch(r"translation_context_[0-9]+_[0-9a-f]{8}\.txt", lower):
+        return True
     return False
 
 
@@ -760,6 +777,25 @@ _RESIDUE_DOT_TMP_RE = re.compile(
 _RESIDUE_JOB_STAGING_RE = re.compile(r"^\.job_.{6,}|^\.batch_.{6,}")
 _RESIDUE_INSTALL_STAGING_RE = re.compile(
     r"^\..+\.(?:install|ready)-[0-9a-z_.-]{4,}", re.IGNORECASE
+)
+
+# --clean 认领的 .bak 形态:仅限工具发布/换装路径自建的备份
+# (review_tables.publish_output / twitch_chat_burn._publish_promotable_locked /
+# overlay_compose 均为 <产物路径> + ".bak")。诚实边界:形态与用户手工备份
+# 同号时无法区分——video.mp4.bak 无论谁写都会被清理;受保护的是非产物
+# 后缀(notes.txt.bak / archive.zip.bak 之类)。
+_BAK_ARTIFACT_SUFFIXES = (
+    ".mp4.bak",
+    ".mkv.bak",
+    ".webm.bak",
+    ".mov.bak",
+    ".avi.bak",
+    ".html.bak",
+    ".htm.bak",
+    ".json.bak",
+    ".xlsx.bak",
+    ".tsv.bak",
+    ".csv.bak",
 )
 
 
@@ -903,10 +939,12 @@ def clean_temp_artifacts(
         if _is_stale_residue(name, path, is_dir=False):
             return True
         # Crash-leftover publish lock files (.publish.guard) and backup copies
-        # (<file>.bak) from promote paths; deletion only — restore stays manual.
+        # (<产物>.bak) from promote paths; deletion only — restore stays manual.
+        # .bak 只认领工具产物形态(_BAK_ARTIFACT_SUFFIXES),用户手工的
+        # notes.txt.bak 类非产物后缀不受影响。
         if _is_publish_guard_artifact(name):
             return True
-        if clean_bak_artifacts and name.lower().endswith(".bak"):
+        if clean_bak_artifacts and name.lower().endswith(_BAK_ARTIFACT_SUFFIXES):
             return True
         if clean_progress and name.lower().endswith(".progress.json"):
             return True

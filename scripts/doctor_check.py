@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """环境诊断（--doctor）——从 render_cn_chat.py 原样搬出（搬运而非重写）。
 
-只依赖 env_bootstrap / common_utils / ux_setup 的可直连函数，不读渲染编排层
-任何模块级可变全局，因此不需要注入。
+只依赖 env_bootstrap / common_utils / process_util / ux_setup 的可直连函数，
+不读渲染编排层任何模块级可变全局，因此不需要注入。
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from env_bootstrap import (
     prepend_tools_ffmpeg_to_path,
     print_readiness_report,
 )
+from process_util import redact_text
 from ux_setup import print_setup_next_steps
 
 
@@ -149,7 +150,8 @@ def doctor(args):
     check(
         "翻译 Base URL",
         bool(base_url),
-        base_url or "未设置",
+        # security-3: 明细输出前过脱敏（base_url 可能内嵌带凭据的 userinfo）。
+        redact_text(base_url) if base_url else "未设置",
         f"设置 OPENAI_COMPAT_BASE_URL；仅复用翻译可忽略\n      可 {current_cli_invocation()} --init 生成 .env",
         required=False,
     )

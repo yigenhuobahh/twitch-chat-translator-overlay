@@ -13,7 +13,10 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 
-def test_collect_readiness_has_core_keys():
+def test_collect_readiness_has_core_keys(monkeypatch):
+    # tests-3: collect_readiness() 先调 prepend_tools_ffmpeg_to_path(),命中
+    # tools/ffmpeg 时会改写进程 PATH;快照让 teardown 还原,不污染其他测试。
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
     from env_bootstrap import collect_readiness, readiness_levels
 
     items = collect_readiness()
@@ -27,7 +30,10 @@ def test_collect_readiness_has_core_keys():
     assert isinstance(min_ok, bool) and isinstance(full_ok, bool)
 
 
-def test_print_readiness_report_runs(capsys):
+def test_print_readiness_report_runs(capsys, monkeypatch):
+    # tests-3: print_readiness_report() 内部走 collect_readiness → prepend,
+    # 快照 PATH 让 teardown 还原。
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
     from env_bootstrap import print_readiness_report
 
     min_ok, full_ok = print_readiness_report()
@@ -88,6 +94,9 @@ def test_doctor_prints_readiness(capsys, monkeypatch):
     import env_bootstrap as eb
     import render_cn_chat as pipe
 
+    # tests-3: doctor() 路径触发 prepend_tools_ffmpeg_to_path();快照 PATH
+    # 让 monkeypatch teardown 还原,测试进程不被污染。
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
     # Non-interactive: do not block on install prompt
     monkeypatch.setattr(eb, "can_prompt_interactive", lambda: False)
     monkeypatch.setattr(eb, "maybe_prompt_offer_fixes", lambda **k: False)
@@ -444,6 +453,8 @@ def test_collect_readiness_api_item_uses_shared_fallback(monkeypatch):
     """collect_readiness 的 api 检查项复用同一回退实现(AGNES_* 也算已配置)。"""
     import env_bootstrap as eb
 
+    # tests-3: collect_readiness() 直调会触发 prepend;快照 PATH 供 teardown 还原。
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
     for key in _API_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("AGNES_BASE_URL", "https://agnes.invalid/v1")

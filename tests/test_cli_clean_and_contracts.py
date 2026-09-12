@@ -982,6 +982,27 @@ def test_posix_descendant_kill_errors_swallowed(monkeypatch):
     assert killed == [111, 222]
 
 
+def test_windows_taskkill_command_shape(monkeypatch):
+    """Windows branch mirror of the POSIX tests: taskkill.exe, /F only when forced.
+
+    commands-2/tests-2: monkeypatched _is_windows/require_executable/subprocess.run
+    — no real taskkill invocation happens (the real branch runs on Windows boxes).
+    """
+    import process_util as pu
+
+    commands: list[list[str]] = []
+    monkeypatch.setattr(pu, "_is_windows", lambda: True)
+    monkeypatch.setattr(pu, "require_executable", lambda name: name)
+    monkeypatch.setattr(pu.subprocess, "run", lambda cmd, **kwargs: commands.append(list(cmd)))
+
+    pu.kill_process_tree(4242, force=True)
+    assert commands[-1] == ["taskkill.exe", "/F", "/T", "/PID", "4242"]
+
+    pu.kill_process_tree(4242, force=False)
+    assert commands[-1] == ["taskkill.exe", "/T", "/PID", "4242"]
+    assert "/F" not in commands[-1]
+
+
 # ---------------------------------------------------------------------------
 # C-11: make_job_dir must not expose a half-built job dir (marker written,
 # run_meta.json missing) — concurrent --clean-all would rmtree it on POSIX.
@@ -1095,3 +1116,30 @@ def test_clean_removes_bak_and_publish_guard_files(tmp_path: Path):
     assert (tmp_path / "notes.bak.txt").is_file(), ".bak must be a trailing suffix"
     assert count >= 5
     assert freed > 0
+
+
+# ---------------------------------------------------------------------------
+# C-8b: --clean claims only tool-artifact .bak forms (0912 correctness-2,
+# option C). Non-artifact user backups (notes.txt.bak / archive.zip.bak)
+# must survive; every publish-path suffix family in _BAK_ARTIFACT_SUFFIXES
+# must still be claimed.
+# ---------------------------------------------------------------------------
+
+def test_clean_bak_narrowed_to_artifact_forms(tmp_path: Path):
+    from process_util import clean_temp_artifacts
+
+    user_backups = ["notes.txt.bak", "archive.zip.bak", "readme.md.bak", "setup.exe.bak"]
+    tool_backups = [
+        "video.mp4.bak", "clip.mkv.bak", "clip.webm.bak", "clip.mov.bak", "clip.avi.bak",
+        "chat.html.bak", "chat.htm.bak", "translation.json.bak",
+        "review.xlsx.bak", "review.tsv.bak", "review.csv.bak",
+    ]
+    for name in user_backups + tool_backups:
+        (tmp_path / name).write_bytes(b"x" * 10)
+
+    clean_temp_artifacts(tmp_path, clean_progress=False, clean_all=False)
+
+    for name in user_backups:
+        assert (tmp_path / name).is_file(), f"non-artifact {name} must survive narrowed clean"
+    for name in tool_backups:
+        assert not (tmp_path / name).exists(), f"tool artifact {name} must be claimed"

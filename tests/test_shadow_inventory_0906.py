@@ -17,6 +17,7 @@ Covers:
 from __future__ import annotations
 
 import importlib
+import os
 from pathlib import Path
 import re
 import shutil
@@ -72,6 +73,9 @@ def test_doctor_and_env_bootstrap_package_lists_agree(monkeypatch):
     surfaces report absent; the derived missing-required list must equal the
     env_bootstrap required set (PIL/bs4/yaml/textual consistency).
     """
+    # tests-3: collect_readiness() 会先调 prepend_tools_ffmpeg_to_path(),
+    # 命中 tools/ffmpeg 时改写进程 PATH;快照让 teardown 还原,不污染其他测试。
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
     import env_bootstrap
 
     pkg_modules = [
@@ -168,16 +172,20 @@ def test_tui_preset_options_survive_missing_profiles_dir(monkeypatch, tmp_path):
     # repo profiles/ still exists; force profiles_search_dirs to find nothing
     monkeypatch.setattr(common_utils, "profiles_search_dirs", lambda: [])
 
-    import tui_run
+    try:
+        import tui_run
 
-    layout_vals = [value for _label, value in tui_run._LAYOUT_PRESET_OPTIONS]
-    assert layout_vals == [
-        "default", "right", "compact", "mobile",
-        "transparent", "sidebar", "top_right",
-    ], layout_vals
-    sys.modules.pop("tui_run", None)
-    if saved_tui_run is not None:
-        sys.modules["tui_run"] = saved_tui_run
+        layout_vals = [value for _label, value in tui_run._LAYOUT_PRESET_OPTIONS]
+        assert layout_vals == [
+            "default", "right", "compact", "mobile",
+            "transparent", "sidebar", "top_right",
+        ], layout_vals
+    finally:
+        # 与 test_tui_preset_options_merge_discovered 相同的恢复纪律：断言失败
+        # 也必须还原 tui_run 模块对象，保持全进程内 tui_run 身份唯一。
+        sys.modules.pop("tui_run", None)
+        if saved_tui_run is not None:
+            sys.modules["tui_run"] = saved_tui_run
 
 
 # ---------------------------------------------------------------------------
@@ -346,3 +354,15 @@ def test_layout_float_and_bool_fields_unchanged(layout_preset_mod):
     assert coerce("reuse_static_frames", True) is True
     assert coerce("reuse_static_frames", 0) is False
     assert coerce("stack_mode", "lanes") == "lanes"
+
+
+def test_layout_float_field_rejects_bools(layout_preset_mod):
+    """float 分支与 int 分支口径对齐：bool 是 int 子类，不得静默收敛
+    float(True)=1.0（regression: correctness-5）。"""
+    coerce = layout_preset_mod._coerce
+    with pytest.raises(ValueError, match="msg_lifetime"):
+        coerce("msg_lifetime", True)
+    with pytest.raises(ValueError, match="msg_lifetime"):
+        coerce("msg_lifetime", False)
+    # 非 bool 输入语义不变。
+    assert coerce("msg_lifetime", 14) == 14.0

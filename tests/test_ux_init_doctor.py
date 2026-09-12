@@ -368,6 +368,9 @@ def test_apply_mode_render_ok_with_reuse(pipeline):
 
 def test_doctor_mentions_next_steps(pipeline, capsys, monkeypatch):
     # Avoid depending on real video; doctor without inputs still prints 推荐下一步
+    # tests-3: doctor() 路径触发 prepend_tools_ffmpeg_to_path();快照 PATH
+    # 让 monkeypatch teardown 还原,测试进程不被污染。
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
     monkeypatch.delenv("OPENAI_COMPAT_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_COMPAT_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_COMPAT_MODEL", raising=False)
@@ -635,7 +638,9 @@ def _patch_doctor_probe(monkeypatch, doctor_mod, duration: str) -> None:
     )
 
 
-def test_doctor_missing_video_file_fails_with_hint(doctor_mod, tmp_path, capsys):
+def test_doctor_missing_video_file_fails_with_hint(doctor_mod, tmp_path, monkeypatch, capsys):
+    # tests-3: doctor() 会调 prepend_tools_ffmpeg_to_path();快照 PATH 供还原。
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
     code = doctor_mod.doctor(_doctor_args(video=tmp_path / "nope.mp4"))
 
     out = capsys.readouterr().out
@@ -644,7 +649,9 @@ def test_doctor_missing_video_file_fails_with_hint(doctor_mod, tmp_path, capsys)
     assert code == 1
 
 
-def test_doctor_missing_chat_html_file_fails(doctor_mod, tmp_path, capsys):
+def test_doctor_missing_chat_html_file_fails(doctor_mod, tmp_path, monkeypatch, capsys):
+    # tests-3: doctor() 会调 prepend_tools_ffmpeg_to_path();快照 PATH 供还原。
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
     code = doctor_mod.doctor(_doctor_args(chat_html=tmp_path / "nope.html"))
 
     out = capsys.readouterr().out
