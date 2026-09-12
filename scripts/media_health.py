@@ -250,12 +250,14 @@ def _decode_check_with_progress(path: Path, *, duration: float) -> tuple[bool, s
     except OSError as exc:
         return False, f"Full decode check failed: {exc}"
 
-    emit_task_event("stage_started", stage="media_decode", completed=0, total=100)
     # Track the decode child in process_util's registry (same one run_tracked
     # feeds) so parent exit/cancel paths (kill_active_processes) can reap a
     # potentially 24 h decode instead of orphaning it. The raw Popen handle is
     # preserved so per-line progress parsing behaves exactly as before.
+    # emit_task_event 先注册、后写盘：收窄 kill-while-spawn 窗口（磁盘事件写
+    # 可能阻塞，期间父进程若被杀，已注册的子进程才会被收割）。
     with tracked_process(process):
+        emit_task_event("stage_started", stage="media_decode", completed=0, total=100)
         deadline = time.monotonic() + 24 * 3600
         lines: queue.Queue[str | None] = queue.Queue(maxsize=256)
         errors: deque[str] = deque(maxlen=20)

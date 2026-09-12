@@ -46,6 +46,7 @@ from env_bootstrap import (
     probe_translate_api,
     save_dotenv_api_config,
 )
+from process_util import install_process_cleanup_handlers
 from tui_history import TuiHistoryStore
 from tui_models import (
     MODE_AUTO,
@@ -959,6 +960,13 @@ class OverlayTui(App[None]):
             # 0.15s 轮询窗口内刚退出的旧任务还挂着临时 events/result 文件；
             # 覆盖引用前先收尾，避免这些文件永久泄漏。
             self.session.drain_after_exit()
+            # 已退出的旧会话若还没经过 _poll_session_once 终态分支（如取消后
+            # 0.15s 内立刻重启），它的历史记录会永远停在 running——先按取消
+            # 收尾，再切换 active_history_id，否则结果清单来不及落 durable
+            # 副本，后续 recover_interrupted 只能在"下次启动"才把僵尸修正。
+            if self.active_history_id and not self.session.running:
+                returncode = self.session.returncode
+                self._finish_history("cancelled" if self.session.cancelled else "failed", returncode)
             self.session.cleanup(keep_failure=False)
         try:
             queued = self.history.start(draft, label=label)
@@ -988,14 +996,24 @@ class OverlayTui(App[None]):
             self.history.finish(self.active_history_id, state="failed", returncode=1, result_path=None)
             self._refresh_history()
             return
-        self.history.mark_running(
-            self.active_history_id,
-            pid=self.session.process.pid if self.session.process else None,
-            result_path=None,
-        )
+        history_degraded = False
+        try:
+            self.history.mark_running(
+                self.active_history_id,
+                pid=self.session.process.pid if self.session.process else None,
+                result_path=None,
+            )
+        except OSError:
+            # concurrency-5: 僵死 TUI 实例持有历史锁 >5s 时 mark_running 裸抛会沿
+            # 消息处理链打崩本实例；任务进程已启动，历史写不进去只降级提示
+            # （终态时 _finish_history 仍会按 active_history_id 收尾）。
+            history_degraded = True
         self._refresh_history()
         self._set_history_clear_enabled(False)
-        self._set_status(label)
+        if history_degraded:
+            self._set_status(f"{label}（任务历史暂时无法更新，可能被其他 TUI 实例占用）")
+        else:
+            self._set_status(label)
         self._log("$ " + " ".join(redact_command(command)))
 
     def _start_support_summary(self) -> None:
@@ -1256,8 +1274,14 @@ class OverlayTui(App[None]):
             self._set_status("清空会删除本机任务快照和诊断；请在 10 秒内再次点击确认。")
             return
         self._history_clear_confirmation_until = 0.0
-        if not self.history.clear():
-            self._history_clear_confirmation_until = 0.0
+        try:
+            cleared = self.history.clear()
+        except OSError:
+            # concurrency-5: 其他实例持有历史锁 >5s 时 clear 裸抛会打崩 TUI；
+            # 降级提示,确认窗已重置,用户可稍后重试。
+            self._set_status("任务历史暂时无法写入（可能被其他 TUI 实例占用）；历史未清空。")
+            return
+        if not cleared:
             self._set_status("存在其他窗口正在运行的任务，历史未清空。")
             return
         self.active_history_id = None
@@ -1430,6 +1454,10 @@ class OverlayTui(App[None]):
 
 
 def main() -> int:
+    # concurrency-1: 启动 App 前安装一次 SIGINT/SIGTERM/atexit 清理钩子
+    # （install_process_cleanup_handlers 幂等），TaskSession 注册进
+    # process_util 注册表的子进程才会被 kill_active_processes 收割。
+    install_process_cleanup_handlers()
     OverlayTui().run()
     return 0
 

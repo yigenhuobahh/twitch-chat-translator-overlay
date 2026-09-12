@@ -122,6 +122,8 @@ class TaskSession:
         self._reader: threading.Thread | None = None
         self.cancelled = False
         self.dropped_output = 0
+        # concurrency-1: 子进程当前是否已注册进 process_util._active。
+        self._registered = False
 
     @property
     def running(self) -> bool:
@@ -146,11 +148,10 @@ class TaskSession:
         env = os.environ.copy()
         env["TWITCH_OVERLAY_EVENT_FILE"] = str(self.event_path.resolve())
         env["TWITCH_OVERLAY_RESULT_FILE"] = str(self.result_path.resolve())
-        popen_options: dict[str, object] = {}
-        if os.name != "nt":
-            # kill_process_tree uses killpg on POSIX, so the task must not
-            # share the Textual launcher's process group.
-            popen_options["start_new_session"] = True
+        # concurrency-1: 与 run_tracked/tracked_process 同源的 spawn kwargs
+        # （POSIX start_new_session / Windows CREATE_NEW_PROCESS_GROUP），
+        # 保证整个子进程树可被 kill_process_tree 收割。
+        popen_options = _process_util.popen_kwargs()
         try:
             self.process = subprocess.Popen(
                 self.command,
@@ -167,6 +168,13 @@ class TaskSession:
         except OSError:
             self.cleanup(keep_failure=False)
             raise
+        # concurrency-1: Popen 成功后立即把子进程注册进 process_util 的全局
+        # 注册表（TaskSession 生命周期横跨多次 poll()，套不进 with
+        # tracked_process 的作用域，故直接用 _register/_unregister）。注销点：
+        # poll() 确认收割终态、cleanup()/close() —— 所有退出路径都注销，
+        # 注册表条目不泄漏。
+        _process_util._register(self.process)
+        self._registered = True
         self._reader = threading.Thread(target=self._read_output, name="tui-task-output", daemon=True)
         self._reader.start()
 
@@ -236,6 +244,9 @@ class TaskSession:
                 pass
         if self.result_path and self.result is None and self.process and self.process.poll() is not None:
             self.result = read_task_result(self.result_path)
+        if self.process is not None and self.process.poll() is not None:
+            # 收割终态：子进程已退出即注销注册表（条目只为在跑的子进程保留）。
+            self._release_registry_slot()
         return logs, events
 
     def cancel(self) -> bool:
@@ -245,8 +256,24 @@ class TaskSession:
         kill_process_tree(self.process.pid, force=True)
         return True
 
+    def _release_registry_slot(self) -> None:
+        """Drop this session's child from process_util's registry (idempotent).
+
+        ``process_util._unregister`` already tolerates a missing entry; the
+        flag merely keeps repeated ``poll()`` ticks from re-scanning the list
+        after the child exited. TaskSession 可能在子进程已退出后才 cleanup，
+        这里对两种情况都安全。
+        """
+        if not self._registered:
+            return
+        self._registered = False
+        if self.process is not None:
+            _process_util._unregister(self.process)
+
     def cleanup(self, *, keep_failure: bool = True) -> None:
         """Remove transient events unless a failed run is retained for export."""
+        # close()/start()失败等所有清理路径都先注销注册表条目（幂等）。
+        self._release_registry_slot()
         failed = self.returncode not in (None, 0) and not self.cancelled
         if keep_failure and failed:
             return

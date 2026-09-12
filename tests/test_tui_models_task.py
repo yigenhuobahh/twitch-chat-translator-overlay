@@ -265,6 +265,23 @@ def test_redact_text_covers_user_pass_userinfo_and_oauth_value_shapes():
     assert redact_text("contact me at bob@example.com") == "contact me at bob@example.com"
 
 
+def test_redact_text_covers_chinese_oauth_token_key_shapes():
+    """security-1 回归：中文/混合键名 “OAuth 令牌: <值>” 同样要脱敏。"""
+    zh = redact_text("下载失败: OAuth 令牌: leaked-oauth-value")
+    assert "leaked-oauth-value" not in zh
+    assert "OAuth 令牌: [redacted]" in zh
+    # 英文混合键名 “oauth token = 值” 命中同一条规则。
+    en = redact_text("oauth token = leaked-en-value")
+    assert "leaked-en-value" not in en
+    assert en.endswith("[redacted]")
+    # 全角右括号截断值：句子尾巴不被吞掉。
+    bracketed = redact_text("失败（OAuth 令牌: leaked-value）请检查")
+    assert "leaked-value" not in bracketed
+    assert "）请检查" in bracketed
+    # 不误伤：无分隔符的普通句子保持原样。
+    assert redact_text("oauth token 已过期") == "oauth token 已过期"
+
+
 def test_sanitize_download_source_strips_url_credentials():
     malicious = sanitize_download_source_for_history("https://user:secret@evil.example.com/p?x=1#f")
     assert malicious == "https://evil.example.com/p"
@@ -510,6 +527,35 @@ def test_task_session_start_failure_cleans_transient_files(tmp_path: Path):
         session.start()
     assert session.event_path is not None and not session.event_path.exists()
     assert session.result_path is not None and not session.result_path.exists()
+
+
+def test_task_session_registers_child_in_process_util_registry(tmp_path: Path):
+    """concurrency-1: spawn 后子进程进入 process_util._active；
+    close()/正常收割终态后注销，注册表条目不泄漏。"""
+    import process_util as pu
+
+    # 收割路径：close()（cancel → cleanup）必须注销注册表条目。
+    session = TaskSession([sys.executable, "-c", "import time; time.sleep(30)"], cwd=tmp_path)
+    session.start()
+    assert session.process is not None
+    assert session.process in pu._active
+    session.close()
+    assert session.process not in pu._active
+
+    # 正常退出路径：TaskSession.poll() 确认收割终态后同样注销。
+    finished = TaskSession([sys.executable, "-c", "pass"], cwd=tmp_path)
+    finished.start()
+    assert finished.process is not None
+    assert finished.process in pu._active
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and finished.running:
+        time.sleep(0.02)
+    # running 用的是 Popen.poll()，不会触发注销；显式 poll() 后才注销。
+    assert finished.process in pu._active
+    finished.poll()
+    assert finished.process not in pu._active
+    finished.cleanup()
+    assert finished.process not in pu._active
 
 
 @pytest.mark.slow
