@@ -175,3 +175,26 @@ def test_atomic_replace_directory_permanent_error_restores_backup(tmp_path, monk
 
     assert (dest / "old" / "f.txt").is_file(), "backup must be restored"
     assert not (dest / "new").exists()
+
+
+# ---------------------------------------------------------------------------
+# performance-3: atomic_write_json 紧凑序列化（读回语义不变 + 体积变小）
+# ---------------------------------------------------------------------------
+
+
+def test_atomic_write_json_compact_output(tmp_path):
+    """Compact JSON: json.load semantics unchanged, bytes smaller than indent=2."""
+    data = {"messages": [{"index": i, "translation": f"译{i}"} for i in range(50)]}
+    target = tmp_path / "out.json"
+
+    common_utils.atomic_write_json(target, data)
+
+    raw = target.read_text(encoding="utf-8")
+    # 读回语义不变（机器消费面对空白不敏感）。
+    assert json.loads(raw) == data
+    # 紧凑：无 indent 缩进换行，无默认分隔符空格。
+    assert "\n" not in raw
+    assert '", "' not in raw and '": ' not in raw
+    # 体积严格小于 indent=2 版本。
+    pretty = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    assert len(raw.encode("utf-8")) < len(pretty)
