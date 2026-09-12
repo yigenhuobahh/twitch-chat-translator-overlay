@@ -408,7 +408,15 @@ def _infer_output_from_job(job: dict, job_path: Path) -> Path | None:
 
 
 # extra_cli 中"flag + 独立取值"形式的路径选项；其取值不会被误认成裸媒体路径。
-_EXTRA_VALUE_FLAGS = frozenset({"--output", "--workdir", "--translation-json"})
+# 唯一事实源(design-6 单源化):_split_bare_media_paths /
+# _apply_extra_cli_path_overrides / _confirm_and_run_job 三处消费者都从这里
+# 派生——新增路径 flag 只需改这一处,避免手抄三处漂移。
+_EXTRA_PATH_FLAGS = {
+    "--output": "output",
+    "--workdir": "workdir",
+    "--translation-json": "translation_json",
+}
+_EXTRA_VALUE_FLAGS = frozenset(_EXTRA_PATH_FLAGS)
 _CHAT_EXTENSIONS = frozenset({".html", ".htm"})
 
 
@@ -461,11 +469,7 @@ def _apply_extra_cli_path_overrides(
     out = dict(session or {})
     if not extra_cli:
         return out
-    flags = {
-        "--output": "output",
-        "--workdir": "workdir",
-        "--translation-json": "translation_json",
-    }
+    flags = _EXTRA_PATH_FLAGS
     args = [str(a) for a in extra_cli]
     i = 0
     while i < len(args):
@@ -850,7 +854,7 @@ def _confirm_and_run_job(path: Path, extra_cli: list[str] | None = None) -> int:
             extra.append("--reuse-translation")
     if extra_cli:
         # Forward non-path extras only (paths already applied above).
-        path_flags = {"--output", "--workdir", "--translation-json"}
+        path_flags = _EXTRA_VALUE_FLAGS
         skip_next = False
         for i, a in enumerate(extra_cli):
             if skip_next:
@@ -1360,7 +1364,9 @@ def _menu_download_and_continue() -> int:
         print(f"[FAIL] {redact_text(str(e))}")
         return 2
     except Exception as e:
-        print(f"[FAIL] 下载异常: {e}")
+        # 与上方 TwitchDownloadError 分支同一纪律：泛化异常文本可能回显
+        # URL/PATH 上下文中的凭据，打印前先脱敏。
+        print(f"[FAIL] 下载异常: {redact_text(str(e))}")
         return 1
 
     video = str(result.video_path)

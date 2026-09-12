@@ -192,9 +192,18 @@ def atomic_replace_directory(staged: Path, destination: Path) -> None:
         atomic_replace_with_retry(destination, backup)
     try:
         atomic_replace_with_retry(staged, destination)
-    except Exception:
+    except Exception as exc:
         if backup is not None and not destination.exists():
-            os.replace(backup, destination)
+            try:
+                # 回滚与正向替换对称地走重试 helper（瞬时 WinError 32/5 不再
+                # 让回滚雪上加霜）；耗尽仍失败则保留原始异常链并指路 backup。
+                atomic_replace_with_retry(backup, destination)
+            except OSError as rollback_exc:
+                raise RuntimeError(
+                    f"新版本安装失败（{exc}）且回滚旧目录也失败（{rollback_exc}）；"
+                    f"旧安装已保留于此: {backup.resolve()}，"
+                    f"请手动将该目录移回 {destination} 后重试"
+                ) from exc
         raise
     if backup is not None:
         try:

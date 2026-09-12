@@ -234,8 +234,9 @@ def _reject_option_like(value: str | None, label: str) -> str:
     """Reject slot values that a .NET CLI would parse as its own options."""
     text = "" if value is None else str(value).strip()
     if text.startswith("-"):
+        # security-1: 原值可能内嵌凭据（如 --oauth=…），错误消息一律不回显。
         raise TwitchDownloadError(
-            f"无效{label}: 不能以 '-' 开头（会被 TwitchDownloaderCLI 当作选项）: {text!r}"
+            f"无效{label}: 不能以 '-' 开头（会被 TwitchDownloaderCLI 当作选项），值已隐藏"
         )
     return text
 
@@ -381,6 +382,79 @@ def _print_media_health_warnings(health) -> None:
         print(f"  [WARN] 媒体健康检查: {warning}", flush=True)
 
 
+def _validate_download_video(
+    staged_video: Path,
+    *,
+    media_check: str,
+    media_repair: str,
+    label: str,
+    blocked_action: str,
+    repair_state: dict[str, Path | None],
+    expected_duration: float | None = None,
+    duration_tolerance: float = 1.0,
+    encoder: str | None = None,
+) -> Path:
+    """健康检查（可选音频修复+复检）；返回要发布的视频路径。design-5 双路径共用。
+
+    行为与原两段内联代码逐点一致：单段今天不传 expected_duration/encoder，
+    多段传——差异全部经显式参数进入，不在助手内折叠。encoder=None 时
+    repair_media 走自身默认（"auto"），与单段旧行为等价；"单段是否该透传
+    --download-encoder" 是未批准的行为变更，留人工。
+    repair_state["repaired_video"] 在修复产物落盘后立即写入：即使复检失败
+    抛错，调用方 finally 仍能清理修复文件（返回值在异常路径不可达）。
+    """
+    from media_health import repair_media, validate_media_health
+
+    health = validate_media_health(
+        staged_video,
+        mode=media_check,
+        require_audio=True,
+        expected_duration=expected_duration,
+        duration_tolerance=duration_tolerance,
+    )
+    _print_media_health_warnings(health)
+    video_to_publish = staged_video
+    if not health.ok and str(media_repair or "off").lower() == "audio":
+        try:
+            repaired_video = (
+                repair_media(staged_video) if encoder is None else repair_media(staged_video, encoder=encoder)
+            )
+            repair_state["repaired_video"] = repaired_video
+            health = validate_media_health(
+                repaired_video,
+                mode=media_check,
+                require_audio=True,
+                expected_duration=expected_duration,
+                duration_tolerance=duration_tolerance,
+            )
+            _print_media_health_warnings(health)
+            if health.ok:
+                video_to_publish = repaired_video
+        except (OSError, RuntimeError) as e:
+            raise TwitchDownloadError(f"{label}修复失败，原文件未覆盖: {e}") from e
+    if not health.ok:
+        raise TwitchDownloadError(f"{label}健康检查失败，已阻止{blocked_action}: " + health.reason())
+    return video_to_publish
+
+
+def _cleanup_download_staging(transaction_root: Path, temporaries, *, label: str) -> None:
+    """finally 暂存清理：transaction journal 仍在时保留其登记的 staged 路径。design-5 共用。"""
+    preserve_paths = preserved_staged_paths(transaction_root)
+    for temporary in temporaries:
+        if temporary is None or preserve_paths is None:
+            continue
+        try:
+            resolved_temporary = temporary.resolve(strict=False)
+        except OSError:
+            continue
+        if resolved_temporary in preserve_paths:
+            continue
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"  [WARN] 无法清理{label}临时文件 {temporary}: {exc}", file=sys.stderr, flush=True)
+
+
 def download_assets(
     source: str,
     *,
@@ -410,13 +484,8 @@ def download_assets(
 
     slug = slug_for_source(kind_r, source_id)
     base = Path(out_dir) if out_dir else new_download_session_dir(app_root, slug)
-    try:
-        from process_util import is_dangerous_publish_path
-
-        if is_dangerous_publish_path(base) or is_dangerous_publish_path(base.parent):
-            raise TwitchDownloadError(f"下载目录不能是系统路径: {base}")
-    except ImportError:
-        pass
+    if process_util.is_dangerous_publish_path(base) or process_util.is_dangerous_publish_path(base.parent):
+        raise TwitchDownloadError(f"下载目录不能是系统路径: {base}")
     base.mkdir(parents=True, exist_ok=True)
     transaction_root, video_path, chat_path = resolve_download_targets(
         base,
@@ -439,7 +508,9 @@ def download_assets(
 
     staged_video = _new_download_staging_path(video_path)
     staged_chat = _new_download_staging_path(chat_path)
-    repaired_video: Path | None = None
+    # 修复产物在 finally 里登记清理；try 前初始化保证异常路径(含 _repair_state
+    # 自身)永远可引用。
+    _repair_state: dict[str, Path | None] = {"repaired_video": None}
 
     try:
         # Prefer system/tools ffmpeg for TD video mux when available
@@ -460,25 +531,14 @@ def download_assets(
         _run_cli(vcmd, label="视频下载")
         if not staged_video.is_file():
             raise TwitchDownloadError(f"视频下载未生成新的指定文件: {video_path}")
-        from media_health import repair_media, validate_media_health
-        health = validate_media_health(staged_video, mode=media_check, require_audio=True)
-        _print_media_health_warnings(health)
-        video_to_publish = staged_video
-        if not health.ok and str(media_repair or "off").lower() == "audio":
-            try:
-                repaired_video = repair_media(staged_video)
-                health = validate_media_health(
-                    repaired_video,
-                    mode=media_check,
-                    require_audio=True,
-                )
-                _print_media_health_warnings(health)
-                if health.ok:
-                    video_to_publish = repaired_video
-            except (OSError, RuntimeError) as e:
-                raise TwitchDownloadError(f"下载视频修复失败，原文件未覆盖: {e}") from e
-        if not health.ok:
-            raise TwitchDownloadError("下载视频健康检查失败，已阻止继续下载聊天/翻译/渲染: " + health.reason())
+        video_to_publish = _validate_download_video(
+            staged_video,
+            media_check=media_check,
+            media_repair=media_repair,
+            label="下载视频",
+            blocked_action="继续下载聊天/翻译/渲染",
+            repair_state=_repair_state,
+        )
 
         ccmd = build_chat_cmd(
             cli,
@@ -501,20 +561,11 @@ def download_assets(
             transaction_root=transaction_root,
         )
     finally:
-        preserve_paths = preserved_staged_paths(transaction_root)
-        for temporary in (staged_video, staged_chat, repaired_video):
-            if temporary is None or preserve_paths is None:
-                continue
-            try:
-                resolved_temporary = temporary.resolve(strict=False)
-            except OSError:
-                continue
-            if resolved_temporary in preserve_paths:
-                continue
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError as exc:
-                print(f"  [WARN] 无法清理下载临时文件 {temporary}: {exc}", file=sys.stderr, flush=True)
+        _cleanup_download_staging(
+            transaction_root,
+            (staged_video, staged_chat, _repair_state["repaired_video"]),
+            label="下载",
+        )
     print(f"\n[OK] 视频: {video_path}", flush=True)
     print(f"[OK] 聊天: {chat_path}", flush=True)
     return DownloadResult(
@@ -877,13 +928,8 @@ def download_assets_multi(
 
     slug = slug_for_source(kind_r, source_id)
     base = Path(out_dir) if out_dir else new_download_session_dir(app_root, slug)
-    try:
-        from process_util import is_dangerous_publish_path
-
-        if is_dangerous_publish_path(base) or is_dangerous_publish_path(base.parent):
-            raise TwitchDownloadError(f"下载目录不能是系统路径: {base}")
-    except ImportError:
-        pass
+    if process_util.is_dangerous_publish_path(base) or process_util.is_dangerous_publish_path(base.parent):
+        raise TwitchDownloadError(f"下载目录不能是系统路径: {base}")
     base.mkdir(parents=True, exist_ok=True)
     transaction_root, final_video, final_chat = resolve_download_targets(
         base,
@@ -939,7 +985,8 @@ def download_assets_multi(
     cut_ranges = list(timeline.cuts)
     staged_video = _new_download_staging_path(final_video)
     staged_chat = _new_download_staging_path(final_chat)
-    repaired_video: Path | None = None
+    # 修复产物在 finally 里登记清理；try 前初始化保证异常路径永远可引用。
+    _repair_state: dict[str, Path | None] = {"repaired_video": None}
     mode = ""
 
     try:
@@ -954,36 +1001,20 @@ def download_assets_multi(
         )
 
         expected = timeline.remaining_duration
-        from media_health import repair_media, validate_media_health
         # 每段拼接边界各有一个 probe/trim 残差；按段数线性放大时长容差，
         # 避免多段（如 20 段）把 1s 默认容差耗尽而误判"时长不符"。
         duration_tolerance = 1.0 + 0.05 * len(seg_downloads)
-        health = validate_media_health(
+        video_to_publish = _validate_download_video(
             staged_video,
-            mode=media_check,
-            require_audio=True,
+            media_check=media_check,
+            media_repair=media_repair,
+            label="合并视频",
+            blocked_action="合并聊天/翻译/渲染",
+            repair_state=_repair_state,
             expected_duration=expected,
             duration_tolerance=duration_tolerance,
+            encoder=encoder,
         )
-        _print_media_health_warnings(health)
-        video_to_publish = staged_video
-        if not health.ok and str(media_repair or "off").lower() == "audio":
-            try:
-                repaired_video = repair_media(staged_video, encoder=encoder)
-                health = validate_media_health(
-                    repaired_video,
-                    mode=media_check,
-                    require_audio=True,
-                    expected_duration=expected,
-                    duration_tolerance=duration_tolerance,
-                )
-                _print_media_health_warnings(health)
-                if health.ok:
-                    video_to_publish = repaired_video
-            except (OSError, RuntimeError) as e:
-                raise TwitchDownloadError(f"合并视频修复失败，原文件未覆盖: {e}") from e
-        if not health.ok:
-            raise TwitchDownloadError("合并视频健康检查失败，已阻止合并聊天/翻译/渲染: " + health.reason())
 
         print("-- 合并聊天时间轴 ...", flush=True)
         merge_chat_html(
@@ -1001,20 +1032,11 @@ def download_assets_multi(
             transaction_root=transaction_root,
         )
     finally:
-        preserve_paths = preserved_staged_paths(transaction_root)
-        for temporary in (staged_video, staged_chat, repaired_video):
-            if temporary is None or preserve_paths is None:
-                continue
-            try:
-                resolved_temporary = temporary.resolve(strict=False)
-            except OSError:
-                continue
-            if resolved_temporary in preserve_paths:
-                continue
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError as exc:
-                print(f"  [WARN] 无法清理合并临时文件 {temporary}: {exc}", file=sys.stderr, flush=True)
+        _cleanup_download_staging(
+            transaction_root,
+            (staged_video, staged_chat, _repair_state["repaired_video"]),
+            label="合并",
+        )
 
     print(f"[OK] 合并视频: {final_video}  (mode={mode})", flush=True)
     print(f"[OK] 合并聊天: {final_chat}", flush=True)

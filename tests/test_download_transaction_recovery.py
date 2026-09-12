@@ -505,3 +505,68 @@ def test_transaction_evidence_error_includes_manual_recovery_hint(tmp_path):
     assert "手工删除" in text
     assert ".twitch-download-publish.json" in text
     assert ".twitch-download-publish.lock" in text
+
+
+# ---------------------------------------------------------------------------
+# tests-8: exclusive_file_lock 直接用例(symlink / 非常规文件 / timeout=0)
+# ---------------------------------------------------------------------------
+
+def test_exclusive_file_lock_rejects_symlink_path(tmp_path):
+    """锁路径是 symlink → 直接 raise,不得跟随符号链接打开。"""
+    from process_util import exclusive_file_lock
+
+    target = tmp_path / "target.bin"
+    target.write_bytes(b"payload")
+    link = tmp_path / "lock.link"
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink 不可用(Windows 未开启符号链接权限)")
+    try:
+        with pytest.raises(OSError, match="symlink"):
+            with exclusive_file_lock(link):
+                pass
+    finally:
+        link.unlink(missing_ok=True)
+
+
+def test_exclusive_file_lock_rejects_directory_path(tmp_path):
+    """非常规文件(目录)不能当锁文件:os.open(O_RDWR) 直接失败。"""
+    from process_util import exclusive_file_lock
+
+    with pytest.raises(OSError):
+        with exclusive_file_lock(tmp_path):
+            pass
+
+
+def test_exclusive_file_lock_timeout_zero_raises_immediately(tmp_path):
+    """锁被占用 + timeout=0 → 立即 raise FileLockTimeoutError,不重试等待。"""
+    from process_util import FileLockTimeoutError, exclusive_file_lock
+
+    lock_path = tmp_path / "busy.lock"
+    # 同进程直接持有 OS 级字节锁(绕过 exclusive_file_lock 本身:其模块内
+    # 线程锁会在超时循环之前把同进程二次获取串行化,测不到超时路径)。
+    # 先写 1 字节,使被测方打开时 st_size != 0,跳过其写分支。
+    holder_fd = os.open(
+        lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600
+    )
+    try:
+        os.write(holder_fd, b"\0")
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(holder_fd, 0, os.SEEK_SET)
+            msvcrt.locking(holder_fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(holder_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        start = time.monotonic()
+        with pytest.raises(FileLockTimeoutError, match="timed out"):
+            with exclusive_file_lock(lock_path, timeout=0):
+                pass
+        # timeout=0 → 立即超时,不做 0.05s 间隔重试。
+        assert time.monotonic() - start < 2.0
+    finally:
+        os.close(holder_fd)

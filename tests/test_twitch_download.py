@@ -83,6 +83,20 @@ def test_slot_values_reject_option_like_tokens(tmp_path: Path):
         build_chat_cmd(cli, source_id="123", output=tmp_path / "c.html", begin="-b:evil")
 
 
+def test_reject_option_like_message_hides_original_value():
+    """security-1: 拒绝消息不得回显以 '-' 开头的原值（可能内嵌凭据）。"""
+    from twitch_download import TwitchDownloadError, _reject_option_like
+
+    with pytest.raises(TwitchDownloadError) as excinfo:
+        _reject_option_like("--oauth=leaked-secret", "OAuth 令牌")
+    message = str(excinfo.value)
+    assert "leaked-secret" not in message
+    assert "值已隐藏" in message
+    # 标签（label）仍保留在消息里，定位是哪个槽位被拒。
+    with pytest.raises(TwitchDownloadError, match="下载画质"):
+        _reject_option_like("-q:evil", "下载画质")
+
+
 def test_parse_td_time_and_segment_line_smoke():
     from twitch_download import format_td_t_seconds, parse_segment_line, parse_td_time
 
@@ -582,3 +596,132 @@ def test_multi_segment_duration_tolerance_scales_with_segment_count():
     # 调用方公式（download_assets_multi 内联）：
     seg_downloads = list(range(20))
     assert 1.0 + 0.05 * len(seg_downloads) == 2.0
+
+
+class _StubHealth:
+    def __init__(self, ok=True, warnings=()):
+        self.ok = ok
+        self.warnings = list(warnings)
+        self.reason_text = "stub-reason"
+
+    def reason(self):
+        return self.reason_text
+
+
+def test_validate_download_video_single_segment_call_shape(monkeypatch, tmp_path):
+    """design-5b 行为保留:单段接线 = expected_duration None / 容差默认 / repair 不传 encoder。"""
+    import media_health as mh
+    import twitch_download as td
+
+    calls_validate, calls_repair = [], []
+    monkeypatch.setattr(mh, "validate_media_health",
+                        lambda path, **k: (calls_validate.append(k), _StubHealth())[1])
+    monkeypatch.setattr(mh, "repair_media", lambda *a, **k: (calls_repair.append(k), a[0])[1])
+
+    staged = tmp_path / "staged.mp4"
+    staged.write_bytes(b"x")
+    state = {"repaired_video": None}
+    out = td._validate_download_video(
+        staged, media_check="fast", media_repair="audio",
+        label="下载视频", blocked_action="X", repair_state=state,
+    )
+    assert out is staged
+    assert calls_validate[0]["expected_duration"] is None
+    assert calls_validate[0]["duration_tolerance"] == 1.0
+    assert calls_validate[0]["require_audio"] is True
+    assert not calls_repair  # health.ok 不触发修复
+
+
+def test_validate_download_video_multi_segment_forwards_encoder_and_tolerance(monkeypatch, tmp_path):
+    """design-5b:多段接线把 expected/tolerance/encoder 透传给 validate 与 repair。"""
+    import media_health as mh
+    import twitch_download as td
+
+    calls_validate, calls_repair = [], []
+    bad = _StubHealth(ok=False, warnings=("w",))
+    ok = _StubHealth(ok=True)
+    queue = iter([bad, ok])
+    monkeypatch.setattr(mh, "validate_media_health",
+                        lambda path, **k: (calls_validate.append(k), next(queue))[1])
+    def fake_repair(source, **k):
+        calls_repair.append(k)
+        out = tmp_path / "staged.repaired.mp4"
+        out.write_bytes(b"y")
+        return out
+    monkeypatch.setattr(mh, "repair_media", fake_repair)
+
+    staged = tmp_path / "staged.mp4"
+    staged.write_bytes(b"x")
+    state = {"repaired_video": None}
+    out = td._validate_download_video(
+        staged, media_check="decode", media_repair="audio",
+        label="合并视频", blocked_action="X", repair_state=state,
+        expected_duration=120.0, duration_tolerance=2.0, encoder="nvenc",
+    )
+    assert out == tmp_path / "staged.repaired.mp4"
+    assert state["repaired_video"] == tmp_path / "staged.repaired.mp4"
+    assert calls_validate[0]["expected_duration"] == 120.0
+    assert calls_validate[0]["duration_tolerance"] == 2.0
+    assert calls_validate[1]["expected_duration"] == 120.0  # 复检同参
+    assert calls_repair[0] == {"encoder": "nvenc"}
+
+
+def test_validate_download_video_records_repair_before_revalidate(monkeypatch, tmp_path):
+    """复检仍失败:修复产物已被登记进 repair_state(finally 可清理),抛健康检查失败。"""
+    import media_health as mh
+    import twitch_download as td
+
+    bad = _StubHealth(ok=False)
+    monkeypatch.setattr(mh, "validate_media_health", lambda path, **k: bad)
+    def fake_repair(source, **k):
+        out = tmp_path / "staged.repaired.mp4"
+        out.write_bytes(b"y")
+        return out
+    monkeypatch.setattr(mh, "repair_media", fake_repair)
+
+    staged = tmp_path / "staged.mp4"
+    staged.write_bytes(b"x")
+    state = {"repaired_video": None}
+    with pytest.raises(td.TwitchDownloadError, match="健康检查失败"):
+        td._validate_download_video(
+            staged, media_check="fast", media_repair="audio",
+            label="下载视频", blocked_action="X", repair_state=state,
+        )
+    assert state["repaired_video"] == tmp_path / "staged.repaired.mp4"
+
+
+def test_cleanup_download_staging_preserves_journal_registered_and_skips_none(tmp_path, monkeypatch):
+    import twitch_download as td
+
+    journal_kept = tmp_path / ".download-kept"
+    journal_kept.write_bytes(b"k")
+    doomed = tmp_path / ".download-doomed"
+    doomed.write_bytes(b"d")
+    monkeypatch.setattr(td, "preserved_staged_paths", lambda root: {journal_kept.resolve()})
+
+    td._cleanup_download_staging(tmp_path, (None, doomed, journal_kept), label="下载")
+    assert journal_kept.exists()
+    assert not doomed.exists()
+
+
+def test_cleanup_download_staging_journal_consumed_unlinks_all(tmp_path, monkeypatch):
+    """journal 已消费(preserved 返回空集)→ 全部 staged 清理,与原逐点行为一致。"""
+    import twitch_download as td
+
+    a, b = tmp_path / ".download-a", tmp_path / ".download-b"
+    a.write_bytes(b"a")
+    b.write_bytes(b"b")
+    monkeypatch.setattr(td, "preserved_staged_paths", lambda root: set())
+    td._cleanup_download_staging(tmp_path, (a, b, None), label="合并")
+    assert not a.exists() and not b.exists()
+
+
+def test_cleanup_download_staging_corrupt_evidence_preserves_all(tmp_path, monkeypatch):
+    """preserved 返回 None(证据受损)→ 什么都不删(保留现场等恢复/人工)。"""
+    import twitch_download as td
+
+    a = tmp_path / ".download-a"
+    a.write_bytes(b"a")
+    monkeypatch.setattr(td, "preserved_staged_paths", lambda root: None)
+    td._cleanup_download_staging(tmp_path, (a,), label="下载")
+    assert a.exists()

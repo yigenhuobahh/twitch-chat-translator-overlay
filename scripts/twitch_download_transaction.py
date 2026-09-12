@@ -21,6 +21,7 @@ import threading
 import time
 import uuid
 
+from common_utils import atomic_replace_with_retry
 from process_util import FileLockTimeoutError, exclusive_file_lock
 from twitch_download_types import TwitchDownloadError
 
@@ -666,7 +667,7 @@ def _recover_download_transaction_locked(
                     entry.destination.unlink()
             for entry, _destination_sig, _staged_sig, backup_sig in snapshots:
                 if entry.old_signature is not None and backup_sig == entry.old_signature:
-                    os.replace(entry.backup, entry.destination)
+                    atomic_replace_with_retry(entry.backup, entry.destination)
             for entry, _destination_sig, staged_sig, _backup_sig in snapshots:
                 if staged_sig == entry.staged_signature:
                     entry.staged.unlink()
@@ -706,13 +707,17 @@ def _publish_claimed_download_pair(
                     raise TwitchDownloadError(f"{entry.role} 目标文件在发布前发生变化")
                 if _file_transaction_signature(entry.backup) is not None:
                     raise TwitchDownloadError(f"{entry.role} 备份路径在发布前已被占用")
-                os.replace(entry.destination, entry.backup)
+                # 发布/恢复 replace 走共享重试 helper：并发读者短暂持有目标
+                # 文件（无 FILE_SHARE_DELETE）时 WinError 32/5 是瞬时的，裸
+                # os.replace 一次失败即触发整次下载作废。重试耗尽仍失败则
+                # 原样抛出，走下方 except 的恢复/回滚语义。
+                atomic_replace_with_retry(entry.destination, entry.backup)
         for entry in runtime_entries:
             if _file_transaction_signature(entry.staged) != entry.staged_signature:
                 raise TwitchDownloadError(f"{entry.role} 暂存文件在发布前发生变化")
             if _file_transaction_signature(entry.destination) is not None:
                 raise TwitchDownloadError(f"{entry.role} 目标路径在发布前未腾空")
-            os.replace(entry.staged, entry.destination)
+            atomic_replace_with_retry(entry.staged, entry.destination)
         for entry in runtime_entries:
             if _file_transaction_signature(entry.destination) != entry.staged_signature:
                 raise TwitchDownloadError(f"{entry.role} 发布后签名验证失败")

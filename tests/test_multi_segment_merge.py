@@ -390,6 +390,74 @@ def test_merge_chat_html_normalizes_overlapping_cuts(tmp_path: Path):
     assert [m["timestamp"] for m in data["messages"]] == [1, 3]
 
 
+# ---------------------------------------------------------------------------
+# tests-4: merge_chat_html 输入守卫(空段 / 时间轴不一致 / 超大 HTML)
+# ---------------------------------------------------------------------------
+
+def test_merge_chat_html_rejects_empty_segments(tmp_path: Path):
+    """空段列表必须显式报错,不得产出空壳 merged.html。"""
+    from twitch_download import TwitchDownloadError, merge_chat_html
+
+    with pytest.raises(TwitchDownloadError, match="没有可合并"):
+        merge_chat_html([], source_id="1", out_path=tmp_path / "merged.html")
+
+
+def test_merge_chat_html_rejects_cut_timeline_duration_mismatch(tmp_path: Path):
+    """cut_timeline 的原始时长与片段总时长不一致必须拒绝(concat 同款守卫)。"""
+    from cut_timeline import CutTimeline
+    from twitch_download import (
+        CropSegment,
+        SegmentDownload,
+        TwitchDownloadError,
+        merge_chat_html,
+    )
+
+    source = tmp_path / "seg.html"
+    source.write_text(_seg_html([(101, "a", "hi")]), encoding="utf-8")
+    seg = SegmentDownload(
+        index=0,
+        segment=CropSegment("100s", "110s", 100.0, 110.0),
+        video_path=tmp_path / "seg.mp4",
+        chat_html_path=source,
+        duration_s=10.0,
+    )
+    # 时间轴按 100s 源构建,片段只声明 10s → 总时长不一致
+    timeline = CutTimeline.from_ranges([(2.0, 4.0)], 100.0)
+    with pytest.raises(TwitchDownloadError, match="不一致"):
+        merge_chat_html(
+            [seg], source_id="1", out_path=tmp_path / "merged.html",
+            cut_timeline=timeline,
+        )
+
+
+def test_merge_chat_html_rejects_oversized_segment_html(tmp_path: Path, monkeypatch):
+    """超过 _MAX_HTML_BYTES(2 GiB)的段 HTML 必须拒绝读取。
+
+    不真造 2 GiB 文件:把 vod_merge._MAX_HTML_BYTES(monkeypatch 恢复)压到
+    真实文件大小之下,走同一个 > 上限 守卫分支。
+    """
+    from twitch_download import (
+        CropSegment,
+        SegmentDownload,
+        TwitchDownloadError,
+        merge_chat_html,
+    )
+    import vod_merge
+
+    source = tmp_path / "seg.html"
+    source.write_text(_seg_html([(101, "a", "hi")]), encoding="utf-8")
+    seg = SegmentDownload(
+        index=0,
+        segment=CropSegment("100s", "110s", 100.0, 110.0),
+        video_path=tmp_path / "seg.mp4",
+        chat_html_path=source,
+        duration_s=10.0,
+    )
+    monkeypatch.setattr(vod_merge, "_MAX_HTML_BYTES", source.stat().st_size - 1)
+    with pytest.raises(TwitchDownloadError, match="上限"):
+        merge_chat_html([seg], source_id="1", out_path=tmp_path / "merged.html")
+
+
 def test_concat_videos_single_copy(tmp_path: Path):
     import twitch_download as td
 

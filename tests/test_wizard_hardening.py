@@ -117,6 +117,32 @@ def test_menu_download_segment_parse_error_is_redacted(jobs_dir, tmp_path, monke
     assert "oauth=[redacted]" in out or rc != 0
 
 
+def test_menu_download_generic_exception_is_redacted(jobs_dir, tmp_path, monkeypatch, capsys):
+    """泛化 except Exception 分支：异常文本打印前同样过 redact_text（security-2）。"""
+    import twitch_download as download
+
+    wizard, _calls = _patch_menu(
+        jobs_dir,
+        monkeypatch,
+        answers=iter(["2819850140", "auto", "1080p60", "1", "", "", "Safe", "fast", "audio", "", "1"]),
+    )
+    video = tmp_path / "v.mp4"
+    chat = tmp_path / "c.html"
+    video.write_bytes(b"v")
+    chat.write_text("<html></html>", encoding="utf-8")
+
+    def fail_download(source, **kwargs):
+        raise RuntimeError("上传失败: OAuth 令牌: leaked-oauth-value")
+
+    monkeypatch.setattr(download, "download_assets", fail_download)
+
+    assert wizard._menu_download_and_continue() == 1
+    out = capsys.readouterr().out
+    assert "[FAIL] 下载异常:" in out
+    assert "leaked-oauth-value" not in out
+    assert "[redacted]" in out
+
+
 # ---------------------------------------------------------------------------
 # T-10: preview_clip magic 10 → named constant (no drift between the two sites)
 # ---------------------------------------------------------------------------
@@ -197,3 +223,38 @@ def test_chat_window_preview_clip_constant_matches_wizard_value():
     args2 = Args()
     chat_window.apply_preview_first_defaults(args2, cli_defaults={"overlay_codec": "vp9"})
     assert args2.preview_clip == 10.0
+
+
+# ---------------------------------------------------------------------------
+# design-6: 三份路径 flag 清单单源化后的同源契约。
+# ---------------------------------------------------------------------------
+
+
+def test_extra_path_flag_lists_are_single_sourced():
+    import job_wizard as jw
+
+    # 唯一事实源与派生集合等价;消费点不再各自手抄字面量。
+    assert set(jw._EXTRA_VALUE_FLAGS) == set(jw._EXTRA_PATH_FLAGS)
+    assert frozenset({"--output", "--workdir", "--translation-json"}) == jw._EXTRA_VALUE_FLAGS
+
+    src = (ROOT / "scripts" / "job_wizard.py").read_text(encoding="utf-8")
+    # 手抄字面量(除单源定义本身)不得再次出现——防未来新增消费点绕开事实源。
+    assert src.count('{"--output", "--workdir", "--translation-json"}') == 0
+    assert src.count('"--translation-json": "translation_json"') == 1  # 只活在 _EXTRA_PATH_FLAGS
+
+
+def test_new_path_flag_flows_to_all_three_consumers(tmp_path, monkeypatch):
+    """monkeypatch 事实源新增 --review-xlsx:剥离/映射/转发三处消费同步变化。"""
+    import job_wizard as jw
+
+    monkeypatch.setitem(jw._EXTRA_PATH_FLAGS, "--review-xlsx", "review_xlsx")
+    monkeypatch.setattr(jw, "_EXTRA_VALUE_FLAGS", frozenset(jw._EXTRA_PATH_FLAGS))
+
+    extra = ["--review-xlsx", str(tmp_path / "r.xlsx"), "plain.txt"]
+    # 消费点2:_apply_extra_cli_path_overrides 映射生效
+    out = jw._apply_extra_cli_path_overrides(None, extra)
+    assert out.get("review_xlsx") == str(tmp_path / "r.xlsx")
+    # 消费点1:_split_bare_media_paths 不把取值当裸媒体路径
+    bare, rest = jw._split_bare_media_paths(extra)
+    assert str(tmp_path / "r.xlsx") not in [bare.get("video"), bare.get("chat_html")]
+    assert "--review-xlsx" in rest  # 该 flag 本身仍留在 extras

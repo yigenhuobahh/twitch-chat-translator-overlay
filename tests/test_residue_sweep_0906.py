@@ -87,6 +87,31 @@ class TestDotTmpSiblings:
         assert not p.exists()
 
 
+class TestTranslationContextHandoff:
+    """render_cn_chat 硬杀残留的翻译 context 交接文件（可含敏感 glossary）。
+
+    命名互为契约（twin）：写入方 render_cn_chat._prepare_translation_context
+    为 f"translation_context_{pid}_{uuid4().hex[:8]}.txt"，
+    process_util._is_partial_artifact 按同一命名认领（partial 伞下不限年龄）。
+    """
+
+    def test_old_handoff_file_removed(self, out: Path) -> None:
+        p = out / f"translation_context_{os.getpid()}_a5236cda.txt"
+        p.write_text("sensitive glossary", encoding="utf-8")
+        _age(p, _RESIDUE_MAX_AGE_SEC + 3600)
+        count, _ = clean_temp_artifacts(out, clean_all=False)
+        assert not p.exists()
+        assert count >= 1
+
+    def test_name_shape_mismatch_kept(self, out: Path) -> None:
+        # 契约严格一致：随机 hex 段不足 8 位不认领，避免误伤同名前缀文件。
+        p = out / f"translation_context_{os.getpid()}_abc123.txt"
+        p.write_text("keep", encoding="utf-8")
+        _age(p, _RESIDUE_MAX_AGE_SEC + 3600)
+        clean_temp_artifacts(out, clean_all=False)
+        assert p.exists()
+
+
 class TestDotStagingDirs:
     """make_job_dir / install 的隐藏 staging 目录残留。"""
 
