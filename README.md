@@ -94,7 +94,7 @@ python scripts\render_cn_chat.py --job jobs\example_job.yaml
 | 最终默认名都是 `<视频>_chat.mp4` | **已处理** | 若输出目录已有同名成片，会改发为 `<视频>_chat__job_xxx.mp4`，避免后写覆盖先写 |
 | 各用各的 `--workdir` / `--output` | **最推荐** | 完全隔离，路径最好认 |
 | `--no-job-dir` 共用 out-dir | **不安全** | 共享 `overlay_frames`，后写覆盖；仅兼容旧行为 |
-| 运行中 `--clean` | **安全** | 默认只删 `*.partial.mp4`；`--clean-all` 清已结束/stale running job（仍 skip 存活 pid） |
+| 运行中 `--clean` | **安全** | 默认删 `*.partial.mp4` 与工具产物 `.bak`（`*.mp4.bak` 等发布恢复点，删后不可恢复；同名媒体形态无法区分来源，但 `notes.txt.bak` 之类非产物后缀不受影响）；`--clean-all` 清已结束/stale running job（仍 skip 存活 pid） |
 | 同一视频同目录并发两个翻译管线 | **不安全** | 共享 `<视频>_translation.json` 与复核文件（写原子但互相丢批次）；不同视频或各自 `--workdir`/`--output` 安全 |
 
 ```powershell
@@ -625,9 +625,10 @@ translation_style:
 | `--profile <yaml>` | 翻译 profile |
 | `--doctor` | 环境诊断 |
 | `--workdir <dir>` | pipeline 工作目录（中间文件进 `workdir/temp`，默认输出归档到此） |
-| `--clean` | 清理临时文件后退出：默认只删 `*.partial.mp4`；加 `--clean-all` 才删已结束/stale running 的 `job_`/`batch_`；`--clean-progress` 才删进度文件 |
+| `--clean` | 清理临时文件后退出：默认删 `*.partial.mp4` 与工具产物 `.bak`（发布恢复点，删后不可恢复；非产物后缀不受影响）；加 `--clean-all` 才删已结束/stale running 的 `job_`/`batch_`；`--clean-progress` 才删进度文件 |
 | `--clean-all` | 与 `--clean` 联用：删除 workdir/out 下工具 job 目录（跳过仍存活 pid 的 running） |
 | `--keep-temp` | 保留中间文件 |
+| `--allow-empty-chat` | 聊天解析为 0 条消息时也继续出片（默认失败，避免静默生成无弹幕成片） |
 | `--lazy-message-images` | 长片省内存：消息图按需渲染 + LRU 缓存 |
 
 ### 底层引擎专用（`twitch_chat_burn`，pipeline 内部会调用）
@@ -642,7 +643,7 @@ translation_style:
 | `--strict-import` | 导入时 author/timestamp/original 不一致硬失败（pipeline 同名开关会转发） |
 | `--job-dir <dir>` | 本次运行独立 job 目录（默认在 `--out-dir` 下自动创建） |
 | `--out-dir <dir>` | 中间文件 / 默认输出目录 |
-| `--clean` | 清理 `--out-dir` 临时文件后退出；默认 partials only；`--clean-all` 清已结束/stale running job；或 `--job-dir` 只清一个 |
+| `--clean` | 清理 `--out-dir` 临时文件后退出；默认删 partials 与工具产物 `.bak`（发布恢复点，删后不可恢复；非产物后缀不受影响）；`--clean-all` 清已结束/stale running job；或 `--job-dir` 只清一个 |
 | `--clean-all` | 与 `--clean` 联用：删除工具 `job_`/`batch_` 目录（跳过存活 pid 的 running） |
 
 ## 运行环境诊断

@@ -91,7 +91,7 @@ python -m pytest tests/ -v -m max
 | `tests/test_html_variants.py` | HTML 格式兼容性（单引号、多 class、legacy） |
 | `tests/test_validate_and_offset_edges.py` | duration/offset 边界 |
 | `tests/test_burn_hardening.py` | validate/hex/emote classes 等加固 |
-| `tests/test_font_resolve.py` | 跨平台 CJK 字体检测 |
+| `tests/test_font_resolve.py` | 跨平台 CJK 字体检测（含 `platform.system` 强制的 Windows/Darwin/Linux 三平台候选分支用例） |
 | `tests/test_doctor_import.py` | `--doctor` 不依赖 .env/API |
 
 ### 如何添加新测试

@@ -170,7 +170,7 @@ CLI wins over YAML. Ratio flags: `--x-ratio` / `--y-ratio` / `--width-ratio` / `
 
 - Reusable `jobs/*.yaml` usually **do not pin** video/chat (session paths).  
 - Parallel burns use isolated `job_*` dirs; avoid `--no-job-dir` for concurrent runs.  
-- `--clean`: partials only by default; `--clean-all` removes finished **and stale** tool jobs (skips live PIDs); `--clean-progress` deletes `*.progress.json`.
+- `--clean`: deletes `*.partial.mp4` and tool-artifact `.bak` (publish restore-points like `*.mp4.bak`; **not recoverable**; non-artifact suffixes such as `notes.txt.bak` are left alone) by default; `--clean-all` removes finished **and stale** tool jobs (skips live PIDs); `--clean-progress` deletes `*.progress.json`.
 
 ### After API translate (TTY)
 
@@ -185,6 +185,7 @@ Pause: Enter = continue full render; `P` / `P 30` = short preview; `S` = stop fo
 | `--force-export` | Allow wiping non-empty translations on export |
 | `--strict-import` | On import/render: hard-fail identity mismatch (forwarded to burn) |
 | `--manual-translation` | Export JSON + review tables; stop |
+| `--allow-empty-chat` | Proceed even when the chat parses to 0 messages (default: fail, to avoid silently rendering an overlay-free video) |
 | `--preview-clip` / `--preview-dense` / `--preview-frame` | Short clip / densest window / still |
 | `--layout-preset` / `--render-preset` | YAML or short name |
 | `--download` / `--download-only` / `--quality` / `--begin` / `--end` | Optional TD CLI acquire and single-window trim |
