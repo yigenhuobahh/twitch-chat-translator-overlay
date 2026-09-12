@@ -310,6 +310,7 @@ def truncate_wrapped_lines_with_ellipsis(
     *,
     max_message_lines,
     max_w,
+    header_w,
     padding,
     indent,
     gap,
@@ -322,6 +323,12 @@ def truncate_wrapped_lines_with_ellipsis(
     path is reused so the fallback truncation looks identical to an explicit
     configured limit. An explicit ``max_message_lines`` above the hard cap is
     honored as-is (user's explicit choice).
+
+    ``header_w`` is the first line's start offset (padding + badges + author +
+    colon, from compute_message_header_width): a single-line message draws its
+    fragments after the header, so its budget is ``max_w - header_w`` (not
+    ``max_w - padding`` — a long nickname would push the '...' past the right
+    edge of the bitmap).
     """
     limit = max_message_lines if max_message_lines and max_message_lines > 0 else _HARD_MAX_MESSAGE_LINES
     if len(lines) <= limit:
@@ -330,7 +337,7 @@ def truncate_wrapped_lines_with_ellipsis(
     ellipsis = "..."
     ellipsis_w = text_width_fn(ellipsis)
     last_is_first_line = len(lines) == 1
-    last_limit = (max_w - padding) if last_is_first_line else (max_w - padding - indent)
+    last_limit = (max_w - header_w) if last_is_first_line else (max_w - padding - indent)
     while lines[-1] and sum(
         item[2] + (gap if item[0] == "emote" else 0) for item in lines[-1]
     ) + ellipsis_w > last_limit:
@@ -383,6 +390,7 @@ def layout_message_lines(
             lines,
             max_message_lines=max_message_lines,
             max_w=max_w,
+            header_w=header["header_w"],
             padding=padding,
             indent=indent,
             gap=gap,

@@ -260,9 +260,50 @@ def test_truncate_hard_cap_fallback_matches_explicit_semantics(burn, font):
         return font.getbbox(s)[2]
 
     lines_in = [[("text", "x", 1)]] * 250
+    # 250 行 → 截到 200 行,末行是续行(header_w 不参与续行预算);
+    # 传一个现实 header 值仅为满足签名(correctness-4)。
     out = burn.truncate_wrapped_lines_with_ellipsis(
-        lines_in, max_message_lines=0, max_w=96, padding=5, indent=12, gap=3,
+        lines_in, max_message_lines=0, max_w=96, header_w=13,
+        padding=5, indent=12, gap=3,
         text_width_fn=tw,
     )
     assert len(out) == 200
     assert any(it[0] == "text" and it[1] == "..." for it in out[-1])
+
+
+def test_truncate_single_line_budget_uses_header_width(burn, font):
+    """correctness-4: max_message_lines=1 时首行预算必须用真实首行起始偏移。
+
+    单行消息的 fragments 在 header(徽章+昵称+冒号)之后起画,可用宽度是
+    max_w - header_w;旧实现用 max_w - padding,长昵称会把 '...' 行推出
+    位图右缘(112 + 88 + 3 = 203 > 200)。此处断言布局返回的首行总宽
+    (含省略号)不超位图宽——只走布局函数,不渲染位图。
+    """
+
+    def tw(s):
+        return font.getbbox(s)[2]
+
+    msg = {
+        "author": "A" * 100,
+        "badges": [],
+        "fragments": [{"type": "text", "text": ": " + "B" * 300}],
+    }
+    max_w = 200
+    lines, header, _n = burn.layout_message_lines(
+        msg,
+        max_w=max_w,
+        font=font,
+        font_bold=font,
+        text_width_fn=tw,
+        emote_width_fn=lambda _c: 10,
+        emote_available_fn=lambda _c: False,
+        max_message_lines=1,
+        truncate_with_ellipsis=True,
+    )
+    assert len(lines) == 1
+    assert any(it[0] == "text" and it[1] == "..." for it in lines[0])
+    # 首行内容宽度(与 render_message 的绘制宽度口径一致:emote 追加 gap)
+    first_line_w = sum(it[2] + (3 if it[0] == "emote" else 0) for it in lines[0])
+    # header_w = padding + author + gap + colon + gap(此处无徽章)= 112
+    assert header["header_w"] == 112
+    assert header["header_w"] + first_line_w <= max_w

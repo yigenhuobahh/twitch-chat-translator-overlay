@@ -64,6 +64,15 @@ _MAX_EMOTE_ANIMATION_FRAMES = 300
 _MAX_EMOTE_SOURCE_PIXELS = 4_000_000
 _MAX_EMOTE_DECODED_BYTES_PER_ASSET = 32 * 1024 * 1024
 _MAX_EMOTE_DECODED_BYTES_TOTAL = 256 * 1024 * 1024
+# correctness-3: 消息位图字节预算（emote 预算之上的"字节"维度补充，
+# AUTO_LAZY_MESSAGE_THRESHOLD 的"条数"护栏语义不变）。
+# - eager 预渲染累计 MAX_W*(LINE_H*行数)*4（与 render_message 的 Image.new
+#   同口径），超过 _EAGER_MESSAGE_BUDGET_BYTES 的消息不预渲染，回落为首次
+#   可见时再渲染（与 auto-lazy 同款按需路径）。
+# - 单条位图超 _MAX_MESSAGE_BITMAP_BYTES 时按比例收紧该消息的行数上限，
+#   确保任何单条消息的位图分配不超过上限。
+_EAGER_MESSAGE_BUDGET_BYTES = 512 * 1024 * 1024
+_MAX_MESSAGE_BITMAP_BYTES = 256 * 1024 * 1024
 
 # PIL 默认在 ~89M 像素附近抛 DecompressionBombWarning/Error。本项目只画小
 # emote 和消息贴图，把上限抬到 64M 像素（=8000x8000，远超任何合理表情
@@ -362,6 +371,7 @@ class FrameRenderer:
                 lines,
                 max_message_lines=self.max_message_lines,
                 max_w=self.max_w,
+                header_w=header["header_w"],
                 padding=self.padding,
                 indent=self.indent,
                 gap=self.gap,
@@ -370,7 +380,49 @@ class FrameRenderer:
             if not lines:
                 lines = [[]]
             num_lines = len(lines)
+            # correctness-3: 单条位图字节硬上限。按用户行数上限截断后仍超
+            # 字节预算时，对缓存的全量布局（cached[0]）按预算行数走同一
+            # 省略号路径二次截断——预算行数 < 首次截断行数，不会叠加双重
+            # 省略号；未超预算的路径逐字节保持原行为。
+            line_cap = self._bitmap_line_cap()
+            if num_lines > line_cap:
+                lines = truncate_wrapped_lines_with_ellipsis(
+                    cached[0],
+                    max_message_lines=line_cap,
+                    max_w=self.max_w,
+                    header_w=header["header_w"],
+                    padding=self.padding,
+                    indent=self.indent,
+                    gap=self.gap,
+                    text_width_fn=self.text_width,
+                )
+                if not lines:
+                    lines = [[]]
+                num_lines = len(lines)
         return lines, header, num_lines
+
+    def _bitmap_line_cap(self):
+        """correctness-3: 单条消息位图的行数上限（由字节硬上限反解）。
+
+        render_message 的位图分配是 MAX_W * (LINE_H * num_lines) * 4（RGBA，
+        见 Image.new 处）；反解出不超过 _MAX_MESSAGE_BITMAP_BYTES 的最大行数。
+        至少保留 1 行（极端宽度/行高配置下宁可超限也不渲染零行位图）。
+        """
+        per_line = self.max_w * self.line_h * 4
+        if per_line <= 0:
+            return 1
+        return max(1, _MAX_MESSAGE_BITMAP_BYTES // per_line)
+
+    def _message_bitmap_bytes(self, idx):
+        """correctness-3: eager 预渲染前估算单条消息位图字节。
+
+        与 render_message 的 Image.new 分配同尺寸口径（截断后的行数），
+        供 prepare_message_cache 的 eager 字节预算累计。
+        """
+        _lines, _header, num_lines = self._layout_for_message(
+            self.messages[idx], truncate_with_ellipsis=True
+        )
+        return self.max_w * self.line_h * num_lines * 4
 
     def calc_msg_lines(self, msg):
         """计算消息需要多少行（与 render_message 共用 layout_message_lines）。"""
@@ -524,8 +576,29 @@ class FrameRenderer:
             # so eagerly rendering dropped entries (timestamp >= duration, or ended
             # before t=0) only wasted memory/CPU without changing any output frame.
             scheduled_indexes = sorted({row[3] for row in msg_schedule})
+            # correctness-3: eager 预渲染字节预算。逐条累计与 render_message 的
+            # Image.new 同口径的位图字节；超预算的消息不预渲染，合成循环首次
+            # 画到它时经 message_image 按需渲染（auto-lazy 同款回落路径），
+            # 避免 eager 阶段一次性驻留超预算位图。动画消息本就逐帧重渲染、
+            # 不进缓存，保持既有调用且不占预算。
+            eager_bytes = 0
+            deferred_count = 0
             for i in scheduled_indexes:
+                if i in self.animated_message_ids:
+                    self.message_image(i)
+                    continue
+                needed = self._message_bitmap_bytes(i)
+                if eager_bytes + needed > _EAGER_MESSAGE_BUDGET_BYTES:
+                    deferred_count += 1
+                    continue
+                eager_bytes += needed
                 self.message_image(i)
+            if deferred_count:
+                print(
+                    f"  消息图: {deferred_count} 条超 eager 预渲染字节预算"
+                    f"（{_EAGER_MESSAGE_BUDGET_BYTES // (1024 * 1024)}MB），改为首次可见时渲染",
+                    flush=True,
+                )
             print(f"  渲染 {len(self.msg_images)} 条消息图片", flush=True)
 
     # --- frame composition (verbatim inner loop) ---

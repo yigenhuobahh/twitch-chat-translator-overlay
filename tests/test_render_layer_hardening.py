@@ -198,3 +198,100 @@ def test_render_overlay_maintains_written_set_alongside_list():
     assert "len(written_index_set)" in source
     # The list is still handed to expand_frame_sequence_for_ffmpeg.
     assert "expand_frame_sequence_for_ffmpeg(frames_dir, total_frames, written_indexes)" in source
+
+
+# ---------------------------------------------------------------------------
+# correctness-3: 消息位图字节预算（eager 预渲染回落 + 单条位图行数硬上限）
+# ---------------------------------------------------------------------------
+
+
+class _FakeScene:
+    """prepare_message_cache 需要的最小 scene 替身（非 lazy 分支）。"""
+
+    def __init__(self, lazy=False, cache_size=256, auto_lazy=False):
+        self.lazy_message_images = lazy
+        self.message_image_cache_size = cache_size
+        self.auto_lazy_message_images = auto_lazy
+
+
+def test_eager_prerender_budget_defers_oversized_messages(monkeypatch):
+    """eager 预渲染按字节预算累计：超预算消息不预渲染，仍可按需渲染。"""
+    font = _FakeFont()
+    messages = _make_messages(4)
+    renderer = _make_renderer(messages, font)
+    schedule = [(0.0, 1.0, 0, i, 1) for i in range(4)]
+
+    per_msg = renderer._message_bitmap_bytes(0)
+    assert per_msg > 0
+    # 预算只够 2 条：前 2 条预渲染，后 2 条回落按需渲染路径。
+    monkeypatch.setattr(overlay_render, "_EAGER_MESSAGE_BUDGET_BYTES", per_msg * 2)
+    renderer.prepare_message_cache(schedule, _FakeScene())
+
+    assert set(renderer.msg_images) == {0, 1}, (
+        "budget should keep exactly the first two messages eager-rendered"
+    )
+    # 回落消息走合成循环同款 message_image 路径仍可渲染。
+    img, nl = renderer.message_image(2)
+    assert img is not None
+    assert renderer.msg_lines[2] == nl
+
+
+def test_eager_prerender_unbudgeted_keeps_all_messages(monkeypatch):
+    """预算充足（默认 512MB）时行为不变：全部 scheduled 消息预渲染。"""
+    font = _FakeFont()
+    messages = _make_messages(3)
+    renderer = _make_renderer(messages, font)
+    schedule = [(0.0, 1.0, 0, i, 1) for i in range(3)]
+    renderer.prepare_message_cache(schedule, _FakeScene())
+    assert set(renderer.msg_images) == {0, 1, 2}
+
+
+def test_message_bitmap_line_cap_truncates_huge_messages(monkeypatch):
+    """单条位图字节超硬上限：行数上限按比例收紧，位图不超过预算。"""
+    font = _FakeFont()
+    messages = _make_messages(1, text="word " * 400)
+    renderer = _make_renderer(messages, font)
+    per_line = renderer.max_w * renderer.line_h * 4
+    lines_budget = 5
+    monkeypatch.setattr(overlay_render, "_MAX_MESSAGE_BITMAP_BYTES", per_line * lines_budget)
+
+    lines, _header, num_lines = renderer._layout_for_message(
+        messages[0], truncate_with_ellipsis=True
+    )
+    assert num_lines == lines_budget
+    assert len(lines) == lines_budget
+    # 省略号路径保持：末行以 "..." 结尾（截断可见而非静默裁剪）。
+    assert lines[-1][-1][:2] == ("text", "...")
+
+    img, nl = renderer.render_message(messages[0])
+    assert nl == lines_budget
+    assert img.size == (renderer.max_w, renderer.line_h * lines_budget)
+    assert renderer.max_w * img.height * 4 <= per_line * lines_budget
+
+
+def test_message_bitmap_line_cap_not_binding_for_small_messages():
+    """小消息不受字节上限影响：布局结果与未注入上限时逐字节一致。"""
+    font = _FakeFont()
+    messages = _make_messages(1, text="hello world")
+    renderer = _make_renderer(messages, font)
+    lines, _header, num_lines = renderer._layout_for_message(
+        messages[0], truncate_with_ellipsis=True
+    )
+    uncached_lines, _uncached_header, uncached_n = overlay_render.layout_message_lines(
+        messages[0],
+        max_w=renderer.max_w,
+        font=renderer.font,
+        font_bold=renderer.font_bold,
+        text_width_fn=renderer.text_width,
+        emote_width_fn=renderer.emote_width,
+        emote_available_fn=lambda cls: cls in renderer.emote_imgs,
+        max_message_lines=renderer.max_message_lines,
+        truncate_with_ellipsis=True,
+        padding=renderer.padding,
+        badge_size=renderer.badge_size,
+        gap=renderer.gap,
+        indent=renderer.indent,
+    )
+    assert num_lines == 1
+    assert (lines, num_lines) == (uncached_lines, uncached_n)
+    assert renderer._bitmap_line_cap() >= num_lines

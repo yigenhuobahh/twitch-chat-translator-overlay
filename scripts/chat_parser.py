@@ -565,17 +565,13 @@ def parse_chat_html(html_path, out_dir):
         # Split on comment-root regardless of quote style around class value.
         # 流式切分:与 re.split 的零宽断言逐点一致,但每块在下一块起点处截断,
         # 任一时刻只持有单块副本,避免一次性生成 ~163k 个全量切片(峰值 ~1x)。
-        # 计数与进度语义不变:root_total 仍统计含 comment-root 的块。
+        # perf-6:不再为打印总数预扫一遍 body(root_total 曾是 2GiB 上限内
+        # 最大 ≈45s 的纯日志开销);进度走 _ParseProgress 无 total 模式,
+        # 收尾 force tick 会报最终块数。
         print("  切分 comment-root 消息块…", flush=True)
-        t_split = time.perf_counter()
         pre_split_re = re.compile(
             r'(?=<pre\b[^>]*\bclass\s*=\s*["\'][^"\']*\bcomment-root\b)',
             re.IGNORECASE,
-        )
-        root_total = sum(1 for _ in pre_split_re.finditer(msg_html))
-        print(
-            f"  消息块约 {root_total} 个（切分用时 {time.perf_counter() - t_split:.1f}s）",
-            flush=True,
         )
         msg_prog = _ParseProgress(every_n=50, every_sec=2.0)
         roots_seen = 0
@@ -590,7 +586,7 @@ def parse_chat_html(html_path, out_dir):
                 # 块间夹带的前导/杂项文本,同旧 split 的"跳过非消息块"分支。
                 continue
             roots_seen += 1
-            msg_prog.tick(roots_seen, "解析消息块", total=root_total or None)
+            msg_prog.tick(roots_seen, "解析消息块")
             fields = _extract_comment_root_fields(
                 line,
                 time_link_pattern=time_link_pattern,
@@ -609,7 +605,7 @@ def parse_chat_html(html_path, out_dir):
         tail_line = msg_html[start:]
         if "comment-root" in tail_line:
             roots_seen += 1
-            msg_prog.tick(roots_seen, "解析消息块", total=root_total or None)
+            msg_prog.tick(roots_seen, "解析消息块")
             fields = _extract_comment_root_fields(
                 tail_line,
                 time_link_pattern=time_link_pattern,
@@ -621,7 +617,7 @@ def parse_chat_html(html_path, out_dir):
             if fields is not None:
                 timestamp, author, color, badges, msg_content = fields
                 assembler.append(messages, msg_content, timestamp, author, color, badges)
-        msg_prog.tick(roots_seen, "解析消息块", force=True, total=root_total or None)
+        msg_prog.tick(roots_seen, "解析消息块", force=True)
         # 流式遍历结束,释放 msg_html 本体(游标切完后不再引用)。
         del msg_html, pre_split_re
 

@@ -176,3 +176,40 @@ def test_timestamp_invalid_unit_suffix_drops_message(tmp_path: Path):
     """
     data = _parse(tmp_path, _make_html("?t=0h0m5x"), "bad_suffix.html")
     assert data["messages"] == []
+
+
+def test_emote_class_substring_is_not_the_emote_image_token(tmp_path: Path):
+    """tests-7: `emote-image-2` 含 `emote-image` 子串但不是精确 token。
+
+    `_class_has_token` 按 whitespace 分词后做精确匹配:class="emote-image-2
+    first-1" 的 token 列表里没有 `emote-image`,因此该 <img> 不得产出
+    emote fragment(即便 "first-1" 本身命中 _EMOTE_PREFIXES 也不行)。
+    """
+    html = (
+        "<html><body><pre class=\"comment-root\">"
+        "[<a href=\"https://www.twitch.tv/videos/1?t=0h0m5s\">0:00:05</a>] "
+        "<span class=\"comment-author\">User</span>"
+        "<span class=\"comment-message\">: hi "
+        '<img class="emote-image-2 first-1" title="X">'
+        "</span></pre></body></html>"
+    )
+    data = _parse(tmp_path, html, "substring_class.html")
+    assert len(data["messages"]) == 1
+    msg = data["messages"][0]
+    emotes = [f for f in msg["fragments"] if f["type"] == "emote"]
+    assert emotes == []
+    # img 标签被剥离后正文文本原样保留。
+    texts = [f["text"] for f in msg["fragments"] if f["type"] == "text"]
+    assert texts == ["hi"]
+
+
+def test_parse_progress_without_total_precount(tmp_path, capsys):
+    """perf-6:进度不再为总数预扫 body;收尾报最终块数(无百分比模式)。"""
+    parser = load_module("chat_parser", "chat_parser.py")
+    html = FIXTURES_DIR / "td_author_class_single_quote.html"
+    data = parser.parse_chat_html(str(html), str(tmp_path / "perf6_progress"))
+    assert len(data["messages"]) == 1
+    out = capsys.readouterr().out
+    assert "消息块约" not in out, "总数预计数扫描已删,不应再报约数"
+    assert "切分 comment-root" in out
+    assert "解析消息块: 1 " in out, "收尾 force tick 报最终块数(无百分比模式)"
