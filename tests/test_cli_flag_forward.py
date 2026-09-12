@@ -562,3 +562,52 @@ def test_build_arg_parser_set_defaults_from_single_source():
 
     parsed = vars(cli_spec.build_arg_parser().parse_args([]))
     assert parsed == cli_spec.PIPELINE_CLI_DEFAULTS
+
+
+# ---------------------------------------------------------------------------
+# design-2: --allow-empty-chat 登记为管线可转发 flag（照 keep_temp 模板）。
+# burn 报错文本引导用户加该 flag——主管线入口必须真的接受并转发，否则指引
+# 必然 unrecognized arguments。
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_parser_exposes_allow_empty_chat():
+    import cli_spec
+    import render_cn_chat as pipe
+
+    assert cli_spec.build_arg_parser().parse_args(["--allow-empty-chat"]).allow_empty_chat is True
+    assert "allow_empty_chat" in pipe.PIPELINE_CLI_DEFAULTS
+    assert pipe.PIPELINE_CLI_DEFAULTS["allow_empty_chat"] is False
+
+
+def test_build_burn_command_forwards_allow_empty_chat():
+    import pipeline_plan
+
+    def _burn_args(allow_empty):
+        args = _representative_namespace(allow_empty_chat=allow_empty)
+        for attr, value in (("x", 10), ("y", 20), ("width", 100), ("height", 200),
+                            ("font_size", 16), ("font_path", "auto"), ("font_bold_path", "auto"),
+                            ("bg_alpha", 200)):
+            setattr(args, attr, value)
+        return args
+
+    on = pipeline_plan.build_burn_command(_burn_args(True), Path("v.mp4"), Path("c.html"), Path("burn.py"))
+    assert "--allow-empty-chat" in on
+    off = pipeline_plan.build_burn_command(_burn_args(False), Path("v.mp4"), Path("c.html"), Path("burn.py"))
+    assert "--allow-empty-chat" not in off
+
+
+def test_job_fields_project_allow_empty_chat_to_pipeline_command():
+    import pipeline_plan
+
+    plan = pipeline_plan.PipelinePlan({"video": "v.mp4", "chat_html": "c.html", "mode": "auto",
+                                       "allow_empty_chat": True})
+    cmd = plan.build_command("python", "render_cn_chat.py")
+    assert "--allow-empty-chat" in cmd
+
+
+def test_allow_empty_chat_is_not_burn_only():
+    import render_cn_chat as pipe
+
+    # 它现在是 shared 转发 flag,不得同时出现在 BURN_ONLY_FLAGS(避免两侧登记漂移)。
+    assert "allow-empty-chat" not in set(pipe.BURN_ONLY_FLAGS)

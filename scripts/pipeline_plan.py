@@ -90,6 +90,7 @@ PIPELINE_BOOLEAN_FLAGS: tuple[tuple[str, str], ...] = (
     ("render_original", "--render-original"),
     ("reuse_translation", "--reuse-translation"),
     ("keep_temp", "--keep-temp"),
+    ("allow_empty_chat", "--allow-empty-chat"),
     ("review", "--review"),
     ("manual_translation", "--manual-translation"),
 )
@@ -186,6 +187,8 @@ def build_burn_command(
     append_shared_burn_args(command, args)
     if getattr(args, "keep_temp", False):
         command.append("--keep-temp")
+    if getattr(args, "allow_empty_chat", False):
+        command.append("--allow-empty-chat")
     if getattr(args, "no_backup_prev", False):
         command.append("--no-backup-prev")
     if out_dir is not None:

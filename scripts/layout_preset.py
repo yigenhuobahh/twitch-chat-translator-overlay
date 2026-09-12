@@ -132,6 +132,10 @@ def _coerce(key: str, value: Any) -> Any:
         except ValueError:
             raise ValueError(f"layout preset 字段 {key} 需要整数，收到 {value!r}") from None
     if typ is float:
+        # 与 int 分支（bool 静默收敛 int(True)=1.0 已堵）口径对齐：bool 是
+        # int 子类，float(True)=1.0 会静默通过，这里显式拒绝。
+        if isinstance(value, bool):
+            raise ValueError(f"layout preset 字段 {key} 需要浮点数，收到 {value!r}")
         return float(value)
     return str(value)
 

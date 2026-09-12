@@ -136,6 +136,27 @@ def test_msg_lifetime_only_validated_in_lanes_mode():
         burn._validate_runtime_args(_valid_runtime_args(stack_mode="lanes", msg_lifetime=601.0))
 
 
+# design-1: render_preset/job 有意把有理数帧率 ("30000/1001") 保留为 str 透传。
+# 经 argv 到 burn 时由 parse_output_fps_arg 归一;preset 直连入口 setattr 进
+# namespace 后必须过 _validate_runtime_args 同一单源归一,而不是 float() 裸崩。
+
+
+def test_string_rational_output_fps_normalizes_and_writes_back():
+    for text, expect in (("30000/1001", 30000 / 1001), ("24000/1001", 24000 / 1001)):
+        args = _valid_runtime_args(output_fps=text)
+        burn._validate_runtime_args(args)
+        assert isinstance(args.output_fps, float), text
+        assert args.output_fps == pytest.approx(expect), text
+
+
+def test_invalid_string_output_fps_reports_flag_not_float_cast():
+    with pytest.raises(ValueError) as exc:
+        burn._validate_runtime_args(_valid_runtime_args(output_fps="-30"))
+    message = str(exc.value)
+    assert "--output-fps" in message
+    assert "could not convert" not in message.lower()
+
+
 def test_blank_hold_seconds_special_case_and_bg_alpha():
     with pytest.raises(ValueError, match="blank-hold-seconds must be > 0"):
         burn._validate_runtime_args(_valid_runtime_args(blank_hold_seconds=0.0))

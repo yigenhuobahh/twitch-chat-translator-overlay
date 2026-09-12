@@ -116,7 +116,7 @@ _TRANSLATION_REQUIRED_MODES = frozenset({
 _FORM_FIELDS = {
     "video", "chat_html", "output", "translation_json", "mode", "render_original", "reuse_translation",
     "target_language", "layout_preset", "render_preset", "preview_clip", "profile", "rules", "encoder",
-    "crf", "workers", "source_media_check", "keep_temp", "review", "manual_translation", "offset",
+    "crf", "workers", "source_media_check", "keep_temp", "allow_empty_chat", "review", "manual_translation", "offset",
 }
 _SENSITIVE_FIELD_PARTS = ("apikey", "token", "password", "authorization", "secret", "oauth")
 
@@ -214,6 +214,7 @@ class TuiJobDraft:
     workers: str = ""
     source_media_check: str = "decode"
     keep_temp: bool = False
+    allow_empty_chat: bool = False
     review: bool = False
     manual_translation: bool = False
     render_original: bool = False
@@ -261,6 +262,7 @@ class TuiJobDraft:
             workers=text("workers"),
             source_media_check=text("source_media_check", "decode").strip().lower() or "decode",
             keep_temp=bool(fields.get("keep_temp", False)),
+            allow_empty_chat=bool(fields.get("allow_empty_chat", False)),
             review=bool(fields.get("review", False)),
             manual_translation=bool(fields.get("manual_translation", False)),
             render_original=bool(fields.get("render_original", False)),
@@ -291,6 +293,7 @@ class TuiJobDraft:
             "rules": _clean_path(self.rules),
             "source_media_check": self.source_media_check.strip().lower() or "decode",
             "keep_temp": self.keep_temp,
+            "allow_empty_chat": self.allow_empty_chat,
             "review": self.review,
             "manual_translation": self.manual_translation,
         })

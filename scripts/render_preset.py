@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -97,10 +98,17 @@ def _coerce(key: str, value: Any) -> Any:
                 coerced = float(s)
             except ValueError as exc:
                 raise ValueError(f"render preset 字段 {key} 需要数字或 N/M 有理数帧率，收到 {value!r}") from exc
-            if coerced <= 0:
+            # 正数且有限：inf/nan 字符串同样拒绝，与非 str 分支及
+            # media_probe.parse_rational_fps_text 的"非有限值一律 ValueError"
+            # 口径一致。
+            if coerced <= 0 or not math.isfinite(coerced):
                 raise ValueError(f"render preset 字段 {key} 需要数字或 N/M 有理数帧率，收到 {value!r}")
             return coerced
-        return float(value)
+        # 非 str（YAML 里的 int/float）走同一正数/有限校验，不再绕过。
+        coerced = float(value)
+        if coerced <= 0 or not math.isfinite(coerced):
+            raise ValueError(f"render preset 字段 {key} 需要数字或 N/M 有理数帧率，收到 {value!r}")
+        return coerced
     if nk == "blank_hold_seconds":
         return float(value)
     if value is None:

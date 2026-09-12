@@ -149,6 +149,20 @@ def test_render_preset_output_fps_rejects_negative_fraction():
         render_preset._coerce("output_fps", "-30000/1001")
 
 
+def test_render_preset_output_fps_rejects_nonpositive_numeric():
+    """Non-str (YAML int/float) values take the same positive/finite check as
+    the str branch (regression: correctness-5 — the bare `float(value)` branch
+    silently accepted -29.97 / 0 / inf / nan)."""
+    import render_preset
+
+    for bad in (-29.97, 0, 0.0, -1, float("inf"), float("-inf"), float("nan")):
+        with pytest.raises(ValueError, match="output_fps"):
+            render_preset._coerce("output_fps", bad)
+    # 正常数字形态不受影响。
+    assert render_preset._coerce("output_fps", 60) == 60.0
+    assert render_preset._coerce("output_fps", 29.97) == 29.97
+
+
 # ---------------------------------------------------------------------------
 # job_config._validated_float_field: fraction stays str + range check
 # ---------------------------------------------------------------------------

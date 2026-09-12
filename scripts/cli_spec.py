@@ -115,6 +115,7 @@ PIPELINE_CLI_DEFAULTS = {
     "output_fps": None,
     "bg_alpha": 255,
     "keep_temp": False,
+    "allow_empty_chat": False,
     "no_backup_prev": False,
     "offset": None,
     "clean": False,
@@ -439,13 +440,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--bg-alpha", type=int, default=255, help="聊天背景透明度 0-255；255 为不透明黑底（默认），170 为半透明")
     parser.add_argument("--keep-temp", action="store_true", help="保留底层渲染中间文件，方便失败后排查/续跑")
+    parser.add_argument(
+        "--allow-empty-chat",
+        action="store_true",
+        help="允许聊天解析结果为 0 条消息并继续（默认失败，避免静默生成无弹幕成片）",
+    )
 
     parser.add_argument("--no-backup-prev", action="store_true", help="不备份旧输出文件（默认自动备份为 .bak）")
     parser.add_argument("--offset", type=float, default=None, help="时间偏移修正秒数；默认交给 twitch_chat_burn.py 自动判断")
     parser.add_argument(
         "--clean",
         action="store_true",
-        help="清理 --workdir 下临时文件后退出（无 workdir 时用视频目录/当前目录）：默认只删 *.partial.mp4；加 --clean-all 才删全部已结束 job_/batch_；默认不删 *.progress.json",
+        help="清理 --workdir 下临时文件后退出（无 workdir 时用视频目录/当前目录）：默认删 *.partial.mp4 与工具产物 .bak（*.mp4.bak 等发布恢复点，删后不可恢复；用户手工的 notes.txt.bak 类非产物后缀不受影响）；加 --clean-all 才删全部已结束 job_/batch_；默认不删 *.progress.json",
     )
     parser.add_argument(
         "--clean-all",

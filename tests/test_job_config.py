@@ -365,6 +365,27 @@ def test_write_load_roundtrip_newline_and_dash_prefix(tmp_path: Path, job_mod):
     assert loaded["target_language"] == "- note"
 
 
+def test_write_load_roundtrip_unicode_line_separators(tmp_path: Path, job_mod):
+    """U+0085/U+2028/U+2029 are line separators to the YAML scanner: bare
+    writes split the scalar mid-line and safe_load fails forever.
+
+    Regression (correctness-1): _yaml_quote only handled \\n/\\r, so a context
+    pasted from Windows clipboard (can contain U+2028) produced a job YAML
+    that could never be loaded back.
+    """
+    fields = {
+        "mode": "translate",
+        "context": "第一行\u2028第二行\u2029第三行\x85第四行",
+    }
+    path = job_mod.write_job_file(tmp_path / "roundtrip_ls.yaml", fields, title="rt")
+    text = path.read_text(encoding="utf-8")
+    # Escaped via YAML double-quote escapes (\L/\P/\N); no raw separator left.
+    assert "\\L" in text and "\\P" in text and "\\N" in text
+    assert "\u2028" not in text and "\u2029" not in text and "\x85" not in text
+    loaded = job_mod.load_job_file(path)
+    assert loaded["context"] == fields["context"]
+
+
 def test_yaml_quote_plain_values_unchanged(job_mod):
     """Existing plain path/number/bool quoting must stay byte-identical."""
     assert job_mod._yaml_quote("path/to/video.mp4") == "path/to/video.mp4"

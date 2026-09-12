@@ -103,6 +103,8 @@ JOB_FIELD_ALIASES: dict[str, str] = {
     "stack-mode": "stack_mode",
     "keep_temp": "keep_temp",
     "keep-temp": "keep_temp",
+    "allow_empty_chat": "allow_empty_chat",
+    "allow-empty-chat": "allow_empty_chat",
     "skip_translate": "skip_translate",
     "skip-translate": "skip_translate",
     "manual_translation": "manual_translation",
@@ -182,6 +184,7 @@ BOOL_FIELDS = {
     "reuse_translation",
     "preview_dense",
     "keep_temp",
+    "allow_empty_chat",
     "skip_translate",
     "manual_translation",
     "review",
@@ -859,9 +862,15 @@ def _yaml_quote(value: Any) -> str:
     # safe_load, so those values must be double-quoted with escapes.
     # Tab/VT/FF 等其余 C0 控制符（含 DEL）同样必须进引号：裸 tab 会让 plain
     # scalar 无法被 safe_load 解析（ScannerError），裸 VT/FF/DEL 触发 ReaderError。
+    # U+0085(NEL)/U+2028(LS)/U+2029(PS) 与 \n/\r 同等对待：PyYAML scanner 把
+    # 它们当行分隔符，裸写会让该行在扫描中途断开（ScannerError），文件永久
+    # 无法 load。
     if (
         "\n" in s
         or "\r" in s
+        or "\x85" in s
+        or "\u2028" in s
+        or "\u2029" in s
         or s.startswith("- ")
         or any(c in s for c in (":", "#", "{", "}", "[", "]", ",", "&", "*", "?", "|", ">", "!", "%", "@", "`", "'", '"'))
         or any(ord(c) < 0x20 and c not in ("\n", "\r") or ord(c) == 0x7F for c in s)
@@ -870,6 +879,8 @@ def _yaml_quote(value: Any) -> str:
     ):
         esc = s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
         esc = esc.replace("\t", "\\t").replace("\x0b", "\\v").replace("\x0c", "\\f")
+        # YAML 双引号转义语义：\N=NEL(U+0085)、\L=LS(U+2028)、\P=PS(U+2029)。
+        esc = esc.replace("\x85", "\\N").replace("\u2028", "\\L").replace("\u2029", "\\P")
         esc = _C0_ESCAPE_RE.sub(lambda m: f"\\x{ord(m.group()):02x}", esc)
         return f'"{esc}"'
     return s
@@ -955,6 +966,7 @@ def render_job_yaml(
         ("webm_crf", "VP9 CRF"),
         ("webm_cpu_used", "VP9 速度 0-8"),
         ("keep_temp", "true=保留中间临时文件"),
+        ("allow_empty_chat", "true=聊天 0 条消息也继续出片(默认失败)"),
         ("no_backup_prev", "true=不备份旧输出"),
         ("lazy_message_images", "true=长片消息图 LRU 省内存"),
         ("message_image_cache_size", "lazy 缓存上限"),

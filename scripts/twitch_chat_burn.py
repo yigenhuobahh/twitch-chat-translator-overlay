@@ -578,6 +578,18 @@ def _validate_runtime_args(args) -> None:
         else:
             low, high, _low_inc, _high_inc = job_config.FLOAT_RANGE[attr]
             if kind == "float_pos":
+                if attr == "output_fps" and isinstance(value, str):
+                    # design-1: render_preset/job 有意把有理数帧率 ("30000/1001")
+                    # 保留为 str 透传。经 argv 到 burn 时由 parse_output_fps_arg
+                    # 归一;preset 直连入口 setattr 进 namespace 则先落到这里——
+                    # 过同一单源解析器归一为 float 再走范围校验,并把写回后的 float
+                    # 留在 namespace 供下游 _quantize_fps/fps_to_ffmpeg_rate 使用。
+                    # 错误带 flag 名(preset str 直连用户报的不再是 float 转换裸异常)。
+                    try:
+                        value = parse_output_fps_arg(value)
+                    except argparse.ArgumentTypeError as exc:
+                        raise ValueError(f"{flag}: {exc}") from exc
+                    setattr(args, attr, value)
                 # positive_float 本身要求 > 0 / >= minimum；low_inc=False 时
                 # 表语义（> low）与 helper（>= low 且 > 0）在 low>0 时一致。
                 validate_positive_float(flag, value, minimum=low, maximum=high)
@@ -703,7 +715,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--clean",
         action="store_true",
-        help="清理指定 --out-dir 下的临时文件后退出：默认只删 *.partial.mp4；加 --clean-all 才删全部已结束 job_/batch_；或配合 --job-dir 只清一个；默认不删 *.progress.json",
+        help="清理指定 --out-dir 下的临时文件后退出：默认删 *.partial.mp4 与工具产物 .bak（*.mp4.bak 等发布恢复点，删后不可恢复；用户手工的 notes.txt.bak 类非产物后缀不受影响）；加 --clean-all 才删全部已结束 job_/batch_；或配合 --job-dir 只清一个；默认不删 *.progress.json",
     )
     parser.add_argument(
         "--clean-all",
