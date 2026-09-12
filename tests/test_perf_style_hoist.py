@@ -194,3 +194,42 @@ def test_compact_json_equivalent_to_pretty(tmp_path: Path):
     compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     pretty = json.dumps(payload, ensure_ascii=False, indent=2)
     assert json.loads(compact) == json.loads(pretty)
+
+
+# ---------------------------------------------------------------------------
+# performance-2: export_review_xlsx 改 write_only 流式写出
+# ---------------------------------------------------------------------------
+
+
+def test_xlsx_export_write_only_roundtrip_small_table(tmp_path: Path):
+    """write_only 导出小表可完整读回：标题/行数/表头/值不变。"""
+    json_path = tmp_path / "trans.json"
+    _write_review_json(json_path)
+    xlsx_path = tmp_path / "review.xlsx"
+    _export_quiet(json_path, xlsx_path)
+
+    wb = openpyxl.load_workbook(xlsx_path)
+    ws = wb.active
+    assert ws.title == "review"
+    assert ws.max_row == 4  # 表头 + 3 行消息
+    assert [ws.cell(row=1, column=i).value for i in range(1, 6)] == [
+        "index", "timestamp", "author", "original", "translation",
+    ]
+    assert ws.cell(row=4, column=1).value == 2
+    assert ws.cell(row=4, column=5).value == "warn 行"
+
+
+def test_xlsx_row_height_skipped_over_threshold(tmp_path: Path, monkeypatch):
+    """行高仅在小表保留：注入小阈值后逐行 row_dimensions 跳过，其余样式保持。"""
+    json_path = tmp_path / "trans.json"
+    _write_review_json(json_path)  # 3 行数据 + 表头 = 4 行
+    monkeypatch.setattr(review_tables, "_XLSX_ROW_HEIGHT_LIMIT", 2)
+    xlsx_path = tmp_path / "review.xlsx"
+    _export_quiet(json_path, xlsx_path)
+
+    ws = openpyxl.load_workbook(xlsx_path).active
+    assert not ws.row_dimensions, "超阈值不得写逐行行高"
+    # write_only 支持的属性保持：冻结窗格 / 列宽。
+    assert ws.freeze_panes == "A2"
+    assert ws.column_dimensions["A"].width == 8
+    assert ws.cell(row=2, column=5).number_format == "@"

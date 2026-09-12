@@ -227,9 +227,11 @@ def test_atomic_write_json_roundtrip_and_no_tmp_left(tmp_path):
     data = {"messages": [{"index": 0, "original": "[LUL]", "translation": "[LUL]"}]}
     pipe.atomic_write_json(target, data)
     assert target.is_file()
+    # round-trip 语义不变：json.load 回读与原数据相等（对空白不敏感）
     assert json.loads(target.read_text(encoding="utf-8")) == data
-    # 与原 write_text(json.dumps(..., ensure_ascii=False, indent=2)) 格式一致
-    assert target.read_text(encoding="utf-8") == json.dumps(data, ensure_ascii=False, indent=2)
+    # performance-3 新契约：紧凑序列化（separators=(",", ":")、无 indent），
+    # 与 translate_chat_openai.save_json / translation_io 口径对齐。
+    assert target.read_text(encoding="utf-8") == json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     leftovers = [p.name for p in target.parent.iterdir() if p.name != target.name]
     assert leftovers == [], f"残留临时文件: {leftovers}"
 

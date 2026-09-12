@@ -951,6 +951,72 @@ def test_translation_cache_get_returns_none_on_corrupt_json(tmp_path: Path):
     assert cache.get("missing", "zh", "m1", "ctx") is None
 
 
+# ---------------------------------------------------------------------------
+# performance-7: cache_key v2 两段组合（context_digest）
+# ---------------------------------------------------------------------------
+
+
+def test_cache_key_v2_differs_from_v1_and_each_is_stable():
+    """v2（带 context_digest）与 v1 输出不同但各自路径稳定可复现。"""
+    from translation_support import cache_key, context_digest
+
+    kwargs = dict(
+        provider="OpenAI",
+        base_url="https://api.example.com/",
+        prompt_version="1",
+    )
+    digest = context_digest("zh", "m1", "glossary-context", **kwargs)
+    v1 = cache_key("hello", "zh", "m1", "glossary-context", **kwargs)
+    v2 = cache_key(
+        "hello", "zh", "m1", "glossary-context", context_digest=digest, **kwargs
+    )
+    # 两代 key 互不冲突（"v2" 前缀隔离）。
+    assert v1 != v2
+    # 各自路径稳定：重复调用（含归一化等价的 provider/base_url 拼写）同 key。
+    assert v1 == cache_key(
+        "hello",
+        "zh",
+        "m1",
+        "glossary-context",
+        provider="openai",
+        base_url="https://api.example.com",
+        prompt_version="1",
+    )
+    assert v2 == cache_key(
+        "hello",
+        "zh",
+        "m1",
+        "glossary-context",
+        provider="OPENAI",
+        base_url="https://api.example.com",
+        prompt_version="1",
+        context_digest=digest,
+    )
+    # digest 对归一化等价输入稳定；不同 context 得到不同 digest/key。
+    assert digest == context_digest(
+        "zh", "m1", "glossary-context", provider="openai", base_url="https://api.example.com", prompt_version="1"
+    )
+    assert digest != context_digest("zh", "m1", "other-context")
+    # v2 路径的 key 只由 (context_digest, original) 决定：组件实参仅为 v1
+    # 签名兼容保留，digest 即非原文维度的权威（不同 context 实参配同一
+    # digest 不改变 key；真正区分靠 digest 随 context 变化，见上）。
+    assert v2 == cache_key("hello", "en", "other-model", "other", context_digest=digest)
+    # 原文单独变化会改变 v2 key。
+    assert v2 != cache_key("world", "zh", "m1", "glossary-context", context_digest=digest)
+
+
+def test_translation_cache_roundtrip_via_context_digest(tmp_path: Path):
+    """TranslationCache.get/put 透传 context_digest：同摘要命中，v1/v2 互不干扰。"""
+    from translation_support import TranslationCache, context_digest
+
+    cache = TranslationCache(tmp_path / "cache")
+    digest = context_digest("zh", "m1", "ctx", prompt_version="1")
+    assert cache.put("hello", "zh", "m1", "ctx", "你好", context_digest=digest)
+    assert cache.get("hello", "zh", "m1", "ctx", context_digest=digest) == "你好"
+    # 未传摘要（v1 路径）读不到 v2 写入的行。
+    assert cache.get("hello", "zh", "m1", "ctx") is None
+
+
 def test_main_aborts_remaining_batches_on_auth_error(tmp_path: Path, monkeypatch):
     """首批返回 401 后：所有批次都标记失败，但 API 实际调用远小于批次数。"""
     import translate_chat_openai as tr

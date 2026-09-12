@@ -38,6 +38,11 @@ class PipelineError(SystemExit):
 # 而不是被后到的 OK/WARN 覆盖。
 _SEVERITY_RANK = {"OK": 0, "WARN": 1, "FAIL": 2}
 
+# performance-2: XLSX 导出改 write_only 流式写出。逐行行高（row_dimensions）
+# 会为每行驻留一个维度对象，只在行数不超过该阈值的表上应用；超大表跳过
+# 行高（其余样式——列宽/冻结/筛选/逐格样式——write_only 均支持，保持不变）。
+_XLSX_ROW_HEIGHT_LIMIT = 50_000
+
 
 def _review_issue_map(json_path: Path, max_chars: int = 90, data: dict | None = None, lint_fn=None):
     """Map message index -> (severity, codes, notes) from lint, without printing a full report.
@@ -201,62 +206,84 @@ def export_review_xlsx(
     """导出带列宽、换行和冻结表头的人工复核 XLSX。
 
     data/issue_map: 与 export_review_tsv 相同的预计算入参；dry-run 下不写出。
+
+    performance-2: Workbook(write_only=True) 流式逐行写出，不再把整表
+    Cell/Style 对象驻留内存后二次遍历保存。write_only 支持列宽/冻结窗格/
+    自动筛选/WriteOnlyCell 逐格样式（语义与原实现一致）；逐行行高仅在
+    行数 <= _XLSX_ROW_HEIGHT_LIMIT 的小表上保留，超限跳过。
     """
     if dry_run:
         (log or print)(f"[dry-run] 跳过复核表 XLSX 写出: {review_path}")
         return
     try:
         from openpyxl import Workbook
+        from openpyxl.cell import WriteOnlyCell
         from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.worksheet.filters import AutoFilter
     except ImportError as e:
         raise SystemExit("错误: 导出 XLSX 需要 openpyxl，请先运行 python -m pip install openpyxl") from e
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "review"
-    header = ["index", "timestamp", "author", "original", "translation", "lint_severity", "lint_codes", "lint_notes"]
-    ws.append(header)
-    for row in _review_rows(json_path, include_lint=True, data=data, issue_map=issue_map):
-        # 防 Excel 公式注入：在 _review_rows 的 \t\r\n 归一之后、append 之前
-        # 处理（仅 str 列 C=author / D=original / E=translation）。
-        ws.append([_xlsx_formula_sanitize(v) if i in (2, 3, 4) else v for i, v in enumerate(row)])
+    rows = _review_rows(json_path, include_lint=True, data=data, issue_map=issue_map)
+    row_count = len(rows) + 1  # 连表头在内的总行数
+    apply_row_heights = row_count <= _XLSX_ROW_HEIGHT_LIMIT
 
-    header_fill = PatternFill("solid", fgColor="D9EAF7")
-    fail_fill = PatternFill("solid", fgColor="F8CBAD")
-    warn_fill = PatternFill("solid", fgColor="FFE699")
-    for cell in ws[1]:
-        cell.font = Font(name="Arial", bold=True)
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet("review")
+    # write_only 模式：sheet 级属性（列宽/冻结/筛选）必须先于首行 append 设置。
     widths = {"A": 8, "B": 10, "C": 20, "D": 50, "E": 50, "F": 12, "G": 24, "H": 40}
     for col, width in widths.items():
         ws.column_dimensions[col].width = width
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
+    ws.auto_filter = AutoFilter(ref=f"A1:H{row_count}")
 
-    # 共享样式对象提到循环外只建一次（openpyxl 赋值时共享 style proxy，
-    # 官方文档模式）：逐格新建 Font/Alignment 在 10 万行量级会让样式遍历
-    # 耗时超过 wb.save 本身（perf-5）。语义不变：number_format、按行 fill、
-    # 行高逻辑保持原样。
+    # 共享样式对象提到循环外只建一次（openpyxl 官方文档模式；write_only 下
+    # 赋给 WriteOnlyCell 同样共享 style proxy）：逐格新建 Font/Alignment 在
+    # 10 万行量级会让样式构造耗时超过写盘本身（perf-5）。
+    header_fill = PatternFill("solid", fgColor="D9EAF7")
+    fail_fill = PatternFill("solid", fgColor="F8CBAD")
+    warn_fill = PatternFill("solid", fgColor="FFE699")
+    header_font = Font(name="Arial", bold=True)
+    header_alignment = Alignment(horizontal="center", vertical="center")
     body_font = Font(name="Arial")
     body_alignment = Alignment(vertical="top", wrap_text=True)
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
+
+    header = ["index", "timestamp", "author", "original", "translation", "lint_severity", "lint_codes", "lint_notes"]
+    header_cells = []
+    for value in header:
+        cell = WriteOnlyCell(ws, value=value)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_alignment
+        header_cells.append(cell)
+    ws.append(header_cells)
+
+    row_no = 1  # 表头是第 1 行；逐行 append 时同步推进
+    for row in rows:
+        row_no += 1
+        if apply_row_heights:
+            # 行高是 write_only 下驻留成本最高的样式（每行一个维度对象），
+            # 只在小表应用；维度必须先于该行 append 设置才能写进 <row> 属性。
+            ws.row_dimensions[row_no].height = 36
+        cells = []
+        for i, value in enumerate(row):
+            # 防 Excel 公式注入：在 _review_rows 的 \t\r\n 归一之后、append 之前
+            # 处理（仅 str 列 C=author / D=original / E=translation）。
+            v = _xlsx_formula_sanitize(value) if i in (2, 3, 4) else value
+            cell = WriteOnlyCell(ws, value=v)
             cell.font = body_font
             cell.alignment = body_alignment
-        # 类型漂移防护：original/translation 一律按文本存储，防止 "=1+1"
-        # 之类内容被 Excel 重解释成数字/公式后类型丢失。
-        row[3].number_format = "@"
-        row[4].number_format = "@"
-        sev = str(row[5].value or "").upper()
-        if sev == "FAIL":
-            row[5].fill = fail_fill
-        elif sev == "WARN":
-            row[5].fill = warn_fill
-
-    for idx in range(2, ws.max_row + 1):
-        ws.row_dimensions[idx].height = 36
+            if i in (3, 4):
+                # 类型漂移防护：original/translation 一律按文本存储，防止 "=1+1"
+                # 之类内容被 Excel 重解释成数字/公式后类型丢失。
+                cell.number_format = "@"
+            elif i == 5:
+                sev = str(v or "").upper()
+                if sev == "FAIL":
+                    cell.fill = fail_fill
+                elif sev == "WARN":
+                    cell.fill = warn_fill
+            cells.append(cell)
+        ws.append(cells)
 
     review_path.parent.mkdir(parents=True, exist_ok=True)
     # 原子写：先存到带 .xlsx 后缀的同目录 tmp 名（openpyxl 按扩展名定格式），
@@ -286,46 +313,62 @@ def import_review_xlsx(json_path: Path, review_path: Path, *, dry_run: bool = Fa
         raise SystemExit(f"错误: 找不到人工复核文件: {review_path}")
     data = json.loads(json_path.read_text(encoding="utf-8-sig"))
     by_index = {int(m.get("index")): m for m in data.get("messages", []) if str(m.get("index", "")).isdigit()}
-    wb = load_workbook(review_path)
-    ws = wb.active
-    # 维度预检：损坏/伪造文件可能声明天文数字的维度，max_row 驱动的逐行
-    # 遍历会变成小时级假死；超阈值直接判损坏拒绝处理。
-    if ws.max_row > 1_000_000 or ws.max_column > 64:
-        raise SystemExit("复核表维度异常，疑似损坏文件")
-    header = [ws.cell(row=1, column=i).value for i in range(1, 9)]
-    required = ["index", "timestamp", "author", "original", "translation"]
-    if header[:5] != required:
-        # Backward compatible with old 5-column review sheets.
-        header5 = [ws.cell(row=1, column=i).value for i in range(1, 6)]
-        if header5 != required:
-            raise SystemExit(
-                "错误: XLSX 表头不匹配，请保持 index/timestamp/author/original/translation 五列"
-                "（可选附加 lint_severity/lint_codes/lint_notes）"
-            )
-    changed = 0
-    for row_no in range(2, ws.max_row + 1):
-        idx_value = ws.cell(row=row_no, column=1).value
-        if idx_value is None:
-            continue
+    # performance-2: read_only + iter_rows(values_only=True) 流式读取，不再把
+    # 整表 Cell 对象驻留内存；read_only 持有文件句柄，用完必须 wb.close()。
+    wb = load_workbook(review_path, read_only=True)
+    try:
+        ws = wb.active
+        # 维度预检：损坏/伪造文件可能声明天文数字的维度，max_row 驱动的逐行
+        # 遍历会变成小时级假死；超阈值直接判损坏拒绝处理。read_only 模式下
+        # 维度取自文件声明的 sheet dimension 且可能缺失（None）——缺失时遍历
+        # 以文件实际内容为准，不存在假死面，守卫按缺失跳过。
+        if (ws.max_row is not None and ws.max_row > 1_000_000) or (
+            ws.max_column is not None and ws.max_column > 64
+        ):
+            raise SystemExit("复核表维度异常，疑似损坏文件")
+        rows = ws.iter_rows(values_only=True)
         try:
-            idx = int(idx_value)
-        except ValueError:
-            print(f"警告: 第 {row_no} 行 index 非数字，已跳过")
-            continue
-        if idx not in by_index:
-            print(f"警告: 第 {row_no} 行 index={idx} 不存在，已跳过")
-            continue
-        raw_cell = ws.cell(row=row_no, column=5).value
-        translation = str(raw_cell or "").strip()
-        # 剥掉导出侧防注入添加的前置单引号，保真往返（只剥我们自己的约定）。
-        translation = _strip_formula_quote(translation)
-        # Empty cells must not wipe existing non-empty translations on writeback.
-        existing = str(by_index[idx].get("translation", "") or "").strip()
-        if not translation and existing:
-            continue
-        if by_index[idx].get("translation") != translation:
-            by_index[idx]["translation"] = translation
-            changed += 1
+            header_row = next(rows)
+        except StopIteration:
+            header_row = ()
+        # 空尾单元格在 read_only 下可能被省略：统一补齐到 8 列（None=空）。
+        header = (list(header_row) + [None] * 8)[:8]
+        required = ["index", "timestamp", "author", "original", "translation"]
+        if header[:5] != required:
+            # Backward compatible with old 5-column review sheets.
+            header5 = header[:5]
+            if header5 != required:
+                raise SystemExit(
+                    "错误: XLSX 表头不匹配，请保持 index/timestamp/author/original/translation 五列"
+                    "（可选附加 lint_severity/lint_codes/lint_notes）"
+                )
+        changed = 0
+        for row_no, row in enumerate(rows, start=2):
+            row = tuple(row)
+            idx_value = row[0] if row else None
+            if idx_value is None:
+                continue
+            try:
+                idx = int(idx_value)
+            except ValueError:
+                print(f"警告: 第 {row_no} 行 index 非数字，已跳过")
+                continue
+            if idx not in by_index:
+                print(f"警告: 第 {row_no} 行 index={idx} 不存在，已跳过")
+                continue
+            raw_cell = row[4] if len(row) > 4 else None
+            translation = str(raw_cell or "").strip()
+            # 剥掉导出侧防注入添加的前置单引号，保真往返（只剥我们自己的约定）。
+            translation = _strip_formula_quote(translation)
+            # Empty cells must not wipe existing non-empty translations on writeback.
+            existing = str(by_index[idx].get("translation", "") or "").strip()
+            if not translation and existing:
+                continue
+            if by_index[idx].get("translation") != translation:
+                by_index[idx]["translation"] = translation
+                changed += 1
+    finally:
+        wb.close()
     atomic_write_json(json_path, data)
     print(f"\n[人工复核] 已从 XLSX 回写 {changed} 条修改到: {json_path}")
 
@@ -703,13 +746,15 @@ def normalize_translation(json_path: Path, rules_path: Path | None = None, *, dr
                 changed.append((msg.get("index"), rule["name"], original, msg.get("translation"), rule["translation"]))
                 msg["translation"] = rule["translation"]
                 break
-    atomic_write_json(json_path, data)
-    if changed:
-        print(f"\n[规则清洗] 已应用 {len(changed)} 条修改，规则文件: {rules_path}")
-        for idx, rule_name, original, old, new in changed:
-            print(f"  [{idx}] {rule_name}: {original!r}: {old!r} -> {new!r}")
-    else:
+    if not changed:
+        # performance-3: 无变更不重写文件——atomic_write_json 是整文件重建 +
+        # os.replace，无谓重写既慢也会白白刷新 mtime。只打印日志，不写盘。
         print(f"\n[规则清洗] 无需修改，规则文件: {rules_path}")
+        return
+    atomic_write_json(json_path, data)
+    print(f"\n[规则清洗] 已应用 {len(changed)} 条修改，规则文件: {rules_path}")
+    for idx, rule_name, original, old, new in changed:
+        print(f"  [{idx}] {rule_name}: {original!r}: {old!r} -> {new!r}")
 
 
 def load_profile(profile_path: Path):

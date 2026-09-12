@@ -49,12 +49,14 @@ from common_utils import (
     positive_float_arg,
     translate_api_env_config,
 )
+from process_util import redact_text
 from translation_support import (
     TranslationCache,
     TranslationErrorKind,
     backoff_seconds,
     classify_api_error,
     clean_translation_text,
+    context_digest,
     summarize_errors,
 )
 
@@ -128,7 +130,11 @@ def save_json(path, data):
     )
     try:
         with open(tmp, "w", encoding="utf-8") as file:
-            json.dump(data, file, ensure_ascii=False, indent=2)
+            # 紧凑 JSON（不带 indent）：消费方（预览/复核窗口、进度续传）均经
+            # json.load 回读，对空白不敏感；人工编辑面是 TSV/XLSX 复核表。
+            # indent 会禁用 C 加速编码器，大批量落盘体积/耗时显著增大
+            # （与 translation_io.write_export_translation_json 紧凑口径对齐）。
+            json.dump(data, file, ensure_ascii=False, separators=(",", ":"))
         # 读方（预览/复核窗口）可能正持有目标文件句柄：Windows 上 MoveFileEx
         # 会瞬时 PermissionError，交给共享 helper 退避重试（concurrency-1）。
         atomic_replace_with_retry(tmp, path)
@@ -432,6 +438,17 @@ def translate_batch(client, batch, batch_num, context, target_language, cache=No
 
     cached_items = []
     need_model = []
+    # performance-7: 非原文维度（语言/model/context/provider/base_url/prompt
+    # 版本）的摘要每批预计算一次——context 通常是整段 glossary，逐条消息重
+    # 哈希整个 context 是 O(N*L) 开销；cache_key 走带 "v2" 前缀的两段组合。
+    batch_context_digest = context_digest(
+        target_language,
+        MODEL or "",
+        context or "",
+        provider=TRANSLATION_PROVIDER,
+        base_url=BASE_URL or "",
+        prompt_version=str(PROMPT_VERSION),
+    )
     for msg in batch:
         original = str(msg.get("original", "") or "")
         hit = cache.get(
@@ -442,6 +459,7 @@ def translate_batch(client, batch, batch_num, context, target_language, cache=No
             provider=TRANSLATION_PROVIDER,
             base_url=BASE_URL or "",
             prompt_version=str(PROMPT_VERSION),
+            context_digest=batch_context_digest,
         )
         if hit is not None:
             cleaned_hit = clean_translation_text(hit)
@@ -608,6 +626,7 @@ def translate_batch(client, batch, batch_num, context, target_language, cache=No
                             provider=TRANSLATION_PROVIDER,
                             base_url=BASE_URL or "",
                             prompt_version=str(PROMPT_VERSION),
+                            context_digest=batch_context_digest,
                         )
                     except Exception:
                         # Caching is optional; never discard a successful API result.
@@ -628,8 +647,10 @@ def translate_batch(client, batch, batch_num, context, target_language, cache=No
         except Exception as e:
             kind = classify_api_error(e)
             _count_error(kind)
+            # 异常文本可能回显带凭据的请求 URL/头部，打印前先脱敏。
             print(
-                f"  [批次 {batch_num}] 重试 {attempt+1}/{max_retries} [{kind}]: {type(e).__name__}: {e}",
+                f"  [批次 {batch_num}] 重试 {attempt+1}/{max_retries} [{kind}]: "
+                f"{type(e).__name__}: {redact_text(str(e))}",
                 flush=True,
             )
             if kind in (TranslationErrorKind.AUTH, TranslationErrorKind.CLIENT):
@@ -1144,19 +1165,63 @@ def main():
             context=args.context,
             target_language=args.target_language,
         )
-        for retry_i, retry_batch in enumerate(retry_batches, start=1):
-            retry_num = f"retry-{retry_i}"
-            retry_translations = translate_batch(
-                client, retry_batch, retry_num, args.context, args.target_language, cache, error_counts, bump_error
-            ) or []
-            for item in retry_translations:
-                if "index" in item and "translation" in item:
-                    translation_map[item["index"]] = item["translation"]
-                    failed_indexes.discard(item["index"])
-            still_missing = [m["index"] for m in retry_batch if m["index"] not in translation_map]
-            for idx in still_missing:
-                mark_failed(idx)
-            persist_progress(force=True)
+        # performance-4: 收尾重试与主流程同款线程池并发提交。abort_event 在
+        # 每批提交前与结果消费处各查一次(已熔断则取消剩余、不再等待在跑
+        # 批次);translate_batch 内部吞掉 API 异常只计数返回 None,worker 内
+        # 其余异常与主流程同款按整批失败计数,不静默吞。进度仍逐批强制落盘。
+        retry_futures = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+            try:
+                for retry_i, retry_batch in enumerate(retry_batches, start=1):
+                    if abort_event.is_set():
+                        break
+                    retry_num = f"retry-{retry_i}"
+                    future = executor.submit(
+                        translate_batch,
+                        client,
+                        retry_batch,
+                        retry_num,
+                        args.context,
+                        args.target_language,
+                        cache,
+                        error_counts,
+                        bump_error,
+                    )
+                    retry_futures[future] = (retry_batch, retry_num)
+
+                for future in concurrent.futures.as_completed(retry_futures):
+                    if abort_event.is_set():
+                        for pending in retry_futures:
+                            pending.cancel()
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
+                    retry_batch, retry_num = retry_futures[future]
+                    try:
+                        retry_translations = future.result() or []
+                        with progress_lock:
+                            for item in retry_translations:
+                                if "index" in item and "translation" in item:
+                                    translation_map[item["index"]] = item["translation"]
+                                    failed_indexes.discard(item["index"])
+                            still_missing = [
+                                m["index"] for m in retry_batch if m["index"] not in translation_map
+                            ]
+                            for idx in still_missing:
+                                mark_failed(idx)
+                            persist_progress(force=True)
+                    except Exception as e:
+                        print(f"批次 {retry_num} 异常: {type(e).__name__}: {e}")
+                        with progress_lock:
+                            for msg in retry_batch:
+                                mark_failed(msg["index"])
+                            persist_progress(force=True)
+            except BaseException:
+                # 与主流程同款中断保护:with 退出前的 shutdown(wait=True) 会等
+                # 完预提交队列,必须先取消未开始批次、不等在跑批次再抛出。
+                for pending in retry_futures:
+                    pending.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
 
     updated = 0
     preserved = 0

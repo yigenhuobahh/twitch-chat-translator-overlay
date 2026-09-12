@@ -200,7 +200,10 @@ def atomic_write_json(path: str | Path, data) -> None:
     tmp_path = Path(tmp_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as file:
-            json.dump(data, file, ensure_ascii=False, indent=2)
+            # 紧凑 JSON（不带 indent）：消费方均经 json.load 回读（对空白不敏
+            # 感），indent 会禁用 C 加速编码器，大 JSON 落盘体积/耗时显著增大
+            # （与 translate_chat_openai.save_json / translation_io 紧凑口径对齐）。
+            json.dump(data, file, ensure_ascii=False, separators=(",", ":"))
         atomic_replace_with_retry(tmp_path, path)
     finally:
         try:

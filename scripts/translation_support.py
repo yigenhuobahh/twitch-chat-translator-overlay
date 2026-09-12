@@ -106,6 +106,34 @@ def backoff_seconds(kind: str, attempt: int, exc: BaseException | None = None) -
     return min(120.0, base * (2 ** attempt) + random.uniform(0, base * 0.3))
 
 
+def context_digest(
+    target_language: str,
+    model: str,
+    context: str,
+    *,
+    provider: str = "",
+    base_url: str = "",
+    prompt_version: str = "",
+) -> str:
+    """sha1 摘要 cache_key 的全部非原文维度（performance-7）。
+
+    供调用方对 (target_language, model, context, provider, base_url,
+    prompt_version) 只预计算一次摘要（context 通常是整段 glossary，超长时
+    逐条消息重哈希是 O(N*L) 开销），再交给 cache_key 走 v2 两段组合路径。
+    各维度的归一化（provider 小写、base_url 去尾斜杠）与 v1 cache_key 完全
+    一致，保证等价输入得到等价 key。
+    """
+    raw = "\0".join([
+        target_language or "",
+        model or "",
+        context or "",
+        (provider or "").strip().lower(),
+        (base_url or "").strip().rstrip("/"),
+        str(prompt_version or ""),
+    ])
+    return hashlib.sha1(raw.encode("utf-8"), usedforsecurity=False).hexdigest()
+
+
 def cache_key(
     original: str,
     target_language: str,
@@ -115,7 +143,18 @@ def cache_key(
     provider: str = "",
     base_url: str = "",
     prompt_version: str = "",
+    context_digest: str | None = None,
 ) -> str:
+    """缓存 key：默认 v1 单段哈希；传入 context_digest 时走 v2 两段路径。
+
+    v2 = sha1("v2\\0" + context_digest + "\\0" + original)：非原文维度
+    （语言/model/context/provider/base_url/prompt_version）先由调用方摘要
+    一次，key 只再哈希摘要与原文。"v2\\0" 前缀隔离旧 v1 key，防止同一
+    输入在两条路径下撞 key；v1 路径保持原样，向后兼容未传摘要的调用点。
+    """
+    if context_digest is not None:
+        raw = f"v2\0{context_digest}\0{original or ''}"
+        return hashlib.sha1(raw.encode("utf-8"), usedforsecurity=False).hexdigest()
     raw = "\0".join([
         original or "",
         target_language or "",
@@ -146,6 +185,7 @@ class TranslationCache:
         provider: str = "",
         base_url: str = "",
         prompt_version: str = "",
+        context_digest: str | None = None,
     ) -> str | None:
         if not self.enabled:
             return None
@@ -157,6 +197,7 @@ class TranslationCache:
             provider=provider,
             base_url=base_url,
             prompt_version=prompt_version,
+            context_digest=context_digest,
         )
         path = self.cache_dir / f"{key}.json"
         # 读路径无锁:写入方用 os.replace 原子替换文件,读者要么见到旧的
@@ -183,6 +224,7 @@ class TranslationCache:
         provider: str = "",
         base_url: str = "",
         prompt_version: str = "",
+        context_digest: str | None = None,
     ) -> bool:
         if not self.enabled:
             return False
@@ -194,6 +236,7 @@ class TranslationCache:
             provider=provider,
             base_url=base_url,
             prompt_version=prompt_version,
+            context_digest=context_digest,
         )
         path = self.cache_dir / f"{key}.json"
         # O·敏感数据:context 可能含用户的 glossary/隐私信息,明文落盘会把
